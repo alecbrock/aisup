@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(git:*)",
+      "Bash(tmux:*)",
+      "Bash(mkdir:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(rtk:*)"
+    ],
+    "deny": [
+      "EnterPlanMode"
+    ]
+  }
+}
