@@ -14,3 +14,4 @@ diagnostics/
 .claude/settings.local.json
 .claude/transcripts/
 .pilot/
+.codegraph/

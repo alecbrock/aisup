@@ -1,0 +1,36 @@
+{
+  "name": "aisup",
+  "version": "0.1.0",
+  "description": "AI supervisor daemon with multi-account failover and Slack remote control",
+  "type": "module",
+  "bin": {
+    "aisup": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli/index.ts",
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.4.1",
+    "@slack/web-api": "^7.9.2",
+    "commander": "^14.0.0",
+    "fastify": "^5.4.0",
+    "js-yaml": "^4.1.0",
+    "strip-ansi": "^7.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
