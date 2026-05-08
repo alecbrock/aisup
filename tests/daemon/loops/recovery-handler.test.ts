@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
-import { detect429InOutput, OutputCursor } from '../../../src/daemon/loops/recovery-handler.js';
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { detect429InOutput, OutputCursor, readLogTail } from '../../../src/daemon/loops/recovery-handler.js';
 
 describe('detect429InOutput', () => {
   it('should detect "rate limit" text', () => {
@@ -34,6 +37,55 @@ describe('detect429InOutput', () => {
 
   it('should return false for empty string', () => {
     expect(detect429InOutput('')).toBe(false);
+  });
+});
+
+describe('readLogTail', () => {
+  it('should read content from offset to EOF', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'aisup-rec-'));
+    const logPath = join(tmpDir, 'output.log');
+    writeFileSync(logPath, 'line1\nline2\nline3\n');
+    try {
+      const content = readLogTail(logPath, 0, 65536);
+      expect(content).toContain('line1');
+      expect(content).toContain('line3');
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should return empty string for missing file', () => {
+    expect(readLogTail('/nonexistent/output.log', 0, 65536)).toBe('');
+  });
+
+  it('should respect 64KB scan window (reads at most last 64KB)', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'aisup-rec-'));
+    const logPath = join(tmpDir, 'output.log');
+    // Write 128KB of 'a' then 'RATE_LIMIT_MARKER\n'
+    const padding = Buffer.alloc(128 * 1024, 'a');
+    const marker = Buffer.from('\nRATE_LIMIT_MARKER\n');
+    writeFileSync(logPath, Buffer.concat([padding, marker]));
+    try {
+      // With 64KB window, should see the marker (it's in the last 64KB)
+      const content = readLogTail(logPath, 0, 65536);
+      expect(content).toContain('RATE_LIMIT_MARKER');
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should start from cursor offset when larger than window start', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'aisup-rec-'));
+    const logPath = join(tmpDir, 'output.log');
+    writeFileSync(logPath, 'old-content\nnew-content\n');
+    const oldLen = Buffer.byteLength('old-content\n');
+    try {
+      const content = readLogTail(logPath, oldLen, 65536);
+      expect(content).not.toContain('old-content');
+      expect(content).toContain('new-content');
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -123,6 +123,22 @@ describe('migrateTranscript', () => {
     ).rejects.toThrow(/UUID mismatch|basename/i);
   });
 
+  it('should reject symlinked target parent component', async () => {
+    const realDir = join(tmpDir, 'real-target');
+    mkdirSync(join(realDir, 'projects', '-Users-alec-Projects-foo'), { recursive: true });
+    const symlinkTarget = join(tmpDir, '.claude-symlinked');
+    symlinkSync(realDir, symlinkTarget);
+
+    await expect(
+      migrateTranscript({
+        transcriptPath,
+        sourceConfigDir,
+        targetConfigDir: symlinkTarget,
+        claudeSessionId: CLAUDE_ID,
+      })
+    ).rejects.toThrow(/symlink.*target parent/i);
+  });
+
   it('should allow any uuid filename when claudeSessionId is null', async () => {
     const result = await migrateTranscript({
       transcriptPath,

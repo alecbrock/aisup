@@ -29,9 +29,9 @@ export class HealthChecker {
     this.onResult = opts.onResult;
   }
 
-  start(): void {
+  start(tickFn?: () => void): void {
     if (this.handle) return;
-    this.handle = setInterval(() => { /* tick wired by daemon */ }, this.intervalMs);
+    this.handle = setInterval(() => { if (tickFn) tickFn(); }, this.intervalMs);
   }
 
   stop(): void {

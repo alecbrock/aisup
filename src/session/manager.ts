@@ -1,10 +1,12 @@
-import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   createTmuxSession,
   destroyTmuxSession,
   sendText,
   sendControl,
+  sendInterrupt,
+  sendEnter,
   isProcessDead,
   listSessions,
   stopPipePane,
@@ -139,12 +141,12 @@ export class SessionManager {
 
     if (!opts.force) {
       // Graceful: Ctrl+C → wait 2s → /exit → poll 5s → force
-      sendControl(this.socket, tmuxName, 'C-c');
+      sendInterrupt(this.socket, tmuxName);
       await new Promise((r) => setTimeout(r, 2000));
 
       if (!isProcessDead(this.socket, tmuxName)) {
         sendText(this.socket, tmuxName, '/exit');
-        sendControl(this.socket, tmuxName, 'Enter');
+        sendEnter(this.socket, tmuxName);
 
         const deadline = Date.now() + 5000;
         while (Date.now() < deadline) {
@@ -165,6 +167,67 @@ export class SessionManager {
       });
     }
   }
+
+  async terminateRunnerForSwitch(
+    tmuxName: string,
+    aisupSessionId: string,
+    opts: { force?: boolean }
+  ): Promise<void> {
+    if (!opts.force) {
+      sendInterrupt(this.socket, tmuxName);
+      await new Promise((r) => setTimeout(r, 2000));
+
+      if (!isProcessDead(this.socket, tmuxName)) {
+        sendText(this.socket, tmuxName, '/exit');
+        sendEnter(this.socket, tmuxName);
+
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          if (isProcessDead(this.socket, tmuxName)) break;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+    }
+
+    stopPipePane(this.socket, tmuxName);
+    destroyTmuxSession(this.socket, tmuxName);
+
+    const state = this.readState(aisupSessionId);
+    if (state) {
+      this.writeState({
+        ...state,
+        status: 'SWITCHING',
+        updated_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  /** Atomically patch fields on a session's persisted state. */
+  patchState(aisupSessionId: string, patch: Partial<import('./types.js').SessionState>): void {
+    const existing = this.readState(aisupSessionId);
+    if (!existing) return;
+    this.writeState({ ...existing, ...patch, updated_at: new Date().toISOString() });
+  }
+
+  /** Return the first session in ACTIVE or SWITCH_PENDING_AT_IDLE state, or null. */
+  getActiveSession(): import('./types.js').SessionState | null {
+    if (!existsSync(this.stateDir)) return null;
+    try {
+      for (const sessionId of readdirSync(this.stateDir)) {
+        const state = this.readState(sessionId);
+        if (state && (state.status === 'ACTIVE' || state.status === 'SWITCH_PENDING_AT_IDLE')) {
+          return state;
+        }
+      }
+    } catch { /* ignore read errors */ }
+    return null;
+  }
+
+  /** Expose the stateDir for consumers that need to read session dirs directly. */
+  getStateDir(): string { return this.stateDir; }
+
+  /** Expose the tmux socket for consumers that need direct tmux access. */
+  getSocket(): string { return this.socket; }
 
   listTmuxSessions(): string[] {
     return listSessions(this.socket).filter((s) => s.startsWith('aisup-'));

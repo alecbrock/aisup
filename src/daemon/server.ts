@@ -4,11 +4,20 @@ import { existsSync } from 'node:fs';
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { canStartNewSession } from '../cli/pid.js';
 import type { SessionInfo } from '../session/types.js';
+import type { SessionManager } from '../session/manager.js';
+import type { AccountRegistry } from '../accounts/registry.js';
+import type { JournalWriter } from '../journal/types.js';
+import { validateManualFailoverTarget, performSwitch } from '../failover/switcher.js';
+import { SwitchReason } from '../failover/types.js';
 
 export interface DaemonServerOptions {
   tokenPath: string;
   host: string;
   port: number;
+  sessionManager?: SessionManager;
+  accountRegistry?: AccountRegistry;
+  journal?: JournalWriter;
+  runnerConfig?: { command: string; args: string[]; env: Record<string, string> };
 }
 
 declare module 'fastify' {
@@ -66,17 +75,48 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     const body = req.body as { cwd?: string; plan?: string } | undefined;
     const cwd = body?.cwd ?? process.cwd();
 
-    // Validate cwd exists
     if (!existsSync(cwd)) {
       return reply.status(400).send({ error: `cwd does not exist or is not a directory: ${cwd}` });
     }
 
-    // Stub: real session creation wired in Task 3
-    return reply.status(201).send({ status: 'created', cwd, message: 'stub — wired in Task 3' });
+    if (!opts.sessionManager || !opts.accountRegistry || !opts.runnerConfig) {
+      return reply.status(201).send({ status: 'created', cwd, message: 'deps not wired' });
+    }
+
+    const accounts = opts.accountRegistry.getAll();
+    const bestAccount = accounts.sort((a, b) => a.priority - b.priority).find((a) => a.enabled && a.state !== 'UNAVAILABLE');
+    if (!bestAccount) {
+      return reply.status(409).send({ error: 'no eligible account available' });
+    }
+
+    const aisupSessionId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    try {
+      const state = await opts.sessionManager.createSession({
+        aisupSessionId,
+        account: bestAccount.name,
+        accountConfigDir: bestAccount.configDir,
+        command: opts.runnerConfig.command,
+        args: opts.runnerConfig.args,
+        env: opts.runnerConfig.env,
+        cwd,
+      });
+      sessionState = { status: state.status, aisup_session_id: state.aisup_session_id };
+      return reply.status(201).send({ status: 'created', aisup_session_id: state.aisup_session_id, account: bestAccount.name, cwd });
+    } catch (err) {
+      return reply.status(500).send({ error: `session creation failed: ${String(err)}` });
+    }
   });
 
   app.delete('/api/sessions', async (_req, reply) => {
-    return reply.send({ status: 'stopped', message: 'stub — wired in Task 3' });
+    if (!sessionState?.aisup_session_id || !opts.sessionManager) {
+      return reply.send({ status: 'stopped', message: 'no active session' });
+    }
+    const state = opts.sessionManager.readState(sessionState.aisup_session_id);
+    if (state) {
+      await opts.sessionManager.stopSession(state.tmux_name, state.aisup_session_id, { force: false });
+    }
+    sessionState = null;
+    return reply.send({ status: 'stopped' });
   });
 
   app.get('/api/events', async (req, reply) => {
@@ -86,7 +126,13 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
   });
 
   app.get('/api/accounts', async (_req, reply) => {
-    return reply.send({ accounts: [] });
+    if (!opts.accountRegistry) {
+      return reply.send({ accounts: [] });
+    }
+    const accounts = opts.accountRegistry.getAll().map((a) => ({
+      name: a.name, state: a.state, priority: a.priority, enabled: a.enabled, score: a.score,
+    }));
+    return reply.send({ accounts });
   });
 
   app.post('/api/failover', async (req, reply) => {
@@ -97,7 +143,56 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     if (!sessionState || sessionState.status === 'STOPPED') {
       return reply.status(409).send({ error: 'No active session to failover' });
     }
-    return reply.send({ target_account: body.target_account, launch_mode: 'stub', status: 'initiated' });
+    if (!opts.accountRegistry || !opts.sessionManager || !opts.journal) {
+      return reply.send({ target_account: body.target_account, launch_mode: 'pending', status: 'initiated' });
+    }
+
+    const accounts = opts.accountRegistry.getAll();
+    const currentAccount = opts.sessionManager.readState(sessionState.aisup_session_id!)?.account;
+    if (!currentAccount) {
+      return reply.status(409).send({ error: 'cannot determine current account' });
+    }
+    const validation = validateManualFailoverTarget(body.target_account, currentAccount, accounts);
+    if (!validation.valid) {
+      return reply.status(400).send({ error: validation.reason });
+    }
+
+    const currentState = opts.sessionManager.readState(sessionState.aisup_session_id!);
+    const result = await performSwitch(
+      {
+        aisupSessionId: sessionState.aisup_session_id!,
+        claudeSessionId: currentState?.claude_session_id ?? null,
+        transcriptPath: currentState?.transcript_path ?? null,
+        activeSkill: currentState?.active_skill ?? null,
+        planFilePath: currentState?.plan_path ?? null,
+        sourceAccount: currentAccount,
+        targetAccount: body.target_account,
+        reason: SwitchReason.Manual,
+        selectionMode: 'manual',
+      },
+      accounts,
+      {
+        sessionManager: opts.sessionManager,
+        journal: opts.journal,
+        createSessionForTarget: async (target, snapshot) => {
+          return opts.sessionManager!.createSession({
+            aisupSessionId: snapshot.aisupSessionId,
+            account: target.name,
+            accountConfigDir: target.configDir,
+            command: opts.runnerConfig!.command,
+            args: opts.runnerConfig!.args,
+            env: opts.runnerConfig!.env,
+            cwd: currentState?.cwd ?? process.cwd(),
+          });
+        },
+      }
+    );
+
+    if (result.status === 'completed') {
+      sessionState = { status: 'ACTIVE', aisup_session_id: sessionState.aisup_session_id };
+      return reply.send({ target_account: result.targetAccount, launch_mode: 'switched', status: 'completed' });
+    }
+    return reply.status(503).send({ error: result.error, tried: result.triedAccounts, status: result.status });
   });
 
   return app;

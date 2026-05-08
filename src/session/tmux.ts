@@ -3,6 +3,25 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { singleQuote } from '../util/shell.js';
 
+export interface TmuxTimeoutEvent {
+  operation: string;
+  target: string;
+  timeoutMs: number;
+}
+
+let onTmuxTimeout: (event: TmuxTimeoutEvent) => void = () => { /* no-op */ };
+
+/** Register a callback invoked when a real tmux timeout (killed+SIGTERM) occurs. */
+export function setTmuxTimeoutHandler(handler: (event: TmuxTimeoutEvent) => void): void {
+  onTmuxTimeout = handler;
+}
+
+function extractTarget(args: string[]): string {
+  const idx = args.indexOf('-t');
+  if (idx !== -1 && idx + 1 < args.length) return args[idx + 1];
+  return args.find((a) => a.startsWith('aisup-')) ?? 'unknown';
+}
+
 export interface CreateSessionOpts {
   socket: string;
   name: string;
@@ -24,7 +43,15 @@ function tmuxWithTimeout(socket: string, args: string[], timeoutMs = 5000): stri
       timeout: timeoutMs,
     }).trim();
   } catch (err: unknown) {
-    const e = err as NodeJS.ErrnoException & { signal?: string };
+    const e = err as NodeJS.ErrnoException & { signal?: string; killed?: boolean };
+    // Only emit tmux.command_timeout for real timeouts (killed by SIGTERM from execFileSync timeout)
+    if (e.killed === true && e.signal === 'SIGTERM') {
+      onTmuxTimeout({
+        operation: args[0] ?? 'unknown',
+        target: extractTarget(args),
+        timeoutMs,
+      });
+    }
     throw new Error(
       `tmux command timed out after ${timeoutMs}ms: tmux ${args.slice(0, 3).join(' ')}: ${e.message}`
     );
@@ -61,7 +88,7 @@ export async function createTmuxSession(opts: CreateSessionOpts): Promise<void> 
 
 export function destroyTmuxSession(socket: string, name: string): void {
   try {
-    tmux(socket, ['kill-session', '-t', name]);
+    tmuxWithTimeout(socket, ['kill-session', '-t', name]);
   } catch {
     // session may already be gone
   }
@@ -71,8 +98,21 @@ export function sendText(socket: string, name: string, text: string): void {
   tmuxWithTimeout(socket, ['send-keys', '-l', '-t', name, '--', text]);
 }
 
+const ALLOWED_CONTROL_KEYS = new Set(['C-c', 'Enter']);
+
 export function sendControl(socket: string, name: string, key: string): void {
+  if (!ALLOWED_CONTROL_KEYS.has(key)) {
+    throw new Error(`sendControl: rejected reserved control key "${key}" — only ${[...ALLOWED_CONTROL_KEYS].join(', ')} allowed`);
+  }
   tmuxWithTimeout(socket, ['send-keys', '-t', name, key]);
+}
+
+export function sendInterrupt(socket: string, name: string): void {
+  tmuxWithTimeout(socket, ['send-keys', '-t', name, 'C-c']);
+}
+
+export function sendEnter(socket: string, name: string): void {
+  tmuxWithTimeout(socket, ['send-keys', '-t', name, 'Enter']);
 }
 
 export function captureOutput(socket: string, name: string, lines = 100): string {
@@ -138,7 +178,7 @@ export function respawnPane(
 
 export function listSessions(socket: string): string[] {
   try {
-    const out = tmux(socket, ['list-sessions', '-F', '#{session_name}']);
+    const out = tmuxWithTimeout(socket, ['list-sessions', '-F', '#{session_name}']);
     return out.split('\n').filter(Boolean);
   } catch {
     return [];

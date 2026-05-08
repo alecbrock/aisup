@@ -18,7 +18,14 @@ const FAKE_RUNNER = resolve(__dirname, '../fixtures/fake-runner.sh');
 const TEST_SOCKET = 'aisup-test-mgr';
 
 function hasTmux(): boolean {
-  return spawnSync('which', ['tmux']).status === 0;
+  if (spawnSync('which', ['tmux']).status !== 0) return false;
+  try {
+    execFileSync('tmux', ['-L', TEST_SOCKET, 'new-session', '-d', '-s', 'aisup-probe', '/bin/sh'], { timeout: 5000 });
+    execFileSync('tmux', ['-L', TEST_SOCKET, 'kill-session', '-t', 'aisup-probe'], { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const runIf = hasTmux() ? it : it.skip;

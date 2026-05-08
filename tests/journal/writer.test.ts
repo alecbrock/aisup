@@ -123,6 +123,33 @@ describe('appendEvent', () => {
     expect(JSON.parse(content.trim()).event_type).toBe('daemon.ready');
   });
 
+  it('should reject events with api_key (underscore variant) in details', async () => {
+    const event: JournalEvent = {
+      ts: new Date().toISOString(),
+      event_type: 'daemon.started',
+      details: { api_key: 'sk-secret-123' } as Record<string, unknown>,
+    };
+    await expect(appendEvent(journalPath, event)).rejects.toThrow(/forbidden.*key/i);
+  });
+
+  it('should reject events with bot_token in details', async () => {
+    const event: JournalEvent = {
+      ts: new Date().toISOString(),
+      event_type: 'slack.connection_error',
+      details: { bot_token: 'xoxb-123' } as Record<string, unknown>,
+    };
+    await expect(appendEvent(journalPath, event)).rejects.toThrow(/forbidden.*key/i);
+  });
+
+  it('should reject events with secret keys inside arrays', async () => {
+    const event: JournalEvent = {
+      ts: new Date().toISOString(),
+      event_type: 'daemon.started',
+      details: { items: [{ token: 'leaked' }] } as Record<string, unknown>,
+    };
+    await expect(appendEvent(journalPath, event)).rejects.toThrow(/forbidden.*key/i);
+  });
+
   it('should include optional fields when provided', async () => {
     const event: JournalEvent = {
       ts: new Date().toISOString(),

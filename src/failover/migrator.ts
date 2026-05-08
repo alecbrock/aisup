@@ -9,6 +9,7 @@ import {
   fsyncSync,
   closeSync,
   existsSync,
+  unlinkSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, basename, dirname, resolve } from 'node:path';
@@ -34,17 +35,37 @@ async function sha256File(path: string): Promise<string> {
   return hash.digest('hex');
 }
 
-async function atomicCopy(src: string, dest: string): Promise<string> {
-  const tmp = `${dest}.tmp.${Date.now()}`;
-  const wfd = openSync(tmp, 'w', 0o600);
-  try {
-    await pipeline(createReadStream(src), createWriteStream(tmp, { fd: wfd, autoClose: false }));
-    fsyncSync(wfd);
-  } finally {
-    closeSync(wfd);
+function validateTargetParentComponents(targetPath: string, resolvedTargetDir: string): void {
+  let current = dirname(targetPath);
+  while (current !== resolvedTargetDir && current.length > resolvedTargetDir.length) {
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) {
+      throw new Error(
+        `migrateTranscript: symlinked target parent component rejected: ${current}`
+      );
+    }
+    current = dirname(current);
   }
+}
+
+async function atomicCopy(src: string, dest: string): Promise<{ destPath: string; bytesCopied: number }> {
+  const tmp = `${dest}.tmp.${Date.now()}.${process.pid}`;
+  const wfd = openSync(tmp, 'wx', 0o600);
+  let bytesCopied = 0;
+  try {
+    const rs = createReadStream(src);
+    const ws = createWriteStream(tmp, { fd: wfd, autoClose: false });
+    rs.on('data', (chunk: Buffer | string) => { bytesCopied += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length; });
+    await pipeline(rs, ws);
+    fsyncSync(wfd);
+  } catch (err) {
+    closeSync(wfd);
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    throw err;
+  }
+  closeSync(wfd);
   renameSync(tmp, dest);
-  return dest;
+  return { destPath: dest, bytesCopied };
 }
 
 export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationResult> {
@@ -95,7 +116,14 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
     }
   }
 
-  const resolvedTargetDir = realpathSync(resolve(targetConfigDir));
+  // Validate the raw targetConfigDir is not itself a symlink
+  const rawTargetDir = resolve(targetConfigDir);
+  const rawTargetStat = lstatSync(rawTargetDir, { throwIfNoEntry: false });
+  if (rawTargetStat?.isSymbolicLink()) {
+    throw new Error(`migrateTranscript: symlinked target parent component rejected: ${rawTargetDir}`);
+  }
+
+  const resolvedTargetDir = realpathSync(rawTargetDir);
   const targetPath = join(resolvedTargetDir, rel);
 
   // Validate no target path traversal
@@ -104,6 +132,8 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
   }
 
   mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
+
+  validateTargetParentComponents(targetPath, resolvedTargetDir);
 
   const sourceSha256 = await sha256File(resolvedSrc);
 
@@ -123,12 +153,18 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
     // Collision — rename aside and recopy
     const bakPath = `${targetPath}.bak.${Date.now()}`;
     renameSync(targetPath, bakPath);
-    await atomicCopy(resolvedSrc, targetPath);
+    const collisionCopy = await atomicCopy(resolvedSrc, targetPath);
+    if (collisionCopy.bytesCopied !== srcStat.size) {
+      throw new Error(`migrateTranscript: byte count mismatch — expected ${srcStat.size}, got ${collisionCopy.bytesCopied}`);
+    }
     const targetSha256 = await sha256File(targetPath);
     return { status: 'collision_renamed', targetPath, sourceSha256, targetSha256 };
   }
 
-  await atomicCopy(resolvedSrc, targetPath);
+  const copyResult = await atomicCopy(resolvedSrc, targetPath);
+  if (copyResult.bytesCopied !== srcStat.size) {
+    throw new Error(`migrateTranscript: byte count mismatch — expected ${srcStat.size}, got ${copyResult.bytesCopied}`);
+  }
   const targetSha256 = await sha256File(targetPath);
 
   if (targetSha256 !== sourceSha256) {

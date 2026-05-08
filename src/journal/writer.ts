@@ -2,12 +2,18 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { JournalEvent, JournalWriter } from './types.js';
 
-const SECRET_KEYS = new Set(['token', 'secret', 'apikey', 'authorization']);
+const SECRET_KEY_PATTERN = /^(.*_)?(token|secret|apikey|api_key|authorization|password|bot_token|app_token|signing_secret)$/i;
 
 function scanForSecrets(obj: unknown, path = 'details'): void {
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+  if (!obj || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      scanForSecrets(obj[i], `${path}[${i}]`);
+    }
+    return;
+  }
   for (const [key, val] of Object.entries(obj as Record<string, unknown>)) {
-    if (SECRET_KEYS.has(key.toLowerCase())) {
+    if (SECRET_KEY_PATTERN.test(key)) {
       throw new Error(
         `Journal write rejected: forbidden secret key "${key}" found at ${path}.${key}`
       );

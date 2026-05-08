@@ -71,11 +71,10 @@ export class RateLimitMonitor {
     return { level: 'none', fiveHourPct: fivePct, sevenDayPct: sevenPct };
   }
 
-  start(): void {
+  start(tickFn?: () => void): void {
     if (this.handle) return;
     this.handle = setInterval(() => {
-      // Tick logic is injected by the daemon — onBreach is called when telemetry is checked
-      this.onBreach({ level: 'none' });
+      if (tickFn) tickFn();
     }, this.intervalMs);
   }
 

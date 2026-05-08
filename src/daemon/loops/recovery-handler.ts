@@ -1,3 +1,4 @@
+import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import stripAnsi from 'strip-ansi';
 
 const RATE_LIMIT_PATTERNS = [
@@ -11,6 +12,34 @@ const RATE_LIMIT_PATTERNS = [
 export function detect429InOutput(text: string): boolean {
   const clean = stripAnsi(text);
   return RATE_LIMIT_PATTERNS.some((p) => p.test(clean));
+}
+
+/**
+ * Read up to `windowBytes` of content from a log file, starting from
+ * `max(cursorOffset, fileSize - windowBytes)` to EOF.
+ * Returns empty string if file is missing or empty.
+ */
+export function readLogTail(logPath: string, cursorOffset: number, windowBytes: number): string {
+  let fd: number;
+  try {
+    fd = openSync(logPath, 'r');
+  } catch {
+    return '';
+  }
+  try {
+    const stat = fstatSync(fd);
+    const fileSize = stat.size;
+    if (fileSize === 0) return '';
+    const windowStart = Math.max(0, fileSize - windowBytes);
+    const readFrom = Math.max(cursorOffset, windowStart);
+    const toRead = fileSize - readFrom;
+    if (toRead <= 0) return '';
+    const buf = Buffer.allocUnsafe(toRead);
+    const bytesRead = readSync(fd, buf, 0, toRead, readFrom);
+    return buf.slice(0, bytesRead).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export interface CursorState {
@@ -69,9 +98,28 @@ export class RecoveryHandler {
     return this.cursors.get(sessionId);
   }
 
-  start(): void {
+  removeCursor(sessionId: string): void {
+    this.cursors.delete(sessionId);
+  }
+
+  /** Get current file size for a log path (used to init cursor at EOF). */
+  static getFileSize(logPath: string): number {
+    let fd: number;
+    try {
+      fd = openSync(logPath, 'r');
+    } catch {
+      return 0;
+    }
+    try {
+      return fstatSync(fd).size;
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  start(tickFn?: () => void): void {
     if (this.handle) return;
-    this.handle = setInterval(() => { /* tick wired by daemon */ }, this.intervalMs);
+    this.handle = setInterval(() => { if (tickFn) tickFn(); }, this.intervalMs);
   }
 
   stop(): void {

@@ -57,11 +57,52 @@ export async function runDoctor(): Promise<void> {
     }));
   }
 
+  // tmux pane_pipe capability
+  checks.push(check('tmux pipe-pane capable', () => {
+    const testSocket = 'aisup-doctor-probe';
+    try {
+      execFileSync('tmux', ['-L', testSocket, 'new-session', '-d', '-s', 'probe', '/bin/sh'], { timeout: 5000 });
+      const pipeVal = execFileSync('tmux', ['-L', testSocket, 'display-message', '-p', '-t', 'probe', '#{pane_pipe}'], { encoding: 'utf8', timeout: 5000 }).trim();
+      execFileSync('tmux', ['-L', testSocket, 'kill-session', '-t', 'probe'], { timeout: 5000 });
+      if (pipeVal !== '0' && pipeVal !== '1') throw new Error(`unexpected pane_pipe value: ${pipeVal}`);
+      return 'pipe-pane supported';
+    } catch (e) {
+      try { execFileSync('tmux', ['-L', testSocket, 'kill-server'], { timeout: 3000 }); } catch { /* ok */ }
+      throw e;
+    }
+  }));
+
+  // Port availability
+  checks.push(check(`Daemon port ${config.daemon.port} available`, () => {
+    try {
+      const out = execFileSync('lsof', ['-i', `:${config.daemon.port}`, '-t'], { encoding: 'utf8', timeout: 5000 }).trim();
+      if (out) throw new Error(`port ${config.daemon.port} in use by PID ${out.split('\n')[0]}`);
+    } catch (e: unknown) {
+      if ((e as { status?: number }).status === 1) return 'port free';
+      throw e;
+    }
+    return 'port free';
+  }));
+
   // Statusline dir
   checks.push(check('Statusline directory readable', () => {
     if (!existsSync(config.statusline.directory)) throw new Error(`${config.statusline.directory} not found`);
     return config.statusline.directory;
   }));
+
+  // Slack prerequisites (when enabled)
+  if (config.slack.enabled) {
+    checks.push(check('Slack bot token configured', () => {
+      const token = process.env[config.slack.bot_token_env];
+      if (!token) throw new Error(`env var ${config.slack.bot_token_env} not set`);
+      return 'set';
+    }));
+    checks.push(check('Slack app token configured', () => {
+      const token = process.env[config.slack.app_token_env];
+      if (!token) throw new Error(`env var ${config.slack.app_token_env} not set`);
+      return 'set';
+    }));
+  }
 
   printResults(checks);
   const failed = checks.filter((c) => !c.ok);

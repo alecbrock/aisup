@@ -114,7 +114,7 @@ Or simply run `aisup daemon start` — it detects stale PIDs automatically.
 
 ### Daemon crash during switch
 
-The daemon persists `switch_tx` before each switch phase. On restart, it reads `switch_tx` and resumes from the last completed phase. No manual action needed in most cases.
+The daemon persists `switch_tx` before each switch phase. On restart, it detects interrupted switch transactions and logs them as `recovery.failed`. **Note:** automatic switch-transaction resumption is not yet implemented — interrupted switches require manual intervention via `aisup failover --to <account>` or `aisup stop && aisup start`.
 
 If the source tmux session lingers after daemon crash:
 ```bash
@@ -126,7 +126,7 @@ aisup daemon start    # rehydration handles the rest
 
 Symptom: `aisup status` shows a session but `tmux list-sessions` shows nothing.
 
-The daemon detects this on startup and runs crash recovery (same-account restart or account switch). If recovery fails, the session enters `EXHAUSTED`.
+The daemon detects this on startup and logs a `session.destroyed_externally` event. **Note:** automatic crash recovery (same-account restart or account switch) is not yet implemented — use `aisup start` to create a new session manually.
 
 ### EXHAUSTED state
 
@@ -148,7 +148,7 @@ aisup start --cwd /path/to/project
 
 ### Failed switch target
 
-When a target launch fails, aisup records the attempt and retries the next eligible account. If all targets fail after source termination, the session enters `EXHAUSTED`. Check `aisup log` for `runner.launch_failed` events to diagnose.
+When a target launch fails during `performSwitch`, aisup records the attempt and retries the next eligible account (for automatic switches). If all targets fail after source termination, the switch returns `exhausted` status. Check `aisup log` for `runner.launch_failed` events to diagnose. **Note:** automatic switch-triggered retries from daemon monitoring loops are not yet wired — manual failover via `aisup failover --to <account>` is the current path.
 
 ### Port conflict
 

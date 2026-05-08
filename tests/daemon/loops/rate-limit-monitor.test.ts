@@ -87,4 +87,28 @@ describe('RateLimitMonitor loop', () => {
       resolve();
     }, 150));
   });
+
+  it('should call onBreach with real threshold result when tick function reads breaching telemetry', () => {
+    const onBreach = vi.fn();
+    const monitor = new RateLimitMonitor({ intervalMs: 50, onThresholdBreach: onBreach });
+    const telemetry = makeTelemetry(96, 50); // hard threshold breach
+    monitor.start(() => monitor.tick(telemetry, SOFT, HARD));
+    return new Promise<void>((resolve) => setTimeout(() => {
+      monitor.stop();
+      expect(onBreach).toHaveBeenCalledWith(expect.objectContaining({ level: 'hard' }));
+      resolve();
+    }, 120));
+  });
+
+  it('should NOT call onBreach when tick reads sub-threshold telemetry', () => {
+    const onBreach = vi.fn();
+    const monitor = new RateLimitMonitor({ intervalMs: 50, onThresholdBreach: onBreach });
+    const telemetry = makeTelemetry(50, 50);
+    monitor.start(() => monitor.tick(telemetry, SOFT, HARD));
+    return new Promise<void>((resolve) => setTimeout(() => {
+      monitor.stop();
+      expect(onBreach).not.toHaveBeenCalled();
+      resolve();
+    }, 120));
+  });
 });

@@ -34,7 +34,14 @@ function tmuxTest(...args: string[]): string {
 
 function hasTmux(): boolean {
   const r = spawnSync('which', ['tmux']);
-  return r.status === 0;
+  if (r.status !== 0) return false;
+  try {
+    execFileSync('tmux', ['-L', TEST_SOCKET, 'new-session', '-d', '-s', 'aisup-probe', '/bin/sh'], { timeout: 5000 });
+    execFileSync('tmux', ['-L', TEST_SOCKET, 'kill-session', '-t', 'aisup-probe'], { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const runIf = hasTmux() ? it : it.skip;

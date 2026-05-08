@@ -1,6 +1,6 @@
 # aisup
 
-AI supervisor daemon for Claude/Pilot coding sessions. Provides multi-account failover, Slack remote control, workflow skill propagation, and session observability.
+AI supervisor daemon for Claude/Pilot coding sessions. Targets multi-account failover, Slack remote control, workflow skill propagation, and session observability. Phase 1 provides the core primitives (session management, account scoring, transcript migration, event journal); full automated failover orchestration and Slack control are in progress for Phase 2.
 
 ## Prerequisites
 

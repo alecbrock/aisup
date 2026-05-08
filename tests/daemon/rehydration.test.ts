@@ -1,0 +1,274 @@
+/**
+ * Deterministic fixture tests for rehydration recovery.
+ * Uses vi.mock for tmux operations and real filesystem for state files.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+// Mock tmux operations before importing rehydration
+vi.mock('../../src/session/tmux.js', () => ({
+  isPipePaneActive: vi.fn().mockReturnValue(true),
+  startOutputLog: vi.fn(),
+  isProcessDead: vi.fn().mockReturnValue(false),
+  destroyTmuxSession: vi.fn(),
+  listSessions: vi.fn().mockReturnValue([]),
+  createTmuxSession: vi.fn().mockResolvedValue(undefined),
+  stopPipePane: vi.fn(),
+  sendInterrupt: vi.fn(),
+  sendEnter: vi.fn(),
+  sendText: vi.fn(),
+  sendControl: vi.fn(),
+  captureOutput: vi.fn().mockReturnValue(''),
+  getSessionId: vi.fn().mockReturnValue('$1'),
+  getPaneId: vi.fn().mockReturnValue('%1'),
+  respawnPane: vi.fn(),
+  getPaneDeadStatus: vi.fn().mockReturnValue(''),
+}));
+
+import { rehydrateSessions, type RehydrationDeps } from '../../src/daemon/rehydration.js';
+import * as tmuxModule from '../../src/session/tmux.js';
+import type { SessionState } from '../../src/session/types.js';
+
+function makeSessionState(overrides: Partial<SessionState> = {}): SessionState {
+  return {
+    aisup_session_id: 'sess-001',
+    status: 'ACTIVE',
+    account: 'primary',
+    tmux_name: 'aisup-sess0001',
+    tmux_session_id: '$1',
+    pane_id: '%1',
+    cwd: '/tmp/project',
+    launch_started_at: new Date().toISOString(),
+    claude_session_id: null,
+    transcript_path: null,
+    plan_path: null,
+    active_skill: null,
+    output_log_path: '/tmp/output.log',
+    switch_tx: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function setupStateDir(tmpDir: string, sessions: SessionState[]): string {
+  const stateDir = join(tmpDir, 'sessions');
+  for (const s of sessions) {
+    const sessionDir = join(stateDir, s.aisup_session_id);
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sessionDir, 'state.json'), JSON.stringify(s, null, 2), { mode: 0o600 });
+  }
+  return stateDir;
+}
+
+function makeFakeDeps(overrides: Partial<RehydrationDeps> = {}): RehydrationDeps & { tmpDir: string; setSessionState: ReturnType<typeof vi.fn>; journal: { append: ReturnType<typeof vi.fn> } } {
+  const setSessionState = vi.fn();
+  const journal = { append: vi.fn().mockResolvedValue(undefined) };
+  return {
+    stateDir: '/placeholder',
+    tmuxSocket: 'aisup-test',
+    liveSessions: new Set<string>(),
+    setSessionState,
+    journal,
+    ...overrides,
+    tmpDir: '',
+  } as unknown as ReturnType<typeof makeFakeDeps>;
+}
+
+describe('rehydrateSessions', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'aisup-rehy-'));
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('should restore pipe-pane for live ACTIVE session where pipe-pane is disabled', async () => {
+    const session = makeSessionState({ output_log_path: join(tmpDir, 'output.log') });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isPipePaneActive).mockReturnValue(false);
+
+    const deps: RehydrationDeps = {
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name]),
+      setSessionState: vi.fn(),
+      journal: { append: vi.fn().mockResolvedValue(undefined) },
+    };
+
+    await rehydrateSessions(deps);
+
+    expect(tmuxModule.startOutputLog).toHaveBeenCalledWith(
+      'aisup-test', session.tmux_name, session.output_log_path
+    );
+  });
+
+  it('should NOT call startOutputLog when pipe-pane is already active', async () => {
+    const session = makeSessionState({ output_log_path: join(tmpDir, 'output.log') });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isPipePaneActive).mockReturnValue(true);
+
+    const deps: RehydrationDeps = {
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name]),
+      setSessionState: vi.fn(),
+      journal: { append: vi.fn().mockResolvedValue(undefined) },
+    };
+
+    await rehydrateSessions(deps);
+
+    expect(tmuxModule.startOutputLog).not.toHaveBeenCalled();
+  });
+
+  it('should clear switch_tx and return to ACTIVE for snapshot phase', async () => {
+    const session = makeSessionState({
+      status: 'SWITCHING',
+      switch_tx: {
+        switch_phase: 'snapshot',
+        source_account: 'primary',
+        target_account: 'account2',
+        source_tmux_name: 'aisup-sess0001',
+        source_tmux_session_id: '$1',
+        source_pane_id: '%1',
+        target_tmux_name: null,
+        target_tmux_session_id: null,
+        target_pane_id: null,
+        source_transcript_path: null,
+        source_transcript_sha256: null,
+        source_destroyed: false,
+        tried_accounts: [],
+        phase_timestamps: {},
+        error_summary: null,
+      },
+    });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isProcessDead).mockReturnValue(false);
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const setSessionState = vi.fn();
+    const deps: RehydrationDeps = {
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name]),
+      setSessionState,
+      journal,
+    };
+
+    await rehydrateSessions(deps);
+
+    // Should journal a recovery event and restore to ACTIVE
+    const appendCalls = journal.append.mock.calls.map((c) => c[0].event_type);
+    expect(appendCalls).toContain('recovery.success');
+    expect(setSessionState).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'ACTIVE', aisup_session_id: session.aisup_session_id })
+    );
+  });
+
+  it('should kill source tmux and advance for stopping phase when source pane is dead', async () => {
+    const session = makeSessionState({
+      status: 'SWITCHING',
+      switch_tx: {
+        switch_phase: 'stopping',
+        source_account: 'primary',
+        target_account: 'account2',
+        source_tmux_name: 'aisup-sess0001',
+        source_tmux_session_id: '$1',
+        source_pane_id: '%1',
+        target_tmux_name: null,
+        target_tmux_session_id: null,
+        target_pane_id: null,
+        source_transcript_path: null,
+        source_transcript_sha256: null,
+        source_destroyed: false,
+        tried_accounts: [],
+        phase_timestamps: {},
+        error_summary: null,
+      },
+    });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isProcessDead).mockReturnValue(true);
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const deps: RehydrationDeps = {
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name]),
+      setSessionState: vi.fn(),
+      journal,
+    };
+
+    await rehydrateSessions(deps);
+
+    expect(tmuxModule.destroyTmuxSession).toHaveBeenCalledWith('aisup-test', session.tmux_name);
+    const appendCalls = journal.append.mock.calls.map((c) => c[0].event_type);
+    expect(appendCalls).toContain('recovery.failed');
+  });
+
+  it('should log recovery.failed and leave STOPPING → clear switch_tx when source pane is alive', async () => {
+    const session = makeSessionState({
+      status: 'SWITCHING',
+      switch_tx: {
+        switch_phase: 'stopping',
+        source_account: 'primary',
+        target_account: 'account2',
+        source_tmux_name: 'aisup-sess0001',
+        source_tmux_session_id: '$1',
+        source_pane_id: '%1',
+        target_tmux_name: null,
+        target_tmux_session_id: null,
+        target_pane_id: null,
+        source_transcript_path: null,
+        source_transcript_sha256: null,
+        source_destroyed: false,
+        tried_accounts: [],
+        phase_timestamps: {},
+        error_summary: null,
+      },
+    });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isProcessDead).mockReturnValue(false);
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const setSessionState = vi.fn();
+    const deps: RehydrationDeps = {
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name]),
+      setSessionState,
+      journal,
+    };
+
+    await rehydrateSessions(deps);
+
+    // Source alive during stopping → clear switch_tx, return to ACTIVE
+    expect(setSessionState).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'ACTIVE', aisup_session_id: session.aisup_session_id })
+    );
+  });
+
+  it('should handle state-without-tmux: ACTIVE session no live tmux logs event', async () => {
+    const session = makeSessionState();
+    const stateDir = setupStateDir(tmpDir, [session]);
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const deps: RehydrationDeps = {
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set<string>(), // no live tmux sessions
+      setSessionState: vi.fn(),
+      journal,
+    };
+
+    await rehydrateSessions(deps);
+
+    const appendCalls = journal.append.mock.calls.map((c) => c[0].event_type);
+    expect(appendCalls).toContain('session.destroyed_externally');
+  });
+});
