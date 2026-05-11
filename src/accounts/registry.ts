@@ -7,7 +7,6 @@ export class AccountRegistry {
   constructor(config: AisupConfig) {
     this.accounts = new Map(
       config.accounts
-        .filter((a) => a.enabled !== false)
         .map((a) => [
           a.name,
           {

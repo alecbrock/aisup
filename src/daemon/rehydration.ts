@@ -133,6 +133,7 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
 
   let rehydrated = 0;
   const orphans: string[] = [];
+  const matchedTmuxNames = new Set<string>();
   let sessionIds: string[];
   try {
     sessionIds = readdirSync(stateDir);
@@ -145,6 +146,7 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
     if (!state) continue;
 
     const hasTmux = liveSessions.has(state.tmux_name);
+    if (hasTmux) matchedTmuxNames.add(state.tmux_name);
 
     // Handle interrupted switch transactions first
     if (state.status === 'SWITCHING' && state.switch_tx?.switch_phase) {
@@ -152,7 +154,23 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
       continue;
     }
 
-    if (state.status === 'ACTIVE' || state.status === 'SWITCH_PENDING_AT_IDLE') {
+    if (state.status === 'SWITCHING' && !state.switch_tx?.switch_phase) {
+      setSessionState({ status: 'SWITCHING', aisup_session_id: sessionId, hasTmux });
+      await journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'recovery.failed',
+        aisup_session_id: sessionId,
+        details: { reason: 'malformed_or_missing_switch_tx', status: state.status, has_tmux: hasTmux },
+      });
+    } else if (state.status === 'CREATING' || state.status === 'STOPPING') {
+      setSessionState({ status: state.status, aisup_session_id: sessionId, hasTmux });
+      await journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'recovery.failed',
+        aisup_session_id: sessionId,
+        details: { reason: 'operation_interrupted', status: state.status, has_tmux: hasTmux },
+      });
+    } else if (state.status === 'ACTIVE' || state.status === 'SWITCH_PENDING_AT_IDLE') {
       if (!hasTmux) {
         await journal.append({
           ts: new Date().toISOString(),
@@ -160,6 +178,7 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
           aisup_session_id: sessionId,
           details: { persisted_status: state.status, tmux_name: state.tmux_name },
         });
+        setSessionState({ status: state.status, aisup_session_id: sessionId, hasTmux: false });
       } else {
         // Restore pipe-pane if it's no longer active
         if (!isPipePaneActive(tmuxSocket, state.tmux_name)) {
@@ -173,11 +192,12 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
             });
           } catch { /* non-fatal — pipe-pane restore is best-effort */ }
         }
-        setSessionState({ status: state.status, aisup_session_id: sessionId });
+        setSessionState({ status: state.status, aisup_session_id: sessionId, hasTmux: true });
         rehydrated++;
       }
     } else if (state.status === 'STOPPED' && hasTmux) {
       orphans.push(state.tmux_name);
+      setSessionState({ status: 'STOPPED', aisup_session_id: sessionId, hasTmux: true });
       await journal.append({
         ts: new Date().toISOString(),
         event_type: 'session.destroyed_externally',
@@ -189,8 +209,7 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
 
   // Report orphan tmux sessions with no persisted state
   for (const tmuxName of liveSessions) {
-    const sessionId = tmuxName.replace(/^aisup-/, '');
-    if (!existsSync(join(stateDir, sessionId, 'state.json'))) {
+    if (!matchedTmuxNames.has(tmuxName)) {
       orphans.push(tmuxName);
     }
   }

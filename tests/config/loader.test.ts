@@ -260,4 +260,40 @@ accounts:
     const config = await loadConfig(join(configDir, 'config.yaml'));
     expect(config.accounts[0].config_dir).toBe(accountDir);
   });
+
+  it('should require configured account dirs to exist', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+
+    const yaml = `
+accounts:
+  - name: primary
+    config_dir: ${join(tmpDir, 'missing account dir')}
+`;
+    writeFileSync(join(configDir, 'config.yaml'), yaml);
+
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/config_dir.*not found|account.*not found/i);
+  });
+
+  it('should expand statusline.directory and validate Slack enabled prerequisites', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    mkdirSync(join(tmpDir, 'statusline'));
+
+    const yaml = `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+statusline:
+  directory: ~/statusline
+slack:
+  enabled: true
+  allowed_user_ids: []
+`;
+    writeFileSync(join(configDir, 'config.yaml'), yaml);
+
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/allowed_user_ids/i);
+  });
 });

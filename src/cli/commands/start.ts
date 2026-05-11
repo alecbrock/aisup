@@ -1,7 +1,12 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync, accessSync, constants } from 'node:fs';
+import { resolve } from 'node:path';
+import { loadConfig } from '../../config/loader.js';
+import { buildLaunchCommand, validateRunner } from '../../runner/builder.js';
+import { getBlockingSession, canStartNewSession } from '../pid.js';
+import { listSessions } from '../../session/tmux.js';
 
 const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
 
@@ -44,8 +49,33 @@ export async function sessionStart(opts: {
   const cwd = opts.cwd ?? process.cwd();
 
   if (opts.dryRun) {
-    console.log(`[dry-run] cwd: ${cwd}`);
-    console.log('[dry-run] Would POST /api/sessions to daemon');
+    const resolvedCwd = resolve(cwd);
+    if (!existsSync(resolvedCwd) || !statSync(resolvedCwd).isDirectory()) {
+      throw new Error(`cwd does not exist or is not a directory: ${resolvedCwd}`);
+    }
+    const config = await loadConfig();
+    const liveSessions = listSessions('aisup').filter((s) => s.startsWith('aisup-'));
+    const blocking = getBlockingSession(join(homedir(), '.aisup', 'sessions'), liveSessions);
+    const admission = canStartNewSession(blocking);
+    if (!admission.allowed) {
+      throw new Error(admission.reason);
+    }
+    let planPath: string | null = null;
+    if (opts.plan) {
+      planPath = resolve(opts.plan);
+      accessSync(planPath, constants.R_OK);
+      if (!statSync(planPath).isFile()) throw new Error(`plan is not a file: ${planPath}`);
+    }
+    const account = config.accounts
+      .filter((a) => a.enabled)
+      .sort((a, b) => a.priority - b.priority)[0];
+    if (!account) throw new Error('no enabled account configured');
+    const runner = { ...config.runner, command: validateRunner(config.runner) };
+    const command = buildLaunchCommand(runner, account.config_dir);
+    console.log(`[dry-run] cwd: ${resolvedCwd}`);
+    if (planPath) console.log(`[dry-run] plan: ${planPath}`);
+    console.log(`[dry-run] account: ${account.name}`);
+    console.log(`[dry-run] command: ${command.execString}`);
     return;
   }
 

@@ -4,7 +4,7 @@
  * Bolt App is mocked to avoid real Slack connections.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -348,5 +348,40 @@ describe('SlackService', () => {
     });
     await svc.start();
     expect(svc.getChannelId('nonexistent')).toBeNull();
+  });
+
+  it('relays new output-log diffs to the mapped channel when relay is enabled', async () => {
+    vi.useFakeTimers();
+    const outputPath = join(tmpDir, 'output.log');
+    writeFileSync(outputPath, 'already seen\n');
+    const session = makeSession({ output_log_path: outputPath });
+    sessionManager.getActiveSession.mockReturnValue(session);
+
+    const svc = new SlackService({
+      config: makeConfig({ relay_output_enabled: true, redaction_patterns: ['SECRET=[^\\s]+'] }),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+    const internals = svc as unknown as {
+      channelMap: Map<string, string>;
+      relayEnabled: Map<string, boolean>;
+    };
+    internals.channelMap.set(session.aisup_session_id, 'C123');
+    internals.relayEnabled.set('C123', true);
+
+    writeFileSync(outputPath, 'already seen\nnew SECRET=value line\n');
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    expect(appInstance.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      channel: 'C123',
+      text: expect.stringContaining('[REDACTED]'),
+    }));
+    await svc.stop();
+    vi.useRealTimers();
   });
 });

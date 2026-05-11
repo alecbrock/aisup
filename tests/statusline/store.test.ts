@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   listTelemetryFiles,
+  readTelemetryForActiveSession,
   readTelemetryForAccount,
   readTelemetryForSession,
   epochSecondsToDate,
@@ -205,6 +206,61 @@ describe('readTelemetryForSession', () => {
   it('should return null telemetry when file does not exist', () => {
     const result = readTelemetryForSession('no-such-id', configDir, '/tmp', statuslineDir);
     expect(result.telemetry).toBeNull();
+    expect(result.mismatch).toBeNull();
+  });
+});
+
+describe('readTelemetryForActiveSession', () => {
+  let tmpDir: string;
+  let statuslineDir: string;
+  let configDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'aisup-sl-active-'));
+    statuslineDir = join(tmpDir, 'statusline');
+    configDir = join(tmpDir, '.claude');
+    mkdirSync(statuslineDir);
+    mkdirSync(configDir);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('uses exact statusline file when claude_session_id is known', async () => {
+    const knownId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const newerId = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+    const session: SessionState = {
+      aisup_session_id: 'sess-001',
+      status: 'ACTIVE',
+      account: 'primary',
+      tmux_name: 'aisup-sess001',
+      tmux_session_id: null,
+      pane_id: null,
+      cwd: '/home/project',
+      launch_started_at: new Date().toISOString(),
+      claude_session_id: knownId,
+      transcript_path: null,
+      plan_path: null,
+      active_skill: null,
+      output_log_path: join(tmpDir, 'output.log'),
+      switch_tx: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    writeFileSync(
+      join(statuslineDir, `statusline-${knownId}.json`),
+      JSON.stringify(makeTelemetry({ session_id: knownId, transcript_path: `${configDir}/projects/known.jsonl`, cwd: '/home/project' }))
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    writeFileSync(
+      join(statuslineDir, `statusline-${newerId}.json`),
+      JSON.stringify(makeTelemetry({ session_id: newerId, transcript_path: `${configDir}/projects/newer.jsonl`, cwd: '/home/project' }))
+    );
+
+    const result = readTelemetryForActiveSession(session, configDir, statuslineDir, 300);
+    expect(result.telemetry?.session_id).toBe(knownId);
     expect(result.mismatch).toBeNull();
   });
 });

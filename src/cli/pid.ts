@@ -1,5 +1,6 @@
 import { writeFile, readFile, unlink, rename } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { SessionInfo, StartAllowedResult } from '../session/types.js';
 
 export interface PidData {
@@ -74,4 +75,48 @@ export function canStartNewSession(session: SessionInfo | null): StartAllowedRes
     default:
       return { allowed: false, reason: `Unknown session status: ${status as string}` };
   }
+}
+
+export function getBlockingSession(stateDir: string, liveTmuxSessions: string[]): SessionInfo | null {
+  const live = new Set(liveTmuxSessions);
+  if (!existsSync(stateDir)) {
+    if (live.size > 0) {
+      return { status: 'STOPPED', hasTmux: true };
+    }
+    return null;
+  }
+
+  let stoppedWithLive: SessionInfo | null = null;
+  try {
+    for (const entry of readdirSync(stateDir)) {
+      const path = join(stateDir, entry, 'state.json');
+      if (!existsSync(path)) continue;
+      let parsed: { aisup_session_id?: string; status?: string; tmux_name?: string } | null = null;
+      try {
+        parsed = JSON.parse(readFileSync(path, 'utf8')) as { aisup_session_id?: string; status?: string; tmux_name?: string };
+      } catch {
+        continue;
+      }
+      if (!parsed?.status) continue;
+      const hasTmux = parsed.tmux_name ? live.has(parsed.tmux_name) : false;
+      const info: SessionInfo = {
+        status: parsed.status as SessionInfo['status'],
+        aisup_session_id: parsed.aisup_session_id ?? entry,
+        hasTmux,
+      };
+      if (info.status === 'STOPPED') {
+        if (hasTmux) stoppedWithLive = info;
+        continue;
+      }
+      return info;
+    }
+  } catch {
+    return null;
+  }
+
+  if (stoppedWithLive) return stoppedWithLive;
+  for (const name of live) {
+    if (name.startsWith('aisup-')) return { status: 'STOPPED', hasTmux: true };
+  }
+  return null;
 }

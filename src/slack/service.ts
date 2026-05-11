@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { App } from '@slack/bolt';
 import {
@@ -30,6 +30,9 @@ export class SlackService {
   private app: App | null = null;
   private channelMap = new Map<string, string>(); // sessionId → channelId
   private relayEnabled = new Map<string, boolean>(); // channelId → relay on/off
+  private relayHandle: ReturnType<typeof setInterval> | null = null;
+  private outputCursors = new Map<string, { path: string; offset: number; generation: number }>();
+  private lastPostTime = new Map<string, number>();
   private confirmations = new ConfirmationStore(60_000);
   private redactionPatterns: RegExp[];
 
@@ -56,9 +59,13 @@ export class SlackService {
     });
 
     await this.app.start();
+    if (config.relay_output_enabled) {
+      this.startRelay();
+    }
   }
 
   async stop(): Promise<void> {
+    this.stopRelay();
     if (this.app) {
       await this.app.stop();
       this.app = null;
@@ -131,6 +138,15 @@ export class SlackService {
     } catch { /* best effort */ }
   }
 
+  resetRelayCursor(sessionId: string, path: string): void {
+    const existing = this.outputCursors.get(sessionId);
+    this.outputCursors.set(sessionId, {
+      path,
+      offset: 0,
+      generation: (existing?.generation ?? 0) + 1,
+    });
+  }
+
   getChannelId(sessionId: string): string | null {
     return this.channelMap.get(sessionId) ?? null;
   }
@@ -140,7 +156,14 @@ export class SlackService {
     say: (text: string) => Promise<void>
   ): Promise<void> {
     // Ignore bot messages (echo prevention)
-    if (isBotMessage(message as Parameters<typeof isBotMessage>[0])) return;
+    if (isBotMessage(message as Parameters<typeof isBotMessage>[0])) {
+      await this.opts.journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'slack.message_ignored',
+        details: { reason: 'bot_or_system_message', subtype: String(message['subtype'] ?? ''), channel: String(message['channel'] ?? '') },
+      });
+      return;
+    }
 
     const userId = message['user'] as string | undefined;
     const text = (message['text'] as string | undefined) ?? '';
@@ -157,7 +180,20 @@ export class SlackService {
     }
 
     const cmd = parseCommand(text);
-    if (!cmd) return; // not a command — no relay in Phase 1
+    if (!cmd) {
+      const session = this.opts.sessionManager.getActiveSession();
+      if (session && this.opts.config.relay_output_enabled && this.relayEnabled.get(channelId)) {
+        sendText(this.opts.tmuxSocket, session.tmux_name, text);
+        sendEnter(this.opts.tmuxSocket, session.tmux_name);
+      } else {
+        await this.opts.journal.append({
+          ts: new Date().toISOString(),
+          event_type: 'slack.message_ignored',
+          details: { reason: 'relay_disabled', channel: channelId },
+        });
+      }
+      return;
+    }
 
     await this.dispatchCommand(cmd.name, cmd.args, userId, channelId, say);
   }
@@ -204,7 +240,7 @@ export class SlackService {
           if (!session) { await say('No active session.'); return; }
           sendText(tmuxSocket, session.tmux_name, pendingCmd.payload);
           sendEnter(tmuxSocket, session.tmux_name);
-          await say(`Sent: \`${pendingCmd.payload}\``);
+          await say(`Sent: \`${this.redactAndTruncate(pendingCmd.payload, 300)}\``);
           return;
         }
         await say('No pending confirmation.');
@@ -223,12 +259,12 @@ export class SlackService {
         if (!session) { await say('No active session.'); return; }
         if (config.cmd_require_confirmation) {
           this.confirmations.set(channelId, userId, 'cmd', args);
-          await say(`Will send: \`${args}\`. Reply \`!confirm\` within 60s.`);
+          await say(`Will send: \`${this.redactAndTruncate(args, 300)}\`. Reply \`!confirm\` within 60s.`);
           return;
         }
         sendText(tmuxSocket, session.tmux_name, args);
         sendEnter(tmuxSocket, session.tmux_name);
-        await say(`Sent: \`${args}\``);
+        await say(`Sent: \`${this.redactAndTruncate(args, 300)}\``);
         break;
       }
 
@@ -279,5 +315,71 @@ export class SlackService {
     mkdirSync(dirname(channelMapPath), { recursive: true, mode: 0o700 });
     const obj = Object.fromEntries(this.channelMap);
     writeFileSync(channelMapPath, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  }
+
+  private startRelay(): void {
+    if (this.relayHandle) return;
+    this.relayHandle = setInterval(() => {
+      void this.pollRelay();
+    }, 10_000);
+  }
+
+  private stopRelay(): void {
+    if (!this.relayHandle) return;
+    clearInterval(this.relayHandle);
+    this.relayHandle = null;
+  }
+
+  private async pollRelay(): Promise<void> {
+    if (!this.app || !this.opts.config.relay_output_enabled) return;
+    const session = this.opts.sessionManager.getActiveSession();
+    if (!session) return;
+    const channelId = this.channelMap.get(session.aisup_session_id);
+    if (!channelId || !this.relayEnabled.get(channelId)) return;
+
+    const path = session.output_log_path;
+    let cursor = this.outputCursors.get(session.aisup_session_id);
+    if (!cursor || cursor.path !== path) {
+      cursor = { path, offset: 0, generation: 0 };
+      this.outputCursors.set(session.aisup_session_id, cursor);
+    }
+
+    try {
+      const size = statSync(path).size;
+      if (size < cursor.offset) {
+        cursor.offset = 0;
+        cursor.generation += 1;
+      }
+      if (size === cursor.offset) return;
+      const content = readFileSync(path, 'utf8').slice(cursor.offset);
+      if (!content) {
+        cursor.offset = size;
+        return;
+      }
+
+      const last = this.lastPostTime.get(channelId);
+      if (last !== undefined && Date.now() - last < 5000) return;
+
+      const redacted = this.redactAndTruncate(content, 3500);
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: redacted,
+      });
+      cursor.offset = size;
+      this.lastPostTime.set(channelId, Date.now());
+    } catch (err) {
+      await this.opts.journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'slack.queue_dropped',
+        aisup_session_id: session.aisup_session_id,
+        details: { reason: 'relay_poll_failed', error: String(err).slice(0, 300) },
+      });
+    }
+  }
+
+  private redactAndTruncate(text: string, maxLen: number): string {
+    const redacted = redactSecrets(text, this.redactionPatterns);
+    if (redacted.length <= maxLen) return redacted;
+    return redacted.slice(0, maxLen - 20) + '\n[truncated]';
   }
 }

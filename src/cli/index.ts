@@ -53,7 +53,8 @@ program
 program
   .command('status')
   .description('Show daemon and session status')
-  .action(() => void showStatus());
+  .option('--json', 'Print machine-readable JSON')
+  .action((opts: { json?: boolean }) => void showStatus({ json: opts.json ?? false }));
 
 program
   .command('log')

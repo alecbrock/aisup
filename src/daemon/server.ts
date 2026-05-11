@@ -1,14 +1,19 @@
 import Fastify from 'fastify';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync, accessSync, constants } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { canStartNewSession } from '../cli/pid.js';
-import type { SessionInfo } from '../session/types.js';
+import type { SessionInfo, SessionState } from '../session/types.js';
 import type { SessionManager } from '../session/manager.js';
 import type { AccountRegistry } from '../accounts/registry.js';
 import type { JournalWriter } from '../journal/types.js';
 import { validateManualFailoverTarget, performSwitch } from '../failover/switcher.js';
 import { SwitchReason } from '../failover/types.js';
+import { buildLaunchCommand, buildResumeCommand } from '../runner/builder.js';
+import type { RunnerConfig } from '../config/schema.js';
+import { readEvents } from '../journal/reader.js';
 
 export interface DaemonServerOptions {
   tokenPath: string;
@@ -17,19 +22,23 @@ export interface DaemonServerOptions {
   sessionManager?: SessionManager;
   accountRegistry?: AccountRegistry;
   journal?: JournalWriter;
+  journalPath?: string;
   runnerConfig?: { command: string; args: string[]; env: Record<string, string> };
+  runner?: RunnerConfig;
+  onSessionStart?: (session: SessionState) => Promise<void> | void;
+  onSessionStop?: (session: SessionState, force: boolean) => Promise<void> | void;
 }
 
 declare module 'fastify' {
   interface FastifyInstance {
     setReady(): void;
-    setSessionState(session: SessionInfo | null): void;
+    setSessionState(session: SessionInfo | Partial<SessionState> | null): void;
   }
 }
 
 export async function createDaemonServer(opts: DaemonServerOptions): Promise<FastifyInstance> {
   let ready = false;
-  let sessionState: SessionInfo | null = null;
+  let sessionState: SessionInfo | Partial<SessionState> | null = null;
   let bearerToken: string | null = null;
 
   if (existsSync(opts.tokenPath)) {
@@ -66,20 +75,31 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
   });
 
   app.post('/api/sessions', async (req, reply) => {
-    const check = canStartNewSession(sessionState);
+    const blockingSession = opts.sessionManager?.getBlockingSession?.() ?? (sessionState as SessionInfo | null);
+    const check = canStartNewSession(blockingSession);
     if (!check.allowed) {
-      const isExhausted = sessionState?.status === 'EXHAUSTED';
+      const isExhausted = blockingSession?.status === 'EXHAUSTED';
       return reply.status(409).send({ error: check.reason, exhausted: isExhausted });
     }
 
     const body = req.body as { cwd?: string; plan?: string } | undefined;
-    const cwd = body?.cwd ?? process.cwd();
+    const cwd = resolve(body?.cwd ?? process.cwd());
 
-    if (!existsSync(cwd)) {
+    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
       return reply.status(400).send({ error: `cwd does not exist or is not a directory: ${cwd}` });
     }
+    let planPath: string | null = null;
+    if (body?.plan) {
+      planPath = resolve(body.plan);
+      try {
+        accessSync(planPath, constants.R_OK);
+        if (!statSync(planPath).isFile()) throw new Error('not a file');
+      } catch {
+        return reply.status(400).send({ error: `plan does not exist or is not readable: ${planPath}` });
+      }
+    }
 
-    if (!opts.sessionManager || !opts.accountRegistry || !opts.runnerConfig) {
+    if (!opts.sessionManager || !opts.accountRegistry || (!opts.runnerConfig && !opts.runner)) {
       return reply.status(201).send({ status: 'created', cwd, message: 'deps not wired' });
     }
 
@@ -89,40 +109,62 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
       return reply.status(409).send({ error: 'no eligible account available' });
     }
 
-    const aisupSessionId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const aisupSessionId = randomUUID();
+    const launchCommand = opts.runner
+      ? buildLaunchCommand(opts.runner, bestAccount.configDir)
+      : opts.runnerConfig!;
     try {
       const state = await opts.sessionManager.createSession({
         aisupSessionId,
         account: bestAccount.name,
         accountConfigDir: bestAccount.configDir,
-        command: opts.runnerConfig.command,
-        args: opts.runnerConfig.args,
-        env: opts.runnerConfig.env,
+        command: launchCommand.command,
+        args: launchCommand.args,
+        env: launchCommand.env,
         cwd,
+        planPath,
       });
-      sessionState = { status: state.status, aisup_session_id: state.aisup_session_id };
+      sessionState = state;
+      await opts.journal?.append({
+        ts: new Date().toISOString(),
+        event_type: 'session.start',
+        aisup_session_id: state.aisup_session_id,
+        details: { account: bestAccount.name, cwd, tmux_name: state.tmux_name, plan_path: planPath },
+      });
+      await opts.onSessionStart?.(state);
       return reply.status(201).send({ status: 'created', aisup_session_id: state.aisup_session_id, account: bestAccount.name, cwd });
     } catch (err) {
       return reply.status(500).send({ error: `session creation failed: ${String(err)}` });
     }
   });
 
-  app.delete('/api/sessions', async (_req, reply) => {
+  app.delete('/api/sessions', async (req, reply) => {
     if (!sessionState?.aisup_session_id || !opts.sessionManager) {
       return reply.send({ status: 'stopped', message: 'no active session' });
     }
+    const body = req.body as { force?: boolean } | undefined;
+    const force = body?.force === true;
     const state = opts.sessionManager.readState(sessionState.aisup_session_id);
     if (state) {
-      await opts.sessionManager.stopSession(state.tmux_name, state.aisup_session_id, { force: false });
+      await opts.sessionManager.stopSession(state.tmux_name, state.aisup_session_id, { force });
+      await opts.journal?.append({
+        ts: new Date().toISOString(),
+        event_type: 'session.stop',
+        aisup_session_id: state.aisup_session_id,
+        details: { reason: 'user_requested', force, account: state.account, cwd: state.cwd },
+      });
+      await opts.onSessionStop?.(state, force);
     }
     sessionState = null;
     return reply.send({ status: 'stopped' });
   });
 
   app.get('/api/events', async (req, reply) => {
-    const query = req.query as { limit?: string };
+    const query = req.query as { limit?: string; type?: string; since?: string };
     const limit = parseInt(query.limit ?? '20', 10);
-    return reply.send({ events: [], limit, note: 'read journal file for offline access' });
+    if (!opts.journalPath) return reply.send({ events: [], limit });
+    const events = await readEvents(opts.journalPath, { limit, type: query.type, since: query.since });
+    return reply.send({ events, limit });
   });
 
   app.get('/api/accounts', async (_req, reply) => {
@@ -143,7 +185,7 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     if (!sessionState || sessionState.status === 'STOPPED') {
       return reply.status(409).send({ error: 'No active session to failover' });
     }
-    if (!opts.accountRegistry || !opts.sessionManager || !opts.journal) {
+    if (!opts.accountRegistry || !opts.sessionManager || !opts.journal || (!opts.runnerConfig && !opts.runner)) {
       return reply.send({ target_account: body.target_account, launch_mode: 'pending', status: 'initiated' });
     }
 
@@ -175,21 +217,28 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
         sessionManager: opts.sessionManager,
         journal: opts.journal,
         createSessionForTarget: async (target, snapshot) => {
+          const commandForTarget = opts.runner
+            ? (snapshot.claudeSessionId
+              ? buildResumeCommand(opts.runner, target.configDir, snapshot.claudeSessionId)
+              : buildLaunchCommand(opts.runner, target.configDir))
+            : opts.runnerConfig!;
           return opts.sessionManager!.createSession({
             aisupSessionId: snapshot.aisupSessionId,
             account: target.name,
             accountConfigDir: target.configDir,
-            command: opts.runnerConfig!.command,
-            args: opts.runnerConfig!.args,
-            env: opts.runnerConfig!.env,
+            command: commandForTarget.command,
+            args: commandForTarget.args,
+            env: commandForTarget.env,
             cwd: currentState?.cwd ?? process.cwd(),
+            planPath: snapshot.planFilePath,
           });
         },
       }
     );
 
     if (result.status === 'completed') {
-      sessionState = { status: 'ACTIVE', aisup_session_id: sessionState.aisup_session_id };
+      const nextState = opts.sessionManager.readState(sessionState.aisup_session_id!);
+      sessionState = nextState ?? { status: 'ACTIVE', aisup_session_id: sessionState.aisup_session_id };
       return reply.send({ target_account: result.targetAccount, launch_mode: 'switched', status: 'completed' });
     }
     return reply.status(503).send({ error: result.error, tried: result.triedAccounts, status: result.status });

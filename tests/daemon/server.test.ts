@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -101,5 +101,51 @@ describe('daemon HTTP server', () => {
     });
     // 200 or 201 — session created (stub)
     expect([200, 201]).toContain(res.statusCode);
+  });
+
+  it('rejects POST /api/sessions when cwd exists but is not a directory', async () => {
+    app.setReady();
+    const filePath = join(tmpDir, 'not-a-dir');
+    writeFileSync(filePath, 'x');
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/sessions',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd: filePath }),
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('passes DELETE /api/sessions force flag to SessionManager.stopSession', async () => {
+    await app.close();
+    const stopSession = vi.fn().mockResolvedValue(undefined);
+    const sessionManager = {
+      readState: vi.fn().mockReturnValue({
+        aisup_session_id: 'sess-001',
+        tmux_name: 'aisup-sess001',
+      }),
+      stopSession,
+      getBlockingSession: vi.fn().mockReturnValue(null),
+    };
+    app = await createDaemonServer({
+      tokenPath,
+      host: '127.0.0.1',
+      port: 0,
+      sessionManager: sessionManager as never,
+    });
+    app.setReady();
+    app.setSessionState({ status: 'ACTIVE', aisup_session_id: 'sess-001' });
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/sessions',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ force: true }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(stopSession).toHaveBeenCalledWith('aisup-sess001', 'sess-001', { force: true });
   });
 });

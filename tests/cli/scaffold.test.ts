@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -7,7 +7,9 @@ import {
   readPidFile,
   removePidFile,
   canStartNewSession,
+  getBlockingSession,
 } from '../../src/cli/pid.js';
+import { readOfflineSessionStates } from '../../src/cli/commands/status.js';
 import type { SessionStatus } from '../../src/session/types.js';
 
 describe('PID file management', () => {
@@ -108,5 +110,56 @@ describe('canStartNewSession', () => {
     const result = canStartNewSession({ status: 'STOPPED', hasTmux: true });
     expect(result.allowed).toBe(false);
     if (!result.allowed) expect(result.reason).toMatch(/inconsistent|orphan|force/i);
+  });
+});
+
+describe('offline session state helpers', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'aisup-offline-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('reads persisted state files for offline status', () => {
+    const stateDir = join(tmpDir, 'sessions');
+    const sessionDir = join(stateDir, 'sess-001');
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({
+      aisup_session_id: 'sess-001',
+      status: 'EXHAUSTED',
+      account: 'primary',
+      tmux_name: 'aisup-sess001',
+      cwd: tmpDir,
+      updated_at: '2026-05-11T00:00:00.000Z',
+    }));
+
+    expect(readOfflineSessionStates(stateDir)).toEqual([
+      expect.objectContaining({
+        aisup_session_id: 'sess-001',
+        status: 'EXHAUSTED',
+        account: 'primary',
+      }),
+    ]);
+  });
+
+  it('detects persisted blocking sessions before start admission', () => {
+    const stateDir = join(tmpDir, 'sessions');
+    const sessionDir = join(stateDir, 'sess-001');
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({
+      aisup_session_id: 'sess-001',
+      status: 'EXHAUSTED',
+      account: 'primary',
+      tmux_name: 'aisup-sess001',
+      cwd: tmpDir,
+      updated_at: '2026-05-11T00:00:00.000Z',
+    }));
+
+    const blocking = getBlockingSession(stateDir, []);
+    expect(blocking).toMatchObject({ status: 'EXHAUSTED', aisup_session_id: 'sess-001', hasTmux: false });
   });
 });

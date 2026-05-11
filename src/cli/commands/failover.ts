@@ -26,7 +26,7 @@ export async function triggerFailover(targetAccount: string): Promise<void> {
 
   if (!res.ok) {
     console.error(`Failover failed: ${body.error ?? res.statusText}`);
-    process.exit(res.status === 409 ? 0 : 1);
+    process.exit(1);
   }
 
   console.log(`Failover initiated → ${body.target_account} (${body.launch_mode ?? 'unknown mode'})`);

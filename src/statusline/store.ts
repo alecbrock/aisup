@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { StatuslineTelemetry, TelemetryFile } from './types.js';
+import type { SessionState } from '../session/types.js';
 
 const UUID_FILE_PATTERN = /^statusline-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.json$/;
 
@@ -118,13 +119,15 @@ export function readTelemetryForSession(
  * Scan for a matching statusline candidate before claude_session_id is known.
  * Accepts files with mtime ≥ launchStartedAt, transcript under current account, cwd matches.
  */
-export function readTelemetryForActiveSession(opts: {
+export interface ActiveTelemetryScanOpts {
   launchStartedAt: string;
   currentAccountConfigDir: string;
   expectedCwd: string;
   statuslineDir: string;
   freshnessWindowS: number;
-}): StatuslineTelemetry | null {
+}
+
+function scanTelemetryForActiveSession(opts: ActiveTelemetryScanOpts): StatuslineTelemetry | null {
   const { launchStartedAt, currentAccountConfigDir, expectedCwd, statuslineDir, freshnessWindowS } = opts;
   const launchMs = new Date(launchStartedAt).getTime();
   const CLOCK_SKEW_MS = 2000;
@@ -142,4 +145,42 @@ export function readTelemetryForActiveSession(opts: {
     return t;
   }
   return null;
+}
+
+export function readTelemetryForActiveSession(opts: ActiveTelemetryScanOpts): StatuslineTelemetry | null;
+export function readTelemetryForActiveSession(
+  session: Pick<SessionState, 'launch_started_at' | 'cwd' | 'claude_session_id'>,
+  currentAccountConfigDir: string,
+  statuslineDir: string,
+  freshnessWindowS: number
+): SessionTelemetryResult;
+export function readTelemetryForActiveSession(
+  first: ActiveTelemetryScanOpts | Pick<SessionState, 'launch_started_at' | 'cwd' | 'claude_session_id'>,
+  currentAccountConfigDir?: string,
+  statuslineDir?: string,
+  freshnessWindowS?: number
+): StatuslineTelemetry | null | SessionTelemetryResult {
+  if ('launchStartedAt' in first) {
+    return scanTelemetryForActiveSession(first);
+  }
+
+  if (first.claude_session_id) {
+    return readTelemetryForSession(
+      first.claude_session_id,
+      currentAccountConfigDir ?? '',
+      first.cwd,
+      statuslineDir ?? ''
+    );
+  }
+
+  return {
+    telemetry: scanTelemetryForActiveSession({
+      launchStartedAt: first.launch_started_at,
+      currentAccountConfigDir: currentAccountConfigDir ?? '',
+      expectedCwd: first.cwd,
+      statuslineDir: statuslineDir ?? '',
+      freshnessWindowS: freshnessWindowS ?? 300,
+    }),
+    mismatch: null,
+  };
 }

@@ -35,5 +35,5 @@ export async function sessionAttach(): Promise<void> {
     process.exit(1);
   }
 
-  execFileSync('tmux', ['attach-session', '-t', tmuxName], { stdio: 'inherit' });
+  execFileSync('tmux', ['-L', 'aisup', 'attach-session', '-t', tmuxName], { stdio: 'inherit' });
 }

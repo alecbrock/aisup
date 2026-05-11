@@ -1,22 +1,39 @@
 import { existsSync, accessSync, constants } from 'node:fs';
+import { join } from 'node:path';
 import type { AccountInfo } from '../../accounts/types.js';
 
 export interface HealthCheckResult {
   account: string;
   configDirExists: boolean;
   configDirWritable: boolean;
+  claudeJsonReadable: boolean;
+  statuslineDirReadable: boolean;
 }
 
-export function checkAccountHealth(account: AccountInfo): HealthCheckResult {
+export function checkAccountHealth(account: AccountInfo, statuslineDir?: string): HealthCheckResult {
   const configDirExists = existsSync(account.configDir);
   let configDirWritable = false;
+  let claudeJsonReadable = false;
   if (configDirExists) {
     try {
       accessSync(account.configDir, constants.W_OK);
       configDirWritable = true;
     } catch { /* not writable */ }
+    try {
+      accessSync(join(account.configDir, '.claude.json'), constants.R_OK);
+      claudeJsonReadable = true;
+    } catch { /* missing or unreadable */ }
   }
-  return { account: account.name, configDirExists, configDirWritable };
+  let statuslineDirReadable = false;
+  if (statuslineDir) {
+    try {
+      accessSync(statuslineDir, constants.R_OK);
+      statuslineDirReadable = true;
+    } catch { /* missing or unreadable */ }
+  } else {
+    statuslineDirReadable = true;
+  }
+  return { account: account.name, configDirExists, configDirWritable, claudeJsonReadable, statuslineDirReadable };
 }
 
 export class HealthChecker {

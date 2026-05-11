@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, accessSync, constants } from 'node:fs';
+import { existsSync, accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { loadConfig } from '../../config/loader.js';
 import { validateRunner } from '../../runner/builder.js';
+import { readTelemetryForAccount } from '../../statusline/store.js';
 
 interface Check { label: string; ok: boolean; detail?: string }
 
@@ -55,6 +57,22 @@ export async function runDoctor(): Promise<void> {
       accessSync(acct.config_dir, constants.W_OK);
       return acct.config_dir;
     }));
+    checks.push(check(`Account ${acct.name} statusline command`, () => {
+      const settingsPath = join(acct.config_dir, 'settings.json');
+      if (!existsSync(settingsPath)) return 'no settings.json';
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { statusLine?: { command?: string } };
+      const command = settings.statusLine?.command;
+      if (!command) return 'not configured';
+      const words = splitShellWords(command);
+      if (words.length === 0) throw new Error('empty statusLine.command');
+      const executable = statuslineExecutable(words);
+      if (!executable.includes('/')) return executable;
+      if (!existsSync(executable)) throw new Error(`${executable} not found`);
+      const st = statSync(executable);
+      if (!st.isFile()) throw new Error(`${executable} is not a file`);
+      accessSync(executable, constants.R_OK);
+      return executable;
+    }));
   }
 
   // tmux pane_pipe capability
@@ -105,6 +123,7 @@ export async function runDoctor(): Promise<void> {
   }
 
   printResults(checks);
+  printTelemetry(config);
   const failed = checks.filter((c) => !c.ok);
   if (failed.length > 0) process.exit(1);
 }
@@ -114,5 +133,65 @@ function printResults(checks: Check[]): void {
     const icon = c.ok ? '✓' : '✗';
     const detail = c.detail ? ` — ${c.detail}` : '';
     console.log(`  ${icon} ${c.label}${detail}`);
+  }
+}
+
+function splitShellWords(input: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaping = false;
+  for (const ch of input) {
+    if (escaping) {
+      current += ch;
+      escaping = false;
+      continue;
+    }
+    if (ch === '\\' && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && !quote) {
+      quote = ch;
+      continue;
+    }
+    if (quote === ch) {
+      quote = null;
+      continue;
+    }
+    if (!quote && /\s/.test(ch)) {
+      if (current) {
+        words.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (quote) throw new Error('unterminated quote in statusLine.command');
+  if (current) words.push(current);
+  return words;
+}
+
+function statuslineExecutable(words: string[]): string {
+  const first = words[0];
+  const base = basename(first);
+  if (['node', 'bash', 'sh', 'zsh', 'python', 'python3', 'ruby'].includes(base) && words[1]) {
+    return words[1];
+  }
+  return first;
+}
+
+function printTelemetry(config: Awaited<ReturnType<typeof loadConfig>>): void {
+  console.log('Account | Model | Context Window | Total Cost');
+  for (const acct of config.accounts) {
+    const telemetry = readTelemetryForAccount(acct.config_dir, config.statusline.directory, config.statusline.freshness_window_s);
+    const model = telemetry?.model?.id ?? '—';
+    const contextWindow = telemetry?.context_window?.context_window_size ?? '—';
+    const cost = telemetry?.cost?.total_cost_usd ?? '—';
+    console.log(`${acct.name} | ${model} | ${contextWindow} | ${cost}`);
+    if (!telemetry) {
+      console.log(`  ! ${acct.name}: no telemetry`);
+    }
   }
 }

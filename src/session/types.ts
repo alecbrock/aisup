@@ -21,8 +21,21 @@ export interface SwitchTx {
   source_transcript_sha256: string | null;
   source_destroyed: boolean;
   tried_accounts: string[];
+  attempts?: SwitchAttempt[];
+  last_launch_error?: string | null;
   phase_timestamps: Record<string, string>;
   error_summary: string | null;
+}
+
+export interface SwitchAttempt {
+  target_account: string;
+  phase: 'creating' | 'resuming' | 'failed' | 'completed';
+  target_tmux_name: string | null;
+  target_tmux_session_id: string | null;
+  target_pane_id: string | null;
+  error_summary: string | null;
+  ts: string;
+  cleaned_up: boolean;
 }
 
 export interface SessionState {

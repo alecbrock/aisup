@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, accessSync, constants } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import yaml from 'js-yaml';
@@ -50,6 +50,21 @@ function validatePath(p: string, fieldName: string): string {
   return expanded;
 }
 
+function validateExistingDir(p: string, fieldName: string): string {
+  const expanded = validatePath(p, fieldName);
+  try {
+    const st = statSync(expanded);
+    if (!st.isDirectory()) {
+      throw new Error(`Config validation error: ${fieldName} is not a directory: ${expanded}`);
+    }
+    accessSync(expanded, constants.R_OK);
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Config validation error')) throw err;
+    throw new Error(`Config validation error: ${fieldName} not found or not readable: ${expanded}`);
+  }
+  return expanded;
+}
+
 function mergeDeep<T extends object>(target: T, source: Partial<T>): T {
   const result = { ...target };
   for (const key of Object.keys(source) as (keyof T)[]) {
@@ -94,7 +109,7 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     }
 
     const rawDir = String(acct['config_dir'] ?? '');
-    const config_dir = validatePath(rawDir, `accounts[${i}].config_dir`);
+    const config_dir = validateExistingDir(rawDir, `accounts[${i}].config_dir`);
 
     return {
       name,
@@ -124,6 +139,16 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
 
   // expand paths in journal
   const journalPath = validatePath(merged.journal.path, 'journal.path');
+  const statuslineDirectory = validatePath(merged.statusline.directory, 'statusline.directory');
+
+  if (merged.slack.enabled) {
+    if (!merged.slack.bot_token_env || !merged.slack.app_token_env) {
+      throw new Error('Config validation error: slack bot_token_env and app_token_env are required when Slack is enabled');
+    }
+    if (!Array.isArray(merged.slack.allowed_user_ids) || merged.slack.allowed_user_ids.length === 0) {
+      throw new Error('Config validation error: slack.allowed_user_ids must be non-empty when Slack is enabled');
+    }
+  }
 
   return {
     accounts,
@@ -135,7 +160,7 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     session: merged.session,
     slack: merged.slack,
     daemon: merged.daemon,
-    statusline: merged.statusline,
+    statusline: { ...merged.statusline, directory: statuslineDirectory },
     journal: { path: journalPath },
   };
 }
@@ -161,6 +186,8 @@ export async function loadConfig(configPath?: string): Promise<AisupConfig> {
   if (!existsSync(resolvedPath)) {
     const dir = resolvedPath.substring(0, resolvedPath.lastIndexOf('/'));
     if (dir) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    mkdirSync(join(homedir(), '.claude'), { recursive: true, mode: 0o700 });
+    mkdirSync(join(homedir(), '.claude-account2'), { recursive: true, mode: 0o700 });
     writeFileSync(resolvedPath, PLACEHOLDER_ACCOUNTS_YAML, { mode: 0o600 });
     raw = yaml.load(PLACEHOLDER_ACCOUNTS_YAML) as Record<string, unknown>;
   } else {

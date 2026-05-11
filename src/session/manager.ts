@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   createTmuxSession,
@@ -12,13 +12,18 @@ import {
   stopPipePane,
   getSessionId,
   getPaneId,
+  respawnPane,
+  startOutputLog,
 } from './tmux.js';
 import type { SessionState } from './types.js';
+import { singleQuote } from '../util/shell.js';
+import { getBlockingSession as getBlockingSessionFromState } from '../cli/pid.js';
 
 export interface SessionManagerOpts {
   tmuxSocket: string;
   stateDir: string;
   outputLogMaxSizeMb: number;
+  outputLogRetentionDays?: number;
 }
 
 export interface CreateSessionOpts {
@@ -29,17 +34,20 @@ export interface CreateSessionOpts {
   args: string[];
   env: Record<string, string>;
   cwd: string;
+  planPath?: string | null;
 }
 
 export class SessionManager {
   private socket: string;
   private stateDir: string;
   private outputLogMaxSizeMb: number;
+  private outputLogRetentionDays: number;
 
   constructor(opts: SessionManagerOpts) {
     this.socket = opts.tmuxSocket;
     this.stateDir = opts.stateDir;
     this.outputLogMaxSizeMb = opts.outputLogMaxSizeMb;
+    this.outputLogRetentionDays = opts.outputLogRetentionDays ?? 7;
   }
 
   private sessionDir(aisupSessionId: string): string {
@@ -74,7 +82,7 @@ export class SessionManager {
   }
 
   async createSession(opts: CreateSessionOpts): Promise<SessionState> {
-    const { aisupSessionId, account, accountConfigDir, command, args, env, cwd } = opts;
+    const { aisupSessionId, account, command, args, env, cwd } = opts;
     const tmuxName = `aisup-${aisupSessionId.slice(0, 8)}`;
     const logPath = this.outputLogPath(aisupSessionId);
     const now = new Date().toISOString();
@@ -90,7 +98,7 @@ export class SessionManager {
       launch_started_at: now,
       claude_session_id: null,
       transcript_path: null,
-      plan_path: null,
+      plan_path: opts.planPath ?? null,
       active_skill: null,
       output_log_path: logPath,
       switch_tx: null,
@@ -99,15 +107,12 @@ export class SessionManager {
     };
     this.writeState(state);
 
-    const sessionEnv: Record<string, string> = { ...env };
-    if (accountConfigDir) sessionEnv['CLAUDE_CONFIG_DIR'] = accountConfigDir;
-
     await createTmuxSession({
       socket: this.socket,
       name: tmuxName,
       command,
       args,
-      env: sessionEnv,
+      env: { ...env },
       cwd,
       logPath,
     });
@@ -166,6 +171,56 @@ export class SessionManager {
         updated_at: new Date().toISOString(),
       });
     }
+  }
+
+  async restartInPlace(
+    aisupSessionId: string,
+    command: string,
+    args: string[],
+    env: Record<string, string>
+  ): Promise<SessionState> {
+    const state = this.readState(aisupSessionId);
+    if (!state) {
+      throw new Error(`restartInPlace: no persisted state for ${aisupSessionId}`);
+    }
+
+    const liveSessions = listSessions(this.socket);
+    if (!liveSessions.includes(state.tmux_name)) {
+      return this.createSession({
+        aisupSessionId,
+        account: state.account,
+        accountConfigDir: '',
+        command,
+        args,
+        env,
+        cwd: state.cwd,
+        planPath: state.plan_path,
+      });
+    }
+
+    respawnPane(this.socket, state.tmux_name, state.cwd, env);
+    startOutputLog(this.socket, state.tmux_name, state.output_log_path);
+
+    const execCmd = 'exec ' + [command, ...args].map(singleQuote).join(' ');
+    sendText(this.socket, state.tmux_name, execCmd);
+    sendEnter(this.socket, state.tmux_name);
+
+    let tmuxSessionId = state.tmux_session_id;
+    let paneId = state.pane_id;
+    try {
+      tmuxSessionId = getSessionId(this.socket, state.tmux_name);
+      paneId = getPaneId(this.socket, state.tmux_name);
+    } catch { /* non-fatal */ }
+
+    const activeState: SessionState = {
+      ...state,
+      status: 'ACTIVE',
+      tmux_session_id: tmuxSessionId,
+      pane_id: paneId,
+      updated_at: new Date().toISOString(),
+    };
+    this.writeState(activeState);
+    return activeState;
   }
 
   async terminateRunnerForSwitch(
@@ -231,5 +286,52 @@ export class SessionManager {
 
   listTmuxSessions(): string[] {
     return listSessions(this.socket).filter((s) => s.startsWith('aisup-'));
+  }
+
+  destroyTmuxSessionByName(tmuxName: string): void {
+    stopPipePane(this.socket, tmuxName);
+    destroyTmuxSession(this.socket, tmuxName);
+  }
+
+  getBlockingSession(): import('./types.js').SessionInfo | null {
+    const live = this.listTmuxSessions();
+    return getBlockingSessionFromState(this.stateDir, live);
+  }
+
+  rotateOutputLogIfNeeded(aisupSessionId: string): { rotated: boolean; path: string; rotatedPath?: string } {
+    const state = this.readState(aisupSessionId);
+    if (!state) return { rotated: false, path: '' };
+    const maxBytes = this.outputLogMaxSizeMb * 1024 * 1024;
+    if (maxBytes <= 0) return { rotated: false, path: state.output_log_path };
+    let size = 0;
+    try {
+      size = statSync(state.output_log_path).size;
+    } catch {
+      return { rotated: false, path: state.output_log_path };
+    }
+    if (size < maxBytes) return { rotated: false, path: state.output_log_path };
+
+    const rotatedPath = `${state.output_log_path}.1`;
+    stopPipePane(this.socket, state.tmux_name);
+    try { rmSync(rotatedPath, { force: true }); } catch { /* ok */ }
+    renameSync(state.output_log_path, rotatedPath);
+    startOutputLog(this.socket, state.tmux_name, state.output_log_path);
+    writeFileSync(state.output_log_path, '', { flag: 'a', mode: 0o600 });
+    this.cleanupRotatedOutputLogs(state.aisup_session_id);
+    return { rotated: true, path: state.output_log_path, rotatedPath };
+  }
+
+  private cleanupRotatedOutputLogs(aisupSessionId: string): void {
+    const cutoff = Date.now() - this.outputLogRetentionDays * 24 * 60 * 60 * 1000;
+    const dir = this.sessionDir(aisupSessionId);
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (!entry.startsWith('output.log.')) continue;
+        const path = join(dir, entry);
+        try {
+          if (statSync(path).mtime.getTime() < cutoff) rmSync(path, { force: true });
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
   }
 }
