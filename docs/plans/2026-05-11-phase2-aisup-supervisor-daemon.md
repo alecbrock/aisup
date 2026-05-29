@@ -1,17 +1,19 @@
 # Phase 2: aisup Supervisor Daemon Implementation Plan
 
 Created: 2026-05-11
-Review merge: 2026-05-28
+Review merge: 2026-05-29
 Author: alec.m.brock@gmail.com
 Status: PENDING
 Approved: No
-Iterations: 3
+Iterations: 4
 Worktree: No
 Type: Feature
 
 ## Review Merge Notice
 
 This plan has been merged with `docs/reviews/2026-05-12-plan-review-phase2-aisup-supervisor-daemon.md` and the final review at `docs/reviews/2026-05-28-plan-review-2026-05-11-phase2-aisup-supervisor-daemon.md`. It now includes the Phase 1 remediation gate, Phase 2 plan corrections, final tmux-socket and permission-deny corrections, and a finding traceability matrix. A future implementer should be able to execute this plan without reading the review documents.
+
+The fourth-iteration review `docs/reviews/2026-05-29-plan-review-2026-05-11-phase2-aisup-supervisor-daemon.md` has also been merged: it verified the Phase 1 Remediation Gate (R1–R13) is genuinely pending against current source and added implementation-readiness corrections — the R1 score/state refresh mechanism and single canonical selector (HI-001/ME-001), the Task 7 auto-resume action contract (HI-002), `cost.snapshot` segment identity and segment-aware aggregation (ME-002), Task 3 stop/manual-failover snapshot wiring in `server.ts` (ME-003), the rehydration→exhausted-poller startup handoff (ME-004), the detector's built-in default patterns vs the empty config default (ME-005), the `migration.skipped_no_transcript` emit-point and migration target-field/`source_size` propagation (LO-001), and the Task 6 R13 dependency with shared counter resets (LO-002).
 
 ## Summary
 
@@ -60,6 +62,7 @@ This plan has been merged with `docs/reviews/2026-05-12-plan-review-phase2-aisup
 - `docs/plans/2026-05-11-phase2-aisup-supervisor-daemon.md`
 - `docs/reviews/2026-05-12-plan-review-phase2-aisup-supervisor-daemon.md`
 - `docs/reviews/2026-05-28-plan-review-2026-05-11-phase2-aisup-supervisor-daemon.md`
+- `docs/reviews/2026-05-29-plan-review-2026-05-11-phase2-aisup-supervisor-daemon.md`
 - `docs/plans/2026-04-29-aisup-supervisor-daemon.md`
 - `docs/plans/2026-05-07-phase1-alignment-scan.md`
 - `docs/handoff/handoff-2026-05-12T17-41-31.md`
@@ -74,14 +77,26 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **Findings:** P1-CR-001, P1-FULL-001
 **Severity:** CRITICAL
 **Objective:** Use the canonical account scoring and eligibility path for start admission, dry-run, soft/hard failover target selection, and automatic retry.
-**Files:** `src/accounts/scorer.ts`, `src/accounts/registry.ts`, `src/daemon/server.ts`, `src/cli/commands/start.ts`, `src/daemon/loop-manager.ts`, `src/failover/switcher.ts`, `tests/accounts/`, `tests/daemon/`, `tests/failover/`, `tests/cli/`.
+**Files:** `src/accounts/scorer.ts`, `src/accounts/registry.ts`, `src/daemon/server.ts`, `src/cli/commands/start.ts`, `src/daemon/loop-manager.ts`, `src/daemon/index.ts`, `src/failover/switcher.ts`, `tests/accounts/`, `tests/daemon/`, `tests/failover/`, `tests/cli/`.
+
+**Current-state evidence (must be treated as the starting point):**
+- `setScore()` (`src/accounts/registry.ts`), `scoreAccount()` and `selectBestAccount()` (`src/accounts/scorer.ts`), and `applyTelemetry()` (`src/accounts/registry.ts`) are all **dead code** — no non-test caller exists. Every account is therefore permanently `score: null` and `state: 'HEALTHY'`.
+- Because all scores are `null`, the soft-threshold better-target check in `selectSwitchTarget()` (`src/failover/switcher.ts`: `eligible.find(a => typeof a.score === 'number' && a.score > currentScore)`) can never match, so the soft path always reports no_target.
+- Start admission (`src/daemon/server.ts` `/api/sessions`) and dry-run (`src/cli/commands/start.ts`) both sort by `priority` only and never compute a score; dry-run runs in the CLI process, which has no in-memory `AccountRegistry`.
+
 **Implementation Requirements:**
-- Refresh account scores from statusline telemetry and circuit-breaker state before session start, dry-run, and failover target selection.
-- Use `selectBestAccount()` or the canonical selector rather than priority-only sorting.
+- **Score/state refresh helper (the missing mechanism — wiring the selector is not sufficient):** Implement a single refresh routine that, for each configured account, (a) reads its freshest telemetry via `readTelemetryForAccount()`/`scoreAccount()` and calls `registry.setScore(name, score)`, and (b) refreshes account `state` from that telemetry via `applyTelemetry()` (HEALTHY/DEGRADED/UNAVAILABLE) and from circuit-breaker `getState()` (OPEN → COOLDOWN). This routine must run **before every automatic selection decision**, not once at startup.
+- **Exact refresh call-sites:**
+  - Start admission in `src/daemon/server.ts` `/api/sessions` (before choosing `bestAccount`).
+  - Failover target selection in `src/daemon/loop-manager.ts` (both soft prechecks and the hard/429 path) and in `src/daemon/index.ts` `onSwitch` (before `selectSwitchTarget`).
+  - Dry-run in `src/cli/commands/start.ts`.
+- **Dry-run runs outside the daemon.** The CLI has no in-memory registry, so dry-run must build an `AccountRegistry` from config, load the persisted `circuit-breaker-state.json` (same `statePath` the daemon uses) to obtain circuit-breaker state, refresh scores from per-account statusline files, then select. Alternatively route dry-run selection through a daemon endpoint; pick one and state it. Dry-run must print the scored selection, not the priority-order account.
+- **Canonical selector (see Consolidation note below and ME-001 in `docs/reviews/2026-05-29-...`):** Use `selectSwitchTarget()` as the single canonical selector for start admission, dry-run, soft/hard failover, and automatic retry. `selectBestAccount()` must either be deleted or reduced to a thin wrapper that delegates to `selectSwitchTarget()` — do not maintain two selectors with different tiebreaks/soft-target semantics (AGENTS.md rule 3).
 - Exclude `UNAVAILABLE` and `COOLDOWN` accounts from automatic selection; allow `COOLDOWN` only through explicit manual override where already supported.
 - Ensure soft-threshold selection uses current telemetry score and requires a strictly better target.
-**Tests:** Lower-priority higher-score account wins; stale/null scores are refreshed; `COOLDOWN` is skipped automatically; dry-run reports the scored selection.
-**Acceptance Criteria:** Runtime account selection cannot bypass scoring, eligibility, or circuit-breaker state.
+
+**Tests:** Lower-priority higher-score account wins **after a refresh runs** (a test must prove the refresh executed — e.g. start with all-null scores, run admission, assert the scored winner); stale/null scores are refreshed; an account driven to DEGRADED/UNAVAILABLE purely by telemetry (via `applyTelemetry`) is treated accordingly; `COOLDOWN` is skipped automatically; dry-run reports the scored selection using persisted circuit-breaker state.
+**Acceptance Criteria:** Runtime account selection cannot bypass scoring, eligibility, or circuit-breaker state, and the selection actually operates on refreshed (non-null) scores and refreshed account state — not on the permanently-`null`/`HEALTHY` defaults. Exactly one account selector exists.
 
 ### Phase 1 Remediation R2: Persist Terminal No-Target EXHAUSTED State
 
@@ -103,9 +118,9 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **Files:** `src/failover/switcher.ts`, `src/failover/migrator.ts`, `src/daemon/index.ts`, `src/daemon/server.ts`, `tests/failover/switcher.test.ts`, `tests/failover/migrator.test.ts`.
 **Implementation Requirements:**
 - Produce an explicit launch decision from migration: `resumed` only on successful or already-valid migration, `fresh` for null/missing/invalid/failed migration.
-- Emit `migration.skipped_no_transcript` for null or missing transcript paths.
-- Do not pass `claude_session_id` into target creation after failed migration.
-**Tests:** Null transcript plus known Claude session launches fresh; migration failure launches fresh; successful migration resumes.
+- Emit `migration.skipped_no_transcript` for null or missing transcript paths. **Emit-point:** the `performSwitch` branch in `src/failover/switcher.ts` currently skips the entire migration block when `snapshot.transcriptPath` is null and emits nothing — that branch must emit `migration.skipped_no_transcript` and force the `fresh` launch decision. The migrator's existing `MigrationResult.status === 'skipped_no_transcript'` value is unreachable (the migrator throws on a missing source); do not rely on it — own the skip in the switcher.
+- Do not pass `claude_session_id` into target creation after failed migration. The launch decision must be threaded into `createSessionForTarget`/the snapshot so a failed or skipped migration produces a fresh launch even when `snapshot.claudeSessionId` is set; today `createSessionForTarget` (in `src/daemon/index.ts` and `src/daemon/server.ts`) keys resume vs fresh on `snapshot.claudeSessionId` alone, which is the defect.
+**Tests:** Null transcript plus known Claude session launches fresh and emits `migration.skipped_no_transcript`; migration failure launches fresh; successful migration resumes.
 **Acceptance Criteria:** Target account launch mode is determined by safe target transcript state, not merely by source snapshot fields.
 
 ### Phase 1 Remediation R4: Add Recovery Callbacks to Rehydration
@@ -141,8 +156,8 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **Objective:** Keep automatic retries and `onSwitch` execution aligned with the same scoring and better-target rules.
 **Files:** `src/failover/switcher.ts`, `src/daemon/index.ts`, `src/daemon/loop-manager.ts`, `tests/failover/switcher.test.ts`, `tests/daemon/loops/loop-manager.test.ts`.
 **Implementation Requirements:**
-- Automatic retry list must include only `HEALTHY` or `DEGRADED` targets.
-- Pass `reason` and `currentScore` through `onSwitch`, or pass the preselected target into `onSwitch`, so soft-threshold better-target checks are not bypassed.
+- Automatic retry list must include only `HEALTHY` or `DEGRADED` targets. The current `performSwitch` retry `others` list filters `enabled && state !== 'UNAVAILABLE'`, which still **includes `COOLDOWN`** and ignores score — narrow it to `HEALTHY`/`DEGRADED` (and prefer the canonical `selectSwitchTarget` ordering from R1/ME-001 rather than a second priority-only sort).
+- Pass `reason` and `currentScore` through `onSwitch`, or pass the preselected target into `onSwitch`, so soft-threshold better-target checks are not bypassed. Today `onSwitch` calls `selectSwitchTarget(accounts, state.account, [])` with no `reason`/`currentScore`, so the actual switch ignores the soft-threshold better-target rule the precheck applied.
 **Tests:** Soft-threshold `onSwitch` cannot switch to a worse target; COOLDOWN automatic retry is skipped.
 **Acceptance Criteria:** The precheck and actual switch target decision use the same selector contract.
 
@@ -154,7 +169,7 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **Files:** `src/journal/types.ts`, `src/journal/writer.ts`, `src/failover/switcher.ts`, `src/failover/migrator.ts`, `src/statusline/store.ts`, `src/daemon/loop-manager.ts`, `src/slack/service.ts`, `tests/journal/`, `tests/failover/`, `tests/statusline/`, `tests/slack/`.
 **Implementation Requirements:**
 - Use typed event detail helpers or equivalent centralized builders.
-- Migration events include safe source/target path metadata, `source_size`, `source_sha256`, `target_path`, `target_sha256`, and collision metadata where relevant.
+- Migration events include safe source/target path metadata, `source_size`, `source_sha256`, `target_path`, `target_sha256`, and collision metadata where relevant. **Wiring note:** the `migrateTranscript()` result already carries `targetPath` and `targetSha256`, but the `migration.completed` event builder in `src/failover/switcher.ts` currently logs only `source_path`/`source_sha256` and drops the target fields — the switcher event builder must propagate `migrationResult.targetPath`/`targetSha256` into the event. `migrateTranscript()` must additionally return `sourceSize` (it has `srcStat.size` available) so the event can include `source_size`. `migration.invalid_path` currently logs raw `error: String(err)`; map the migrator's distinct thrown conditions to the safe reason enums below instead.
 - Use the canonical already-migrated event name `migration.skipped_already_migrated`; do not emit a parallel `migration.already_migrated` event shape.
 - `migration.invalid_path` and other rejected-migration events use safe reason enums such as `symlink_rejected`, `not_regular_file`, `wrong_extension`, `outside_source_dir`, `target_parent_symlink`, and `basename_mismatch` instead of raw exception text.
 - `telemetry.invalid_json` includes a safe parse error summary and stale/freshness context.
@@ -170,11 +185,11 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **Objective:** Make persisted `EXHAUSTED` sessions visible and recoverable after daemon restart.
 **Files:** `src/daemon/rehydration.ts`, `src/daemon/server.ts`, `src/daemon/index.ts`, `src/session/manager.ts`, `tests/daemon/rehydration.test.ts`, `tests/daemon/server.test.ts`.
 **Implementation Requirements:**
-- Add an `EXHAUSTED` rehydration branch that restores API visibility without putting the session in normal active loops.
-- Allow manual failover and stop commands to operate on a persisted `EXHAUSTED` session after daemon restart.
-- Provide the startup hook used by Task 7 to re-arm EXHAUSTED polling when `auto_resume_exhausted` is enabled.
-**Tests:** Persisted `EXHAUSTED` after restart appears in `/api/status`, accepts valid manual failover, can be stopped, and blocks new start until stopped.
-**Acceptance Criteria:** `EXHAUSTED` durability does not depend on the daemon instance that created it.
+- Add an `EXHAUSTED` rehydration branch. Today a persisted `EXHAUSTED` session matches none of the rehydration branches (`SWITCHING`/`CREATING`/`STOPPING`/`ACTIVE`/`SWITCH_PENDING_AT_IDLE`/`STOPPED`) and is silently dropped — it is never passed to `setSessionState`. The new branch must call `setSessionState({ status: 'EXHAUSTED', aisup_session_id, hasTmux: false })` to restore API visibility, without putting the session into normal active loops.
+- Allow manual failover and stop commands to operate on a persisted `EXHAUSTED` session after daemon restart. Note the current asymmetry: start admission already reads disk via `getBlockingSession()` (so start is correctly blocked post-restart), but `/api/failover` and `/api/status` read the in-memory `sessionState` (null post-restart for `EXHAUSTED`) — the `setSessionState` call above is what makes manual failover/status work again.
+- **Define the startup handoff used by Task 7 (resolve the ordering problem).** `rehydrateSessions()` runs at daemon startup *before* the loop manager and any `ExhaustedRecovery` instance exist, and today it returns only `{ rehydrated, orphans }` counts — it cannot itself start polling. Therefore: (a) `rehydrateSessions()` must surface the set of persisted-`EXHAUSTED` session ids it restored (extend its return shape, e.g. add `exhaustedSessionIds: string[]`), and (b) daemon startup, *after* it constructs the `ExhaustedRecovery` service, must re-arm polling for those ids when `auto_resume_exhausted` is enabled. Do not attempt to start polling inside `rehydrateSessions()`.
+**Tests:** Persisted `EXHAUSTED` after restart appears in `/api/status`, accepts valid manual failover, can be stopped, and blocks new start until stopped; `rehydrateSessions()` returns the persisted-`EXHAUSTED` ids; startup re-arms polling for those ids only when `auto_resume_exhausted` is enabled.
+**Acceptance Criteria:** `EXHAUSTED` durability does not depend on the daemon instance that created it, and the restart re-arm uses an explicit rehydration→poller handoff rather than relying on a poller that does not exist at rehydration time.
 
 ### Phase 1 Remediation R9: Use Current Sources for Status, Log, and Accounts
 
@@ -308,6 +323,7 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 - Validate `session.tmux_socket` as a non-empty tmux socket name with no NUL, newline, whitespace, path separators, shell metacharacters, or control characters. Production default remains `aisup`; tests can override it with a unique value such as `aisup-test-<pid>`.
 - Validate `permissions.approval_key` and `permissions.denial_key` as non-empty printable text with no NUL, newline, or terminal/system-reserved control input. Enter is always sent separately with `sendEnter()`. `!interrupt` remains the only intentional Ctrl-C path.
 - Validate that gate `command` is an executable name/path and every argument is in `args`.
+- The `permissions.detection_patterns` default is `[]`, but an empty list does not disable detection: per Task 8 the detector module ships a built-in default pattern constant used whenever the configured list is empty, and config patterns override/extend it. Detection is still off by default because `permissions.enabled` defaults to `false`.
 
 **Tests:** Typecheck must fail if any config section is missing from schema/defaults/loader return. Loader tests cover defaults, custom values, invalid gate command strings with spaces, retry limits, tmux socket default/custom/invalid values, approval key, denial key, control-input rejection, and detection pattern overrides.
 **Acceptance Criteria:** Feature tasks consume one config and event contract instead of adding local variants.
@@ -371,7 +387,7 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **New Work:**
 - Use the R4 recovery callback boundary to continue `source_destroyed`, `migrating`, and `creating` phases.
 - Restart persisted state-without-tmux sessions via the same daemon-level restart callback used by live recovery.
-- Rehydrate persisted `EXHAUSTED` for status and Task 7 polling re-arm.
+- Rehydrate persisted `EXHAUSTED` for status and Task 7 polling re-arm, using the explicit handoff defined in R8: the rehydration pass returns the persisted-`EXHAUSTED` session ids, and daemon startup re-arms the poller for those ids after the `ExhaustedRecovery` service is constructed. Do not start polling inside the rehydration pass.
 - Optionally report or destroy tmux orphans only through explicit, tested behavior.
 **Tests:** Switch-tx phase tests, state-without-tmux tests, persisted `EXHAUSTED` tests, and pipe-pane restore regression tests.
 **Acceptance Criteria:** Rehydration performs corrective recovery without reimplementing existing pipe-pane or already-correct switch phases.
@@ -384,16 +400,23 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 
 - Modify: `src/daemon/loop-manager.ts`
 - Modify: `src/daemon/index.ts`
+- Modify: `src/daemon/server.ts`
 - Modify: `tests/daemon/loops/loop-manager.test.ts`
+- Modify: `tests/daemon/server.test.ts`
 
 **Requirements:**
 - Use the `StatuslineTelemetry` object already read by `rateLimitTick()`.
 - Extract `cost.total_cost_usd`, `model.id`, and `context_window.context_window_size` before any guard that returns on missing `rate_limits`.
-- Track last snapshot per session and emit only when delta is at least `$0.01`.
-- Emit a final snapshot on session stop and before account switch from `src/daemon/index.ts`.
+- **Segment identity (required for Task 4 aggregation):** every `cost.snapshot` event must carry `claude_session_id` and `account` (both already available on the session object in `rateLimitTick` — `claude_session_id` is hydrated from telemetry, `account` is `session.account`). A Claude `cost.total_cost_usd` resets to ~0 at each account switch / new transcript, so without `claude_session_id` on the event, Task 4 cannot delineate segments. Put `claude_session_id`/`account` on the top-level `JournalEvent` fields (the schema already supports them), not buried in `details`.
+- Track last snapshot per session and emit only when the **upward** delta is at least `$0.01`. A downward delta (the expected reset at a segment boundary, e.g. `$5.00 → $0.00` after a switch) is not journaled as a snapshot; the new segment's costs are captured as they accrue upward again.
+- **Lifecycle snapshots — hook at the canonical boundaries, which are not all in `daemon/index.ts`:**
+  - Automatic account switch: emit the pre-switch final snapshot in `src/daemon/index.ts` `onSwitch` before `performSwitch` runs.
+  - Session stop: the terminal stop path lives in `src/daemon/server.ts` (`DELETE /api/sessions`) and Slack `!stop` (routed through the canonical stop path per R10). Emit the final snapshot in the canonical stop path / `onSessionStop` boundary so API, CLI, and Slack stops all capture it — not only `daemon/index.ts`.
+  - Manual failover: `POST /api/failover` in `src/daemon/server.ts` also calls `performSwitch`; emit the pre-switch snapshot there too.
+  - If a chosen boundary genuinely cannot capture telemetry (e.g. force-kill with no live pane), document that it falls back to the last periodic snapshot rather than silently omitting cost.
 - Clean the snapshot map on terminal stop.
-**Tests:** Delta filtering, missing cost, cost present with missing rate limits, lifecycle snapshots, and map cleanup.
-**Acceptance Criteria:** Cost data is captured even when rate-limit telemetry is temporarily absent.
+**Tests:** Delta filtering (upward only), missing cost, cost present with missing rate limits, segment identity present on the event, downward-reset not emitted, lifecycle snapshots on automatic switch / API stop / manual failover, and map cleanup.
+**Acceptance Criteria:** Cost data is captured even when rate-limit telemetry is temporarily absent, every `cost.snapshot` carries the `claude_session_id`/`account` needed to segment it, and the stop and manual-failover paths (which live in `server.ts`) emit a final snapshot.
 
 ### Task 4: Cost Aggregation Module
 
@@ -409,10 +432,10 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 **Requirements:**
 - Use `readEvents()` from `src/journal/reader.ts`; do not reimplement JSONL parsing.
 - Aggregate `cost.snapshot` events from a caller-provided journal path.
-- Per aisup session cost is the sum of final/max costs across Claude session segments.
+- **Segment-aware reduction (do not naively sum or last-value):** because `cost.total_cost_usd` is cumulative within a Claude session segment but resets across account switches, group snapshots by `claude_session_id` (the segment key written by Task 3), take the **max** `total_cost_usd` per segment, then **sum the per-segment maxima** to get per-aisup-session cost. Group segments under their `aisup_session_id`; group/attribute per account using the event's `account` field. A running sum over raw snapshots would double-count within a segment and mis-handle the reset.
 - Expose rolling windows: `today`, `last_7d`, `last_30d`; document these as the Phase 2 implementation of PRD daily/weekly visibility.
 - Handle empty journals and large enough journals without crashing; streaming optimization is deferred.
-**Tests:** Empty journal, single session, multi-account switch, multiple Claude segments, and time-window filtering.
+**Tests:** Empty journal, single session, multi-account switch (cost reset between segments must not inflate the total), multiple Claude segments under one aisup session (assert max-per-segment then summed), and time-window filtering.
 **Acceptance Criteria:** Aggregation uses existing journal semantics and configured paths supplied by callers.
 
 ### Task 5: `aisup cost`, `/api/cost`, and `aisup log --type`
@@ -440,7 +463,7 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 ### Task 6: Auth and Network Failure Detection
 
 **Objective:** Detect auth failures and network errors from active session output and trigger the correct recovery action.
-**Dependencies:** Phase 1 Remediation R1, R11, C1
+**Dependencies:** Phase 1 Remediation R1, R11, R13, C1
 **Files:**
 
 - Create directory: `src/recovery/`
@@ -456,7 +479,7 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 - Follow the existing `detect429InOutput()` pattern: module-level regex arrays, `strip-ansi`, detector functions, and `readLogTail()` based scanning.
 - `recoveryTick()` only processes `ACTIVE` and `SWITCH_PENDING_AT_IDLE`; document that auth/network detection does not run for `EXHAUSTED`, `SWITCHING`, `CREATING`, or `STOPPING`.
 - Insert detector calls in the live-output scan before the 429 action path. Preferred priority: auth failure, 429, network error escalation, permission/non-action logging.
-- Track network errors on `LoopManager` with `Map<string, number>`, reset on non-error output, switch, stop, or successful restart. Threshold comes from `config.recovery.network_error_threshold`.
+- Track network errors on `LoopManager` with `Map<string, number>`, reset on non-error output, switch, stop, or successful restart. Threshold comes from `config.recovery.network_error_threshold`. The "successful restart" reset depends on R13 making `onRestart` report success/failure (today `onRestart` returns `Promise<void>` and the restart counter increments per dead-tick) — this is why R13 is a dependency. The network-error counter and the R13 restart counter are two per-session maps with overlapping reset semantics; reset both at the same trigger points (switch, stop, successful restart) so they stay consistent.
 **Tests:** Auth triggers switch, network errors restart after threshold, counters reset, output with both auth and 429 takes the intended priority, non-active statuses are skipped.
 **Acceptance Criteria:** Failure detection is an extension of the existing output scanner, not a parallel scanner or hidden loop.
 
@@ -490,10 +513,15 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
   ```
 - Candidate logic calls `getState(account)` first; `HALF_OPEN` or `CLOSED` is runnable. Use `getCooldownEta()` only for ETA messaging.
 - Add `max_exhausted_retries` config default `5`, validate it, and emit `recovery.exhausted_max_retries` when exhausted retries stop.
-- Start polling when live failover enters `EXHAUSTED` and when daemon startup rehydrates a persisted `EXHAUSTED` session.
+- Start polling when live failover enters `EXHAUSTED` and when daemon startup rehydrates a persisted `EXHAUSTED` session (via the R8/Task 2 handoff).
 - Stop polling on resume, manual stop, manual failover, and daemon shutdown.
-**Tests:** Cooldown expiry, persisted restart re-arm, disabled auto-resume, max retries, shutdown cleanup, and no reliance on `getActiveSession()`.
-**Acceptance Criteria:** `auto_resume_exhausted` remains durable across daemon restarts.
+- **Define the resume action (`onAccountAvailable`) — the poller alone is not the feature.** The `ExhaustedRecoveryDeps.onAccountAvailable` callback signature is specified above, but its *body* (wired in `src/daemon/index.ts`) must perform a real relaunch, not a state flip. An `EXHAUSTED` session has no live runner (`performSwitch` destroyed the source pane and cleared `switch_tx` before persisting `EXHAUSTED`), and its persisted `account`/`transcript_path` point at the account that exhausted. Therefore `onAccountAvailable(sessionId, account)` must:
+  - Read the persisted `EXHAUSTED` session state to obtain `sourceAccount = state.account`, `transcriptPath`, `claudeSessionId`, `cwd`, and `plan_path`.
+  - Invoke the canonical `performSwitch` path with `sourceAccount = state.account` and `targetAccount = account` (the now-runnable account), reusing the R3 migration-owns-resume decision (migrate transcript → target, resume only if the migrated/valid transcript exists, else fresh).
+  - Emit `recovery.exhausted_resumed` only **after** a successful target launch; on launch failure, keep the session `EXHAUSTED`, count the attempt, and let polling continue until `max_exhausted_retries`, then emit `recovery.exhausted_max_retries` and stop polling.
+  - Must not simply `patchState({ status: 'ACTIVE' })` — that would mark a session ACTIVE with no runner.
+**Tests:** Cooldown expiry; persisted restart re-arm; disabled auto-resume; max retries (failed relaunches escalate to `recovery.exhausted_max_retries` and stop); resume invokes the migration+launch path with the persisted source account (not a bare state flip); successful resume emits `recovery.exhausted_resumed` only after launch; shutdown cleanup; and no reliance on `getActiveSession()` (an `EXHAUSTED` session is not returned by `getActiveSession()`, so the poller must read persisted state directly).
+**Acceptance Criteria:** `auto_resume_exhausted` remains durable across daemon restarts, and an auto-resume produces a live relaunched runner via the canonical switch/migration path — never a session marked ACTIVE without a runner.
 
 ### Task 8: Permission Prompt Detection
 
@@ -515,8 +543,9 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 - Task 1 is not a hard dependency for permission patterns. Live validation is owned by the `AISUP_TEST_PERMISSIONS=1` host-gated path with bypass mode disabled.
 - Add `onPermissionDetected?: (sessionId: string, request: PermissionRequest) => void` to `LoopManagerDeps`.
 - Detector scans new output deltas, not full logs.
-- Default patterns must match full prompt-like lines and avoid generic `Allow` false positives. Include false-positive tests such as ordinary prose containing "allow".
-- Own `permissions.detection_patterns` here or rely on C1 if C1 has already landed.
+- **Built-in default patterns vs the empty config default.** C1's config default for `permissions.detection_patterns` is `[]`. That empty list must NOT mean "detect nothing" — the detector module (`src/permissions/detector.ts`) must ship a built-in default pattern constant that is used when `permissions.detection_patterns` is empty, and the config list overrides/extends it when non-empty. Otherwise enabling permissions with no explicit patterns would silently detect nothing, and Task 8's false-positive tests would have no patterns to exercise. (`permissions.enabled: false` remains the safe default, so detection is still off out of the box.)
+- Default patterns must match full prompt-like lines and avoid generic `Allow` false positives. Include false-positive tests such as ordinary prose containing "allow", and a test that the built-in defaults apply when the config list is empty.
+- Own `permissions.detection_patterns` here or rely on C1 if C1 has already landed; either way the built-in default pattern constant lives in the detector module, not in config defaults.
 - Insert permission detection before the 429 action path; permission detection logs and notifies the broker but does not block a higher-priority 429/auth action.
 **Tests:** Prompt formats, extraction, deduplication, false positives, callback invocation, and configured pattern override.
 **Acceptance Criteria:** Permission observability is precise enough to feed policy without creating noisy Slack prompts.
@@ -742,3 +771,20 @@ Host-gated tests must be skipped by default unless the required marker and env g
 | P1-FULL-014 | Active | R11 | Merged | Distinguish missing tmux session from dead pane. |
 | P1-FULL-015 | Active | R12 | Merged | Enforce active-session telemetry identity. |
 | P1-FULL-016 | Active | R13 | Merged | Fix restart counter state machine. |
+
+### 2026-05-29 Review Findings (fourth iteration)
+
+IDs are prefixed `R29-` to avoid collision with the same letter-number IDs from the 2026-05-12 review.
+
+| Finding ID | Severity | Plan Destination | Merge Disposition | Required Work |
+|------------|----------|------------------|-------------------|---------------|
+| R29-HI-001 | HIGH | R1 | Merged | Specify the score/state refresh mechanism (call `scoreAccount`/`setScore`/`applyTelemetry` — all currently dead code) and exact refresh call-sites, incl. CLI dry-run loading persisted circuit-breaker state. |
+| R29-HI-002 | HIGH | Task 7 | Merged | Define `onAccountAvailable` as a `performSwitch`-style relaunch (migrate + R3 resume/fresh), not a state flip; emit `recovery.exhausted_resumed` only after launch. |
+| R29-ME-001 | MEDIUM | R1, R6 | Merged | Designate one canonical selector (`selectSwitchTarget`); delete/wrap `selectBestAccount`. |
+| R29-ME-002 | MEDIUM | Task 3, Task 4 | Merged | `cost.snapshot` carries `claude_session_id`/`account`; aggregate max-per-segment then sum; reset deltas not journaled. |
+| R29-ME-003 | MEDIUM | Task 3 | Merged | Add `server.ts` stop/manual-failover snapshot wiring (stop/failover live in `server.ts`, not `daemon/index.ts`). |
+| R29-ME-004 | MEDIUM | R8, Task 2, Task 7 | Merged | Define rehydration→exhausted-poller handoff: rehydration returns persisted-EXHAUSTED ids; startup re-arms after poller exists. |
+| R29-ME-005 | MEDIUM | Task 8 | Merged | Detector ships built-in default patterns used when config `detection_patterns` is empty. |
+| R29-LO-001 | LOW | R3, R7 | Merged | Switcher null-transcript branch emits `migration.skipped_no_transcript`; propagate `target_path`/`target_sha256`; migrator returns `source_size`; map `migration.invalid_path` to reason enums. |
+| R29-LO-002 | LOW | Task 6 | Merged | Add R13 dependency; share reset points between restart and network-error counters. |
+| R29-IN-001 | INFO | Phase 1 Remediation Gate | Informational - noted | Confirmed R1–R13 genuinely pending against current source; alignment-scan doc (R14) stale. |
