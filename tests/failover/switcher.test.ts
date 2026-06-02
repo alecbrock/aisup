@@ -396,6 +396,110 @@ describe('performSwitch transaction persistence', () => {
     expect(result.triedAccounts).toEqual(['account2', 'account3']);
     expect(patched.at(-1)).toMatchObject({ status: 'EXHAUSTED', switch_tx: null });
   });
+
+  // F1 regression: resume-from-EXHAUSTED must not terminate the already-destroyed source pane.
+  it('resumes an EXHAUSTED session without terminating the missing source pane', async () => {
+    const state = makeState({ status: 'EXHAUSTED' });
+    const terminate = vi.fn(async () => { throw new Error('no server running / pane missing'); });
+    const manager = {
+      readState: () => state,
+      patchState: vi.fn(),
+      terminateRunnerForSwitch: terminate,
+      destroyTmuxSessionByName: () => undefined,
+    };
+
+    const result = await performSwitch(
+      {
+        aisupSessionId: state.aisup_session_id,
+        claudeSessionId: null,
+        transcriptPath: null,
+        activeSkill: null,
+        planFilePath: null,
+        sourceAccount: 'primary',
+        targetAccount: 'account2',
+        reason: SwitchReason.CircuitBreaker,
+        selectionMode: 'automatic',
+      },
+      makeSwitchAccounts(),
+      {
+        sessionManager: manager as never,
+        journal: { append: vi.fn().mockResolvedValue(undefined) },
+        createSessionForTarget: async (target) => makeState({ status: 'ACTIVE', account: target.name, tmux_session_id: '$2', pane_id: '%2' }),
+      }
+    );
+
+    // Termination is skipped (source already gone), so the throwing op never aborts the relaunch.
+    expect(terminate).not.toHaveBeenCalled();
+    expect(result.status).toBe('completed');
+    expect(result.targetAccount).toBe('account2');
+  });
+
+  // F2 regression: automatic selection must not relaunch into an ineligible primary target.
+  it('skips an UNAVAILABLE primary target during automatic selection', async () => {
+    const state = makeState({ status: 'EXHAUSTED' });
+    const accounts: AccountInfo[] = [
+      { name: 'primary', configDir: '/tmp/primary', priority: 1, enabled: true, state: 'HEALTHY', score: 20, cooldownUntil: null },
+      { name: 'account2', configDir: '/tmp/account2', priority: 2, enabled: true, state: 'UNAVAILABLE', score: 80, cooldownUntil: null },
+    ];
+    const created: string[] = [];
+
+    const result = await performSwitch(
+      {
+        aisupSessionId: state.aisup_session_id,
+        claudeSessionId: null,
+        transcriptPath: null,
+        activeSkill: null,
+        planFilePath: null,
+        sourceAccount: 'primary',
+        targetAccount: 'account2',
+        reason: SwitchReason.CircuitBreaker,
+        selectionMode: 'automatic',
+      },
+      accounts,
+      {
+        sessionManager: { readState: () => state, patchState: vi.fn(), terminateRunnerForSwitch: async () => undefined, destroyTmuxSessionByName: () => undefined } as never,
+        journal: { append: vi.fn().mockResolvedValue(undefined) },
+        createSessionForTarget: async (target) => { created.push(target.name); return makeState({ status: 'ACTIVE', account: target.name }); },
+      }
+    );
+
+    // account2 is UNAVAILABLE; the source 'primary' is excluded from retry → no eligible target.
+    expect(created).not.toContain('account2');
+    expect(result.status).toBe('exhausted');
+  });
+
+  // F2 boundary: a manual operator override still launches a non-HEALTHY primary it explicitly chose.
+  it('launches a COOLDOWN primary target for a manual failover (operator override)', async () => {
+    const state = makeState();
+    const accounts: AccountInfo[] = [
+      { name: 'primary', configDir: '/tmp/primary', priority: 1, enabled: true, state: 'HEALTHY', score: 20, cooldownUntil: null },
+      { name: 'account2', configDir: '/tmp/account2', priority: 2, enabled: true, state: 'COOLDOWN', score: 80, cooldownUntil: null },
+    ];
+    const created: string[] = [];
+
+    const result = await performSwitch(
+      {
+        aisupSessionId: state.aisup_session_id,
+        claudeSessionId: null,
+        transcriptPath: null,
+        activeSkill: null,
+        planFilePath: null,
+        sourceAccount: 'primary',
+        targetAccount: 'account2',
+        reason: SwitchReason.Manual,
+        selectionMode: 'manual',
+      },
+      accounts,
+      {
+        sessionManager: { readState: () => state, patchState: vi.fn(), terminateRunnerForSwitch: async () => undefined, destroyTmuxSessionByName: () => undefined } as never,
+        journal: { append: vi.fn().mockResolvedValue(undefined) },
+        createSessionForTarget: async (target) => { created.push(target.name); return makeState({ status: 'ACTIVE', account: target.name }); },
+      }
+    );
+
+    expect(created).toEqual(['account2']);
+    expect(result.status).toBe('completed');
+  });
 });
 
 describe('selectSwitchTarget', () => {

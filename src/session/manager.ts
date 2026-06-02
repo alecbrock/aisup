@@ -229,10 +229,21 @@ export class SessionManager {
     opts: { force?: boolean }
   ): Promise<void> {
     if (!opts.force) {
-      sendInterrupt(this.socket, tmuxName);
-      await new Promise((r) => setTimeout(r, 2000));
+      // The source pane may already be gone (race, or terminating a stale runner). C-c to a
+      // missing tmux target throws; treat that as "nothing to interrupt" and fall through to
+      // best-effort cleanup rather than aborting the switch.
+      let interrupted = false;
+      try {
+        sendInterrupt(this.socket, tmuxName);
+        interrupted = true;
+      } catch {
+        /* pane already gone — nothing to interrupt */
+      }
+      if (interrupted) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
 
-      if (!isProcessDead(this.socket, tmuxName)) {
+      if (interrupted && !isProcessDead(this.socket, tmuxName)) {
         sendText(this.socket, tmuxName, '/exit');
         sendEnter(this.socket, tmuxName);
 

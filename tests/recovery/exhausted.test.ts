@@ -119,6 +119,49 @@ describe('ExhaustedRecovery poller', () => {
     expect(er.isPolling('sess-1')).toBe(false);
   });
 
+  // F2 regression: registry state gates candidacy, not just the circuit breaker.
+  it('skips a registry-UNAVAILABLE account even when its circuit breaker is runnable', async () => {
+    const onAccountAvailable = vi.fn().mockResolvedValue(undefined);
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const accounts = [
+      { name: 'primary', configDir: '/tmp/primary', priority: 1, enabled: true, state: 'UNAVAILABLE' as const, score: null, cooldownUntil: null },
+      { name: 'secondary', configDir: '/tmp/secondary', priority: 2, enabled: true, state: 'HEALTHY' as const, score: null, cooldownUntil: null },
+    ];
+    const accountRegistry = { getAll: vi.fn().mockReturnValue(accounts) };
+    const er = new ExhaustedRecovery({
+      circuitBreaker: cb, // both CBs CLOSED (runnable); only registry state differs
+      accountRegistry: accountRegistry as never,
+      config: RECOVERY,
+      journal: journal as never,
+      onAccountAvailable,
+    });
+    er.start('sess-1');
+    await pollOnce(er, 'sess-1');
+    expect(onAccountAvailable).toHaveBeenCalledWith('sess-1', 'secondary'); // never 'primary'
+    er.stopAll();
+  });
+
+  // F2 regression: scores/state are refreshed before the resume target is selected.
+  it('refreshes account state before selecting a resume target', async () => {
+    const refreshAccounts = vi.fn();
+    const onAccountAvailable = vi.fn().mockResolvedValue(undefined);
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const getAll = vi.fn().mockReturnValue(makeAccounts('primary', 'secondary'));
+    const er = new ExhaustedRecovery({
+      circuitBreaker: cb,
+      accountRegistry: { getAll } as never,
+      config: RECOVERY,
+      journal: journal as never,
+      onAccountAvailable,
+      refreshAccounts,
+    });
+    er.start('sess-1');
+    await pollOnce(er, 'sess-1');
+    expect(refreshAccounts).toHaveBeenCalled();
+    expect(refreshAccounts.mock.invocationCallOrder[0]).toBeLessThan(getAll.mock.invocationCallOrder[0]);
+    er.stopAll();
+  });
+
   it('stopAll stops every armed session and emits polling_stopped', () => {
     const { er, journal } = build();
     er.start('sess-1');

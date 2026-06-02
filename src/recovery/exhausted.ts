@@ -15,6 +15,8 @@ export interface ExhaustedRecoveryDeps {
   journal: JournalWriter;
   /** Perform the real relaunch for `sessionId` onto a now-runnable `account`. */
   onAccountAvailable: (sessionId: string, account: string) => Promise<void>;
+  /** Refresh account scores/registry state from telemetry before a resume target is selected. */
+  refreshAccounts?: () => void;
 }
 
 interface PollEntry {
@@ -77,10 +79,16 @@ export class ExhaustedRecovery {
     return this.polls.has(sessionId);
   }
 
-  /** First enabled account whose circuit breaker is runnable (CLOSED or HALF_OPEN). */
+  /**
+   * First account that is both registry-eligible (enabled + HEALTHY/DEGRADED, the canonical
+   * failover filter) and whose circuit breaker is runnable (CLOSED or HALF_OPEN). Registry
+   * state is consulted so a telemetry-driven UNAVAILABLE/COOLDOWN account is never chosen as a
+   * resume target — relaunching into one would immediately re-fail.
+   */
   private findRunnableAccount(): string | null {
     for (const acct of this.deps.accountRegistry.getAll()) {
       if (!acct.enabled) continue;
+      if (acct.state !== 'HEALTHY' && acct.state !== 'DEGRADED') continue;
       const cb: CBState = this.deps.circuitBreaker.getState(acct.name);
       if (cb === 'CLOSED' || cb === 'HALF_OPEN') return acct.name;
     }
@@ -90,6 +98,9 @@ export class ExhaustedRecovery {
   private async pollOnce(sessionId: string): Promise<void> {
     const entry = this.polls.get(sessionId);
     if (!entry || entry.inFlight) return;
+    // Refresh scores/state from telemetry first so selection reflects current eligibility,
+    // not a stale snapshot from a prior tick.
+    this.deps.refreshAccounts?.();
     const account = this.findRunnableAccount();
     if (!account) return; // still cooling down — keep polling
 

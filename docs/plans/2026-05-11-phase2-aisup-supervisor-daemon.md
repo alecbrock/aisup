@@ -5,7 +5,7 @@ Review merge: 2026-05-29
 Author: alec.m.brock@gmail.com
 Status: VERIFIED
 Approved: Yes
-Iterations: 4
+Iterations: 5
 Worktree: No
 Type: Feature
 
@@ -661,6 +661,19 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 - Add `gate` to `KNOWN_COMMANDS` and add `case 'gate'` in Slack dispatch: `!gate` runs gates, `!gate status` reports latest results.
 **Tests:** Idle + active skill triggers; no active skill does not trigger; debounce; active_skill clears; manual CLI/API/Slack runs; latest status; Slack notification.
 **Acceptance Criteria:** Gates are runnable manually and automatically without depending on a nonexistent skill-null transition.
+
+## Verification Gaps
+
+Fresh spec-verify pass on 2026-06-02 (full findings: `docs/reviews/2026-06-02-phase2-spec-verify-findings.md`) reverted this plan from VERIFIED to PENDING. Codex adversarial changes-review surfaced confirmed must_fix/should_fix issues; mechanical gates (typecheck, build, 449 tests) and the Claude changes-review were green, but the unit tests mock `performSwitch`, hiding F1.
+
+**All gaps resolved (compliance re-audit 2026-06-02, Round 2 — CLEAN).** F1–F4 fixed with regression tests; full suite `vitest run` 457 passed / 0 failed / 2 skipped; `tsup` build success. A follow-up compliance audit (Round 1) found F3 only partially fixed and opened **F4** (residual unconfirmed-keystroke false-success), which was then fixed and re-verified (Round 2). Plan re-marked VERIFIED (Iterations:5).
+
+| Gap | Type | Severity | Affected Files | Fix Description | Status |
+|-----|------|----------|----------------|-----------------|--------|
+| F1: EXHAUSTED relaunch terminates a missing source pane → Task 7/R8 auto-resume and post-restart manual failover are unreachable (`performSwitch` runs `terminateRunnerForSwitch(force:false)` → `sendInterrupt`, which throws on the dead pane before `createSessionForTarget`) | bug | must_fix (critical) | src/failover/switcher.ts:256, src/session/manager.ts:235, src/session/tmux.ts:110, tests/failover/switcher.test.ts | Skip source termination when persisted state is EXHAUSTED/source_destroyed; make missing-pane termination non-fatal (try/catch around `sendInterrupt`); regression test exercises the real `performSwitch` with a throwing source-tmux op and asserts the target still launches. | ✅ RESOLVED |
+| F2: Auto-resume target bypasses registry eligibility (`findRunnableAccount` uses circuit-breaker state only; daemon refreshes after selection; `performSwitch` pushes the primary target without the HEALTHY/DEGRADED filter) | bug | must_fix (high) | src/recovery/exhausted.ts:88,101, src/failover/switcher.ts:351, src/daemon/index.ts:276,284 | `findRunnableAccount` adds the canonical enabled+HEALTHY/DEGRADED filter; `refreshAccounts()` runs before selection and before resume; `performSwitch` gates the primary target with `primaryEligible` (automatic) while preserving manual override. Regression tests in exhausted + switcher suites. | ✅ RESOLVED |
+| F3: Slack reports permission success before the broker confirms the keystroke (`void resolveFromSlack(...)` discards the boolean; Slack unconditionally replies granted/denied) | bug | should_fix (medium) | src/daemon/index.ts:98, src/slack/service.ts:373 | `onPermissionGrant`/`onPermissionDeny` return `Promise<boolean>`; daemon propagates `resolveFromSlack`; Slack reports success only on `true`. | ✅ RESOLVED (completed by F4) |
+| F4: `resolveFromSlack` returns `true` even on the unconfirmed/failed-keystroke path, so Slack still falsely reports success (residual of F3) | bug | should_fix (medium) | src/permissions/broker.ts:72,69,43, tests/permissions/broker.test.ts | `PermissionBroker.act` returns `Promise<boolean>` (`false` on both `keystroke_unconfirmed` paths, `true` only after the grant/deny event emits); `resolveFromSlack` propagates it; `onDetected` awaits and discards. Two regression tests assert `false` + no success event for prompt-gone and keystroke-fail. | ✅ RESOLVED |
 
 ## Progress Tracking
 

@@ -118,4 +118,28 @@ describe('PermissionBroker', () => {
     expect(await broker.resolveFromSlack('s1', 'grant')).toBe(false);
     expect(sendKeystroke).not.toHaveBeenCalled();
   });
+
+  // F4 regression: a pending, non-expired prompt that is no longer on screen at resolve time
+  // must not report success — no keystroke is sent, so resolveFromSlack returns false.
+  it('returns false from resolveFromSlack when the prompt is no longer active at resolve time', async () => {
+    const broker = build(permissions({ slack_routing: true }));
+    await broker.onDetected('s1', req); // pending
+    promptStillActive.mockReturnValue(false); // prompt gone by the time !permit arrives
+    const ok = await broker.resolveFromSlack('s1', 'grant');
+    expect(ok).toBe(false);
+    expect(sendKeystroke).not.toHaveBeenCalled();
+    expect(eventTypes()).toContain('permission.keystroke_unconfirmed');
+    expect(eventTypes()).not.toContain('permission.granted');
+  });
+
+  // F4 regression: a keystroke-delivery failure must not report success either.
+  it('returns false from resolveFromSlack when the keystroke fails to send', async () => {
+    const broker = build(permissions({ slack_routing: true }));
+    await broker.onDetected('s1', req); // pending
+    sendKeystroke.mockReturnValue(false); // no live target for the keystroke
+    const ok = await broker.resolveFromSlack('s1', 'deny');
+    expect(ok).toBe(false);
+    expect(eventTypes()).toContain('permission.keystroke_unconfirmed');
+    expect(eventTypes()).not.toContain('permission.denied');
+  });
 });

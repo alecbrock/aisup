@@ -26,10 +26,10 @@ export interface SlackServiceOpts {
   journal: JournalWriter;
   channelMapPath: string;
   permissionsConfig?: PermissionsConfig;
-  /** Resolve a Slack-routed permission via !permit (acts on the active session's pending prompt). */
-  onPermissionGrant?: (sessionId: string) => void | Promise<void>;
-  /** Resolve a Slack-routed permission via !deny. */
-  onPermissionDeny?: (sessionId: string) => void | Promise<void>;
+  /** Resolve a Slack-routed permission via !permit; resolves true only when the keystroke was sent. */
+  onPermissionGrant?: (sessionId: string) => boolean | Promise<boolean>;
+  /** Resolve a Slack-routed permission via !deny; resolves true only when the keystroke was sent. */
+  onPermissionDeny?: (sessionId: string) => boolean | Promise<boolean>;
   /** Run the configured validation gates (Slack !gate). */
   onGateRun?: () => Promise<GateRunResult>;
   /** Latest gate run for Slack !gate status. */
@@ -370,16 +370,20 @@ export class SlackService {
       case 'permit': {
         if (!session) { await say('No active session.'); return; }
         if (!this.opts.onPermissionGrant) { await say('Permission approval is not enabled.'); return; }
-        await this.opts.onPermissionGrant(session.aisup_session_id);
-        await say('Permission granted.');
+        const granted = await this.opts.onPermissionGrant(session.aisup_session_id);
+        await say(granted
+          ? 'Permission granted.'
+          : 'No pending permission prompt to grant — it may have expired or already been resolved.');
         break;
       }
 
       case 'deny': {
         if (!session) { await say('No active session.'); return; }
         if (!this.opts.onPermissionDeny) { await say('Permission approval is not enabled.'); return; }
-        await this.opts.onPermissionDeny(session.aisup_session_id);
-        await say('Permission denied.');
+        const denied = await this.opts.onPermissionDeny(session.aisup_session_id);
+        await say(denied
+          ? 'Permission denied.'
+          : 'No pending permission prompt to deny — it may have expired or already been resolved.');
         break;
       }
 

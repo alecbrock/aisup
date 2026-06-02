@@ -95,8 +95,8 @@ async function main(): Promise<void> {
       journal,
       channelMapPath,
       permissionsConfig: config.permissions,
-      onPermissionGrant: (sessionId) => { void permissionBrokerRef?.resolveFromSlack(sessionId, 'grant'); },
-      onPermissionDeny: (sessionId) => { void permissionBrokerRef?.resolveFromSlack(sessionId, 'deny'); },
+      onPermissionGrant: (sessionId) => permissionBrokerRef?.resolveFromSlack(sessionId, 'grant') ?? Promise.resolve(false),
+      onPermissionDeny: (sessionId) => permissionBrokerRef?.resolveFromSlack(sessionId, 'deny') ?? Promise.resolve(false),
       onGateRun: runConfiguredGates,
       getLatestGateRun: () => latestGateRun,
     });
@@ -272,6 +272,8 @@ async function main(): Promise<void> {
     accountRegistry,
     config: config.recovery,
     journal,
+    // Refresh registry state from telemetry before the poller picks a resume target.
+    refreshAccounts,
     onAccountAvailable: async (sessionId, account) => {
       // If the session already left EXHAUSTED (manual failover/stop/another resume), end polling.
       const current = sessionManager.readState(sessionId);

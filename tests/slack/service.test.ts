@@ -338,8 +338,8 @@ describe('SlackService', () => {
     expect(say).toHaveBeenCalledWith(expect.stringMatching(/interrupt|stop|status|cmd/i));
   });
 
-  it('routes !permit to onPermissionGrant for the active session', async () => {
-    const onPermissionGrant = vi.fn().mockResolvedValue(undefined);
+  it('routes !permit to onPermissionGrant and confirms success only when the broker acts', async () => {
+    const onPermissionGrant = vi.fn().mockResolvedValue(true);
     const svc = new SlackService({
       config: makeConfig(),
       sessionManager: sessionManager as never,
@@ -357,10 +357,34 @@ describe('SlackService', () => {
     await messageHandler?.({ message: { text: '!permit', user: 'U123', channel: 'C123' }, say });
 
     expect(onPermissionGrant).toHaveBeenCalledWith('sess-001');
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/permission granted/i));
   });
 
-  it('routes !deny to onPermissionDeny for the active session', async () => {
-    const onPermissionDeny = vi.fn().mockResolvedValue(undefined);
+  // F3 regression: when the broker found no actionable prompt, Slack must NOT claim success.
+  it('reports failure for !permit when the broker did not send a keystroke', async () => {
+    const onPermissionGrant = vi.fn().mockResolvedValue(false);
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+      onPermissionGrant,
+    });
+    await svc.start();
+
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text: '!permit', user: 'U123', channel: 'C123' }, say });
+
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/no pending permission|expired|already been resolved/i));
+    expect(say).not.toHaveBeenCalledWith(expect.stringMatching(/permission granted/i));
+  });
+
+  it('routes !deny to onPermissionDeny and confirms success only when the broker acts', async () => {
+    const onPermissionDeny = vi.fn().mockResolvedValue(true);
     const svc = new SlackService({
       config: makeConfig(),
       sessionManager: sessionManager as never,
@@ -378,6 +402,7 @@ describe('SlackService', () => {
     await messageHandler?.({ message: { text: '!deny', user: 'U123', channel: 'C123' }, say });
 
     expect(onPermissionDeny).toHaveBeenCalledWith('sess-001');
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/permission denied/i));
   });
 
   it('reports when permission approval is not wired for !permit', async () => {

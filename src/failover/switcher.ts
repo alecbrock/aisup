@@ -243,16 +243,24 @@ export async function performSwitch(
     },
   });
 
-  // Phase: terminate source runner
+  // Phase: terminate source runner.
+  // A resume-from-EXHAUSTED has no live source runner: performSwitch already destroyed the
+  // source pane and cleared switch_tx before persisting EXHAUSTED. Sending C-c to that dead
+  // pane throws (tmux has no such target) and would abort the relaunch before target creation.
+  // Skip termination when the source is already gone; otherwise terminate (a missing pane there
+  // is non-fatal — terminateRunnerForSwitch treats a vanished pane as nothing-to-interrupt).
   switchTx.switch_phase = 'stopping';
   switchTx.phase_timestamps['stopping'] = new Date().toISOString();
   persistTx();
 
-  await sessionManager.terminateRunnerForSwitch(
-    state.tmux_name,
-    snapshot.aisupSessionId,
-    { force: false }
-  );
+  const sourceAlreadyGone = state.status === 'EXHAUSTED' || state.switch_tx?.source_destroyed === true;
+  if (!sourceAlreadyGone) {
+    await sessionManager.terminateRunnerForSwitch(
+      state.tmux_name,
+      snapshot.aisupSessionId,
+      { force: false }
+    );
+  }
   switchTx.source_destroyed = true;
   switchTx.switch_phase = 'source_destroyed';
   switchTx.phase_timestamps['source_destroyed'] = new Date().toISOString();
@@ -262,7 +270,7 @@ export async function performSwitch(
     ts: new Date().toISOString(),
     event_type: 'runner.terminated_for_switch',
     aisup_session_id: snapshot.aisupSessionId,
-    details: { reason: snapshot.reason, source_account: snapshot.sourceAccount, target_account: snapshot.targetAccount, tmux_name: state.tmux_name },
+    details: { reason: snapshot.reason, source_account: snapshot.sourceAccount, target_account: snapshot.targetAccount, tmux_name: state.tmux_name, source_already_gone: sourceAlreadyGone },
   });
 
   // Phase: migrate transcript — the migration outcome owns the launch decision.
@@ -337,7 +345,16 @@ export async function performSwitch(
   // Phase: create target session (with retry across eligible accounts)
   const targetOrder: AccountInfo[] = [];
   const primaryTarget = accounts.find((a) => a.name === snapshot.targetAccount);
-  if (primaryTarget) targetOrder.push(primaryTarget);
+  // Manual failover trusts the operator's already-validated choice (COOLDOWN override allowed).
+  // Automatic selection (incl. EXHAUSTED auto-resume) must honor the canonical eligibility filter
+  // so a primary that went UNAVAILABLE/COOLDOWN since selection is never relaunched into.
+  const primaryEligible =
+    !!primaryTarget &&
+    primaryTarget.enabled &&
+    (primaryTarget.state === 'HEALTHY' || primaryTarget.state === 'DEGRADED');
+  if (primaryTarget && (snapshot.selectionMode === 'manual' || primaryEligible)) {
+    targetOrder.push(primaryTarget);
+  }
 
   if (snapshot.selectionMode === 'automatic') {
     // Automatic retry: only HEALTHY/DEGRADED (excludes COOLDOWN + UNAVAILABLE), ordered by the
