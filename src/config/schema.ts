@@ -39,6 +39,46 @@ export interface SessionConfig {
   output_log_max_size_mb: number;
   output_log_retention_days: number;
   resume_prompt_mode: 'never' | 'always' | 'on-failure';
+  tmux_socket: string;
+}
+
+export interface RecoveryConfig {
+  auto_resume_exhausted: boolean;
+  exhausted_poll_interval_s: number;
+  network_error_threshold: number;
+  max_exhausted_retries: number;
+}
+
+export interface PermissionPolicyConfig {
+  allowlist: string[];
+  denylist: string[];
+  default_action: 'allow' | 'deny';
+}
+
+export interface PermissionsConfig {
+  enabled: boolean;
+  detection_patterns: string[];
+  approval_key: string;
+  denial_key: string;
+  policy: PermissionPolicyConfig;
+  slack_routing: boolean;
+  grant_ttl_seconds: number;
+}
+
+export interface GateCommandConfig {
+  name: string;
+  command: string;
+  args: string[];
+  timeout_seconds: number;
+  required: boolean;
+  cwd: string | null;
+}
+
+export interface GatesConfig {
+  enabled: boolean;
+  gates: GateCommandConfig[];
+  trigger: 'idle_and_skill' | 'manual';
+  idle_delay_seconds: number;
 }
 
 export interface SlackConfig {
@@ -73,6 +113,9 @@ export interface AisupConfig {
   skills: SkillsConfig;
   monitoring: MonitoringConfig;
   session: SessionConfig;
+  recovery: RecoveryConfig;
+  permissions: PermissionsConfig;
+  gates: GatesConfig;
   slack: SlackConfig;
   daemon: DaemonConfig;
   statusline: StatuslineConfig;

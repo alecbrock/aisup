@@ -28,10 +28,21 @@ export async function showAccounts(): Promise<void> {
       return;
     }
 
-    const body = await res.json() as { accounts: Array<{ name: string; state: string; score: number | null }> };
+    const body = await res.json() as {
+      accounts: Array<{
+        name: string; state: string; score: number | null; enabled?: boolean;
+        five_hour_pct?: number | null; seven_day_pct?: number | null; model?: string | null; cooldown_until?: string | null;
+      }>;
+    };
     for (const acct of body.accounts) {
       const score = acct.score !== null ? `${acct.score.toFixed(0)}%` : 'no data';
-      console.log(`  ${acct.name}: ${acct.state} (score: ${score})`);
+      const usage = typeof acct.five_hour_pct === 'number' && typeof acct.seven_day_pct === 'number'
+        ? `5h ${acct.five_hour_pct.toFixed(0)}%, 7d ${acct.seven_day_pct.toFixed(0)}%`
+        : 'no data';
+      const model = acct.model ?? '—';
+      const cooldown = acct.cooldown_until ?? '—';
+      const enabled = acct.enabled === false ? ' (disabled)' : '';
+      console.log(`  ${acct.name}: ${acct.state}${enabled} (score: ${score}, ${usage}, model: ${model}, cooldown: ${cooldown})`);
     }
   } catch {
     await showAccountsOffline();

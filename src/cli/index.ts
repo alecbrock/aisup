@@ -5,6 +5,8 @@ import { sessionStop } from './commands/stop.js';
 import { sessionAttach } from './commands/attach.js';
 import { showStatus } from './commands/status.js';
 import { showLog } from './commands/log.js';
+import { sessionCost } from './commands/cost.js';
+import { showGates, runGateCommand } from './commands/gate.js';
 import { showAccounts } from './commands/accounts.js';
 import { runDoctor } from './commands/doctor.js';
 import { runInit } from './commands/init.js';
@@ -60,7 +62,31 @@ program
   .command('log')
   .description('Show recent supervisor events')
   .option('--limit <n>', 'Number of events to show', '20')
-  .action((opts: { limit?: string }) => void showLog({ limit: opts.limit ? parseInt(opts.limit, 10) : 20 }));
+  .option('--type <event_type>', 'Filter by event type (e.g. cost.snapshot)')
+  .action((opts: { limit?: string; type?: string }) =>
+    void showLog({ limit: opts.limit ? parseInt(opts.limit, 10) : 20, type: opts.type })
+  );
+
+program
+  .command('cost')
+  .description('Show cost/token usage (rolling today / 7d / 30d windows)')
+  .option('--json', 'Print machine-readable JSON')
+  .option('--since <date>', 'Aggregate cost since an ISO date/time')
+  .option('--account <name>', 'Filter to a single account')
+  .action((opts: { json?: boolean; since?: string; account?: string }) =>
+    void sessionCost({ json: opts.json ?? false, since: opts.since, account: opts.account })
+  );
+
+const gate = program
+  .command('gate')
+  .description('Show the latest validation gate run')
+  .option('--json', 'Print machine-readable JSON')
+  .action((opts: { json?: boolean }) => void showGates({ json: opts.json ?? false }));
+gate
+  .command('run')
+  .description('Run the configured validation gates now')
+  .option('--json', 'Print machine-readable JSON')
+  .action((opts: { json?: boolean }) => void runGateCommand({ json: opts.json ?? false }));
 
 program
   .command('accounts')

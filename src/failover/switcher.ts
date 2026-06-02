@@ -3,13 +3,29 @@ import type { ValidationResult, SwitchSnapshot } from './types.js';
 import { SwitchReason } from './types.js';
 import type { SessionManager } from '../session/manager.js';
 import type { SessionState, SwitchAttempt, SwitchTx } from '../session/types.js';
-import { migrateTranscript } from './migrator.js';
-import type { JournalWriter } from '../journal/types.js';
+import { migrateTranscript, MigrationError } from './migrator.js';
+import type { MigrationResult } from './migrator.js';
+import type { JournalWriter, EventType } from '../journal/types.js';
+
+/** Canonical journal event name per migration outcome (no parallel `migration.already_migrated`). */
+const MIGRATION_EVENT: Record<MigrationResult['status'], EventType> = {
+  copied: 'migration.completed',
+  already_migrated: 'migration.skipped_already_migrated',
+  collision_renamed: 'migration.collision_renamed',
+  skipped_no_transcript: 'migration.skipped_no_transcript',
+};
+
+export type LaunchMode = 'resumed' | 'fresh';
 
 export interface SwitchDeps {
   sessionManager: SessionManager;
   journal: JournalWriter;
-  createSessionForTarget: (targetAccount: AccountInfo, snapshot: SwitchSnapshot) => Promise<SessionState>;
+  /**
+   * Launch the target runner. `launchMode` is owned by the migration outcome, not by
+   * `snapshot.claudeSessionId`: a failed/skipped migration yields `'fresh'` even when a
+   * claude session id is set, so the target never resumes against a transcript it lacks.
+   */
+  createSessionForTarget: (targetAccount: AccountInfo, snapshot: SwitchSnapshot, launchMode: LaunchMode) => Promise<SessionState>;
 }
 
 export interface SwitchResult {
@@ -71,6 +87,97 @@ export function selectSwitchTarget(
     return eligible.find((a) => typeof a.score === 'number' && a.score > opts.currentScore!) ?? null;
   }
   return eligible[0] ?? null;
+}
+
+export interface NoTargetDeps {
+  sessionManager: { patchState(id: string, patch: Partial<SessionState>): void };
+  journal: JournalWriter;
+  /** Refresh online API/session visibility (server.setSessionState). */
+  setSessionVisible?: (session: { status: 'EXHAUSTED'; aisup_session_id: string; hasTmux: boolean }) => void;
+  /** Notify Slack when configured (best-effort). */
+  notifyExhausted?: (sessionId: string) => Promise<void> | void;
+}
+
+export interface NoTargetParams {
+  sessionId: string;
+  fromAccount: string;
+  reason: SwitchReason;
+  triedAccounts?: string[];
+  sourceRunnerAlive?: boolean;
+  earliestCooldownEta?: string | null;
+}
+
+/**
+ * Resolve a pre-switch "no eligible target" outcome.
+ *
+ * A soft-threshold no-better-target is NON-terminal: the session keeps running and
+ * is re-evaluated on the next tick. Every other reason (hard threshold, live 429,
+ * source-dead crash, restart failures, circuit breaker) is terminal: the session is
+ * persisted `EXHAUSTED` so it survives daemon restarts, stops being treated as ACTIVE,
+ * and surfaces a distinct terminal event — never the same event shape as the soft case.
+ */
+export async function handleNoTarget(params: NoTargetParams, deps: NoTargetDeps): Promise<{ terminal: boolean }> {
+  const { sessionId, fromAccount, reason } = params;
+  const triedAccounts = params.triedAccounts ?? [];
+  const earliestCooldownEta = params.earliestCooldownEta ?? null;
+  const terminal = reason !== SwitchReason.SoftThreshold;
+
+  if (!terminal) {
+    await deps.journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'failover.no_target_available',
+      aisup_session_id: sessionId,
+      details: {
+        terminal: false,
+        reason,
+        from_account: fromAccount,
+        excluded_accounts: [fromAccount],
+        tried_accounts: triedAccounts,
+        source_runner_alive: params.sourceRunnerAlive ?? true,
+        earliest_cooldown_eta: earliestCooldownEta,
+        requires_better_soft_target: true,
+      },
+    });
+    return { terminal: false };
+  }
+
+  // Terminal: persist EXHAUSTED, clear any in-flight switch transaction.
+  deps.sessionManager.patchState(sessionId, { status: 'EXHAUSTED', switch_tx: null });
+
+  await deps.journal.append({
+    ts: new Date().toISOString(),
+    event_type: 'failover.no_target_available',
+    aisup_session_id: sessionId,
+    details: {
+      terminal: true,
+      reason,
+      from_account: fromAccount,
+      excluded_accounts: [fromAccount],
+      tried_accounts: triedAccounts,
+      source_runner_alive: params.sourceRunnerAlive ?? false,
+      earliest_cooldown_eta: earliestCooldownEta,
+      requires_better_soft_target: false,
+    },
+  });
+
+  await deps.journal.append({
+    ts: new Date().toISOString(),
+    event_type: 'session.exhausted',
+    aisup_session_id: sessionId,
+    details: {
+      reason,
+      from_account: fromAccount,
+      tried_accounts: triedAccounts,
+      earliest_cooldown_eta: earliestCooldownEta,
+      last_switch_failure: null,
+    },
+  });
+
+  // Refresh online visibility so /api/status and manual failover see the EXHAUSTED state.
+  deps.setSessionVisible?.({ status: 'EXHAUSTED', aisup_session_id: sessionId, hasTmux: false });
+  await deps.notifyExhausted?.(sessionId);
+
+  return { terminal: true };
 }
 
 function cloneTx(tx: SwitchTx): SwitchTx {
@@ -158,8 +265,23 @@ export async function performSwitch(
     details: { reason: snapshot.reason, source_account: snapshot.sourceAccount, target_account: snapshot.targetAccount, tmux_name: state.tmux_name },
   });
 
-  // Phase: migrate transcript
-  if (snapshot.transcriptPath) {
+  // Phase: migrate transcript — the migration outcome owns the launch decision.
+  // `resumed` only when a valid transcript exists in the (primary) target account;
+  // `fresh` for null/missing/invalid/failed migration, even if a claude session id is set.
+  let primaryLaunchMode: LaunchMode = 'fresh';
+  if (!snapshot.transcriptPath) {
+    // No transcript to migrate — force fresh and record why (the migrator's own
+    // skipped_no_transcript status is unreachable, so the switcher owns this skip).
+    await journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'migration.skipped_no_transcript',
+      aisup_session_id: snapshot.aisupSessionId,
+      details: {
+        source_account: snapshot.sourceAccount,
+        target_account: snapshot.targetAccount,
+      },
+    });
+  } else {
     switchTx.switch_phase = 'migrating';
     switchTx.phase_timestamps['migrating'] = new Date().toISOString();
     persistTx();
@@ -178,23 +300,36 @@ export async function performSwitch(
 
         await journal.append({
           ts: new Date().toISOString(),
-          event_type: `migration.${migrationResult.status === 'copied' ? 'completed' : migrationResult.status}` as 'migration.completed',
+          event_type: MIGRATION_EVENT[migrationResult.status],
           aisup_session_id: snapshot.aisupSessionId,
           details: {
             status: migrationResult.status,
             source_account: snapshot.sourceAccount,
             target_account: snapshot.targetAccount,
             source_path: snapshot.transcriptPath,
+            source_size: migrationResult.sourceSize ?? null,
             source_sha256: migrationResult.sourceSha256 ?? null,
+            target_path: migrationResult.targetPath ?? null,
+            target_sha256: migrationResult.targetSha256 ?? null,
           },
         });
+        // A valid transcript now exists in the target account → safe to resume.
+        primaryLaunchMode = 'resumed';
       } catch (err) {
         await journal.append({
           ts: new Date().toISOString(),
           event_type: 'migration.invalid_path',
           aisup_session_id: snapshot.aisupSessionId,
-          details: { error: String(err) },
+          // Safe reason enum from MigrationError — never raw exception text or transcript content.
+          details: {
+            reason: err instanceof MigrationError ? err.reason : 'unknown',
+            source_account: snapshot.sourceAccount,
+            target_account: snapshot.targetAccount,
+            source_path: snapshot.transcriptPath,
+          },
         });
+        // Migration failed → do NOT resume against a transcript the target lacks.
+        primaryLaunchMode = 'fresh';
       }
     }
   }
@@ -205,14 +340,29 @@ export async function performSwitch(
   if (primaryTarget) targetOrder.push(primaryTarget);
 
   if (snapshot.selectionMode === 'automatic') {
-    const others = accounts.filter(
-      (a) => a.name !== snapshot.sourceAccount && a.name !== snapshot.targetAccount && a.enabled && a.state !== 'UNAVAILABLE'
-    ).sort((a, b) => a.priority - b.priority);
+    // Automatic retry: only HEALTHY/DEGRADED (excludes COOLDOWN + UNAVAILABLE), ordered by the
+    // canonical score-then-priority rule rather than a second priority-only sort.
+    const others = accounts
+      .filter((a) =>
+        a.name !== snapshot.sourceAccount &&
+        a.name !== snapshot.targetAccount &&
+        a.enabled &&
+        (a.state === 'HEALTHY' || a.state === 'DEGRADED')
+      )
+      .sort((a, b) => {
+        const aScore = a.score ?? -Infinity;
+        const bScore = b.score ?? -Infinity;
+        if (aScore !== bScore) return bScore - aScore;
+        return a.priority - b.priority;
+      });
     targetOrder.push(...others);
   }
 
   for (const target of targetOrder) {
     if (switchTx.tried_accounts.includes(target.name)) continue;
+    // The transcript was migrated only to the primary target; retry ("other") accounts
+    // have no copy, so they must launch fresh.
+    const targetLaunchMode: LaunchMode = target.name === snapshot.targetAccount ? primaryLaunchMode : 'fresh';
     switchTx.target_account = target.name;
     switchTx.target_tmux_name = null;
     switchTx.target_tmux_session_id = null;
@@ -222,7 +372,7 @@ export async function performSwitch(
     switchTx.phase_timestamps['creating'] = new Date().toISOString();
     const attempt: SwitchAttempt = {
       target_account: target.name,
-      phase: snapshot.claudeSessionId ? 'resuming' : 'creating',
+      phase: targetLaunchMode === 'resumed' ? 'resuming' : 'creating',
       target_tmux_name: null,
       target_tmux_session_id: null,
       target_pane_id: null,
@@ -234,7 +384,7 @@ export async function performSwitch(
     persistTx();
 
     try {
-      const newState = await deps.createSessionForTarget(target, snapshot);
+      const newState = await deps.createSessionForTarget(target, snapshot, targetLaunchMode);
       switchTx.target_tmux_name = newState.tmux_name;
       switchTx.target_tmux_session_id = newState.tmux_session_id;
       switchTx.target_pane_id = newState.pane_id;
@@ -254,7 +404,7 @@ export async function performSwitch(
           from_account: snapshot.sourceAccount,
           to_account: target.name,
           selection_mode: snapshot.selectionMode,
-          launch_mode: snapshot.claudeSessionId ? 'resumed' : 'fresh',
+          launch_mode: targetLaunchMode,
         },
       });
 

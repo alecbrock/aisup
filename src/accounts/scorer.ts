@@ -1,6 +1,5 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import type { AccountInfo } from './types.js';
 
 interface RateLimitWindow {
   used_percentage: number;
@@ -42,12 +41,14 @@ function computeScore(five: number, seven: number): number {
  * Score an account by reading its statusline telemetry.
  * Returns null when no valid fresh telemetry exists (caller uses priority fallback).
  * freshnessWindowS: seconds before a file is considered stale.
+ * Synchronous: the underlying telemetry reads are all synchronous, and the
+ * account-refresh path (refreshAccountScores) runs inside synchronous monitor ticks.
  */
-export async function scoreAccount(
+export function scoreAccount(
   configDir: string,
   statuslineDir: string,
   freshnessWindowS: number
-): Promise<number | null> {
+): number | null {
   const resolvedDir = resolve(configDir) + '/';
   const now = Date.now();
   const files = listStatuslineFiles(statuslineDir);
@@ -86,29 +87,4 @@ export async function scoreAccount(
   }
 
   return null;
-}
-
-/** Select the best eligible account (HEALTHY or DEGRADED), excluding named accounts. */
-export function selectBestAccount(
-  accounts: AccountInfo[],
-  exclude: string[] = []
-): AccountInfo | null {
-  const excludeSet = new Set(exclude);
-
-  const eligible = accounts.filter(
-    (a) => a.enabled && !excludeSet.has(a.name) && (a.state === 'HEALTHY' || a.state === 'DEGRADED')
-  );
-
-  if (eligible.length === 0) return null;
-
-  return eligible.sort((a, b) => {
-    // Higher score wins; null score → falls to priority comparison
-    const aScore = a.score ?? -Infinity;
-    const bScore = b.score ?? -Infinity;
-    if (bScore !== aScore) return bScore - aScore;
-    // Lower priority number wins
-    if (a.priority !== b.priority) return a.priority - b.priority;
-    // Alphabetical tiebreak
-    return a.name.localeCompare(b.name);
-  })[0] ?? null;
 }

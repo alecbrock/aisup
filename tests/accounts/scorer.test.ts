@@ -2,8 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { scoreAccount, selectBestAccount } from '../../src/accounts/scorer.js';
-import type { AccountInfo } from '../../src/accounts/types.js';
+import { scoreAccount } from '../../src/accounts/scorer.js';
 
 const NOW_EPOCH = Math.floor(Date.now() / 1000);
 const FUTURE_EPOCH = NOW_EPOCH + 3600; // resets in 1h
@@ -52,7 +51,7 @@ describe('scoreAccount', () => {
       })
     );
 
-    const score = await scoreAccount(configDir, statuslineDir, 300);
+    const score = scoreAccount(configDir, statuslineDir, 300);
     // score = (100-40)*0.7 + (100-20)*0.3 = 42 + 24 = 66
     expect(score).toBeCloseTo(66, 1);
   });
@@ -67,7 +66,7 @@ describe('scoreAccount', () => {
       makeTelemetry({ transcript_path: `${tmpDir}/.claude/projects/foo/bar.jsonl` })
     );
 
-    const score = await scoreAccount(configDir, statuslineDir, 300);
+    const score = scoreAccount(configDir, statuslineDir, 300);
     expect(score).toBeNull();
   });
 
@@ -93,7 +92,7 @@ describe('scoreAccount', () => {
     utimesSync(filePath, tenSecondsAgo, tenSecondsAgo);
 
     // freshness_window_s=5 → file is 10s old → stale
-    const score = await scoreAccount(configDir, statuslineDir, 5);
+    const score = scoreAccount(configDir, statuslineDir, 5);
     // stale-future: score * 0.8 = 66 * 0.8 = 52.8
     expect(score).toBeCloseTo(52.8, 1);
   });
@@ -113,70 +112,7 @@ describe('scoreAccount', () => {
       })
     );
 
-    const score = await scoreAccount(configDir, statuslineDir, 300);
+    const score = scoreAccount(configDir, statuslineDir, 300);
     expect(score).toBeNull();
-  });
-});
-
-describe('selectBestAccount', () => {
-  it('should return highest-scoring HEALTHY account', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: true, state: 'HEALTHY', score: 50, cooldownUntil: null },
-      { name: 'account2', configDir: '/b', priority: 2, enabled: true, state: 'HEALTHY', score: 80, cooldownUntil: null },
-    ];
-    const result = selectBestAccount(accounts);
-    expect(result?.name).toBe('account2');
-  });
-
-  it('should include DEGRADED accounts as eligible', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: true, state: 'UNAVAILABLE', score: 90, cooldownUntil: null },
-      { name: 'account2', configDir: '/b', priority: 2, enabled: true, state: 'DEGRADED', score: 30, cooldownUntil: null },
-    ];
-    const result = selectBestAccount(accounts);
-    expect(result?.name).toBe('account2');
-  });
-
-  it('should return null when all accounts are UNAVAILABLE or COOLDOWN', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: true, state: 'UNAVAILABLE', score: 90, cooldownUntil: null },
-      { name: 'account2', configDir: '/b', priority: 2, enabled: true, state: 'COOLDOWN', score: 70, cooldownUntil: null },
-    ];
-    expect(selectBestAccount(accounts)).toBeNull();
-  });
-
-  it('should skip disabled accounts', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: false, state: 'HEALTHY', score: 90, cooldownUntil: null },
-      { name: 'account2', configDir: '/b', priority: 2, enabled: true, state: 'HEALTHY', score: 40, cooldownUntil: null },
-    ];
-    expect(selectBestAccount(accounts)?.name).toBe('account2');
-  });
-
-  it('should exclude named accounts', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: true, state: 'HEALTHY', score: 90, cooldownUntil: null },
-      { name: 'account2', configDir: '/b', priority: 2, enabled: true, state: 'HEALTHY', score: 40, cooldownUntil: null },
-    ];
-    expect(selectBestAccount(accounts, ['primary'])?.name).toBe('account2');
-  });
-
-  it('should fall back to priority when scores are null', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: true, state: 'HEALTHY', score: null, cooldownUntil: null },
-      { name: 'account2', configDir: '/b', priority: 2, enabled: true, state: 'HEALTHY', score: null, cooldownUntil: null },
-    ];
-    // lower priority number = preferred
-    expect(selectBestAccount(accounts)?.name).toBe('primary');
-  });
-
-  it('should not allow EXHAUSTED as an account state', () => {
-    const accounts: AccountInfo[] = [
-      { name: 'primary', configDir: '/a', priority: 1, enabled: true, state: 'HEALTHY', score: 50, cooldownUntil: null },
-    ];
-    // Verify no account has EXHAUSTED state (TypeScript prevents it, but runtime assertion)
-    for (const a of accounts) {
-      expect(['HEALTHY', 'DEGRADED', 'UNAVAILABLE', 'COOLDOWN']).toContain(a.state);
-    }
   });
 });

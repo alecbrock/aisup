@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { loadConfig } from '../../config/loader.js';
 
 const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
 
@@ -35,5 +36,6 @@ export async function sessionAttach(): Promise<void> {
     process.exit(1);
   }
 
-  execFileSync('tmux', ['-L', 'aisup', 'attach-session', '-t', tmuxName], { stdio: 'inherit' });
+  const config = await loadConfig();
+  execFileSync('tmux', ['-L', config.session.tmux_socket, 'attach-session', '-t', tmuxName], { stdio: 'inherit' });
 }

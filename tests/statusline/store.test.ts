@@ -207,6 +207,43 @@ describe('readTelemetryForSession', () => {
     const result = readTelemetryForSession('no-such-id', configDir, '/tmp', statuslineDir);
     expect(result.telemetry).toBeNull();
     expect(result.mismatch).toBeNull();
+    expect(result.invalidJson ?? null).toBeNull();
+  });
+
+  it('rejects telemetry lacking both cwd and project identity', () => {
+    const claudeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    writeFileSync(
+      join(statuslineDir, `statusline-${claudeId}.json`),
+      JSON.stringify({ session_id: claudeId, transcript_path: `${configDir}/projects/foo/bar.jsonl` })
+    );
+    const result = readTelemetryForSession(claudeId, configDir, '/home/project', statuslineDir);
+    expect(result.telemetry).toBeNull();
+    expect(result.mismatch).toMatch(/project|identity|cwd/i);
+  });
+
+  it('accepts telemetry when workspace.project_dir matches even if cwd is absent', () => {
+    const claudeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    writeFileSync(
+      join(statuslineDir, `statusline-${claudeId}.json`),
+      JSON.stringify({
+        session_id: claudeId,
+        transcript_path: `${configDir}/projects/foo/bar.jsonl`,
+        workspace: { project_dir: '/home/project' },
+      })
+    );
+    const result = readTelemetryForSession(claudeId, configDir, '/home/project', statuslineDir);
+    expect(result.telemetry).not.toBeNull();
+    expect(result.mismatch).toBeNull();
+  });
+
+  it('surfaces invalid JSON with a safe parse summary and freshness context', () => {
+    const claudeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    writeFileSync(join(statuslineDir, `statusline-${claudeId}.json`), '{ not valid json');
+    const result = readTelemetryForSession(claudeId, configDir, '/home/project', statuslineDir);
+    expect(result.telemetry).toBeNull();
+    expect(result.invalidJson).toBeTruthy();
+    expect(result.invalidJson?.error.length).toBeGreaterThan(0);
+    expect(typeof result.invalidJson?.stale).toBe('boolean');
   });
 });
 
@@ -262,5 +299,53 @@ describe('readTelemetryForActiveSession', () => {
     const result = readTelemetryForActiveSession(session, configDir, statuslineDir, 300);
     expect(result.telemetry?.session_id).toBe(knownId);
     expect(result.mismatch).toBeNull();
+  });
+
+  it('skips an unrelated newer same-account candidate and selects the project-matching one', () => {
+    const launchMs = Date.now() - 120_000;
+    const launch = new Date(launchMs).toISOString();
+    const matchId = 'aaaaaaaa-1111-1111-1111-111111111111';
+    const unrelatedId = 'bbbbbbbb-2222-2222-2222-222222222222';
+    const matchPath = join(statuslineDir, `statusline-${matchId}.json`);
+    const unrelatedPath = join(statuslineDir, `statusline-${unrelatedId}.json`);
+    writeFileSync(matchPath, JSON.stringify({ session_id: matchId, transcript_path: `${configDir}/projects/a/x.jsonl`, cwd: '/home/project' }));
+    writeFileSync(unrelatedPath, JSON.stringify({ session_id: unrelatedId, transcript_path: `${configDir}/projects/b/y.jsonl`, cwd: '/home/other' }));
+    // The unrelated candidate is newer but belongs to a different project → must be skipped.
+    utimesSync(matchPath, new Date(launchMs + 1000), new Date(launchMs + 1000));
+    utimesSync(unrelatedPath, new Date(launchMs + 5000), new Date(launchMs + 5000));
+
+    const result = readTelemetryForActiveSession({
+      launchStartedAt: launch,
+      currentAccountConfigDir: configDir,
+      expectedCwd: '/home/project',
+      statuslineDir,
+      freshnessWindowS: 100000,
+    });
+    expect(result?.session_id).toBe(matchId);
+  });
+
+  it('rejects stale source-account telemetry after a failover and selects the current-account file', () => {
+    const launchMs = Date.now() - 120_000;
+    const launch = new Date(launchMs).toISOString();
+    const oldDir = join(tmpDir, '.claude-old');
+    mkdirSync(oldDir, { recursive: true });
+    const curId = 'cccccccc-1111-1111-1111-111111111111';
+    const oldId = 'dddddddd-2222-2222-2222-222222222222';
+    const curPath = join(statuslineDir, `statusline-${curId}.json`);
+    const oldPath = join(statuslineDir, `statusline-${oldId}.json`);
+    writeFileSync(curPath, JSON.stringify({ session_id: curId, transcript_path: `${configDir}/projects/a/x.jsonl`, cwd: '/home/project' }));
+    writeFileSync(oldPath, JSON.stringify({ session_id: oldId, transcript_path: `${oldDir}/projects/a/x.jsonl`, cwd: '/home/project' }));
+    // The previous-account (source) file is newer but belongs to the old account → must be skipped.
+    utimesSync(curPath, new Date(launchMs + 1000), new Date(launchMs + 1000));
+    utimesSync(oldPath, new Date(launchMs + 5000), new Date(launchMs + 5000));
+
+    const result = readTelemetryForActiveSession({
+      launchStartedAt: launch,
+      currentAccountConfigDir: configDir,
+      expectedCwd: '/home/project',
+      statuslineDir,
+      freshnessWindowS: 100000,
+    });
+    expect(result?.session_id).toBe(curId);
   });
 });

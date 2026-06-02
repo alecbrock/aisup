@@ -7,6 +7,8 @@ export enum SwitchReason {
   CircuitBreaker = 'circuit_breaker',
   Manual = 'manual',
   SourceDead = 'source_dead',
+  AuthFailure = 'auth_failure',
+  NetworkError = 'network_error',
 }
 
 export interface SwitchSnapshot {

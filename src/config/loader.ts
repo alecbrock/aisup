@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, accessSyn
 import { join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import yaml from 'js-yaml';
-import type { AisupConfig, AccountConfig } from './schema.js';
+import type { AisupConfig, AccountConfig, GateCommandConfig } from './schema.js';
 import { CONFIG_DEFAULTS } from './defaults.js';
 
 const DEFAULT_CONFIG_PATH = join(homedir(), '.aisup', 'config.yaml');
@@ -63,6 +63,47 @@ function validateExistingDir(p: string, fieldName: string): string {
     throw new Error(`Config validation error: ${fieldName} not found or not readable: ${expanded}`);
   }
   return expanded;
+}
+
+function validateTmuxSocket(socket: string): string {
+  if (!socket || !/^[A-Za-z0-9._-]+$/.test(socket)) {
+    throw new Error(
+      `Config validation error: session.tmux_socket must be a non-empty name using only [A-Za-z0-9._-] (no whitespace, path separators, or control characters), got "${socket}"`
+    );
+  }
+  return socket;
+}
+
+function validateKeyInput(key: string, fieldName: string): string {
+  if (!key || /[\x00-\x1f\x7f]/.test(key)) {
+    throw new Error(
+      `Config validation error: ${fieldName} must be non-empty printable text with no NUL, newline, or control characters`
+    );
+  }
+  return key;
+}
+
+function validateGates(gates: GateCommandConfig[]): GateCommandConfig[] {
+  if (!Array.isArray(gates)) {
+    throw new Error('Config validation error: gates.gates must be an array');
+  }
+  gates.forEach((g, i) => {
+    if (!g || typeof g !== 'object') {
+      throw new Error(`Config validation error: gates.gates[${i}] must be an object`);
+    }
+    if (!g.name || typeof g.name !== 'string') {
+      throw new Error(`Config validation error: gates.gates[${i}].name must be a non-empty string`);
+    }
+    if (!g.command || typeof g.command !== 'string' || /\s/.test(g.command)) {
+      throw new Error(
+        `Config validation error: gates.gates[${i}].command must be an executable with no embedded arguments — put arguments in args`
+      );
+    }
+    if (!Array.isArray(g.args)) {
+      throw new Error(`Config validation error: gates.gates[${i}].args must be an array`);
+    }
+  });
+  return gates;
 }
 
 function mergeDeep<T extends object>(target: T, source: Partial<T>): T {
@@ -141,6 +182,18 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
   const journalPath = validatePath(merged.journal.path, 'journal.path');
   const statuslineDirectory = validatePath(merged.statusline.directory, 'statusline.directory');
 
+  // Phase 2 contract baseline: tmux socket, permission keystrokes, gate commands.
+  const tmuxSocket = validateTmuxSocket(merged.session.tmux_socket);
+  validateKeyInput(merged.permissions.approval_key, 'permissions.approval_key');
+  validateKeyInput(merged.permissions.denial_key, 'permissions.denial_key');
+  if (!Number.isInteger(merged.recovery.max_exhausted_retries) || merged.recovery.max_exhausted_retries < 0) {
+    throw new Error('Config validation error: recovery.max_exhausted_retries must be a non-negative integer');
+  }
+  if (!Number.isInteger(merged.recovery.exhausted_poll_interval_s) || merged.recovery.exhausted_poll_interval_s < 1) {
+    throw new Error('Config validation error: recovery.exhausted_poll_interval_s must be a positive integer');
+  }
+  validateGates(merged.gates.gates);
+
   if (merged.slack.enabled) {
     if (!merged.slack.bot_token_env || !merged.slack.app_token_env) {
       throw new Error('Config validation error: slack bot_token_env and app_token_env are required when Slack is enabled');
@@ -157,7 +210,10 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     failover: merged.failover,
     skills: merged.skills,
     monitoring: merged.monitoring,
-    session: merged.session,
+    session: { ...merged.session, tmux_socket: tmuxSocket },
+    recovery: merged.recovery,
+    permissions: merged.permissions,
+    gates: merged.gates,
     slack: merged.slack,
     daemon: merged.daemon,
     statusline: { ...merged.statusline, directory: statuslineDirectory },

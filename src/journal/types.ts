@@ -2,6 +2,7 @@ export type EventType =
   // Session
   | 'session.start'
   | 'session.stop'
+  | 'session.idle_detected'
   | 'session.attach'
   | 'session.destroyed_externally'
   | 'session.exhausted'
@@ -13,10 +14,35 @@ export type EventType =
   | 'runner.respawn_failed'
   // Failure/Recovery
   | 'failure.detected'
+  | 'failure.auth_detected'
+  | 'failure.network_detected'
   | 'recovery.success'
   | 'recovery.failed'
+  | 'recovery.attempted'
   | 'recovery.restart_same_account'
   | 'recovery.restart_fresh_no_session_id'
+  | 'recovery.exhausted_polling_started'
+  | 'recovery.exhausted_resumed'
+  | 'recovery.exhausted_polling_stopped'
+  | 'recovery.exhausted_max_retries'
+  // Cost
+  | 'cost.snapshot'
+  // Permissions
+  | 'permission.detected'
+  | 'permission.granted'
+  | 'permission.denied'
+  | 'permission.expired'
+  | 'permission.auto_granted'
+  | 'permission.auto_denied'
+  | 'permission.routed_to_slack'
+  | 'permission.keystroke_timeout'
+  | 'permission.keystroke_unconfirmed'
+  // Gates
+  | 'gate.started'
+  | 'gate.passed'
+  | 'gate.failed'
+  | 'gate.timeout'
+  | 'gate.run_completed'
   // Circuit breaker
   | 'circuit_breaker.tripped'
   | 'circuit_breaker.reset'

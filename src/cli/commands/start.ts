@@ -7,8 +7,39 @@ import { loadConfig } from '../../config/loader.js';
 import { buildLaunchCommand, validateRunner } from '../../runner/builder.js';
 import { getBlockingSession, canStartNewSession } from '../pid.js';
 import { listSessions } from '../../session/tmux.js';
+import { AccountRegistry } from '../../accounts/registry.js';
+import { CircuitBreaker } from '../../accounts/circuit-breaker.js';
+import { refreshAccountScores } from '../../accounts/refresh.js';
+import { selectSwitchTarget } from '../../failover/switcher.js';
+import type { AisupConfig } from '../../config/schema.js';
+import type { AccountInfo } from '../../accounts/types.js';
 
 const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
+
+/**
+ * Resolve the account a real `aisup start` would admit, using the same scoring,
+ * eligibility, and circuit-breaker rules as the daemon. The CLI has no in-memory
+ * registry, so this builds one from config, loads the daemon's persisted
+ * circuit-breaker state, refreshes scores from per-account statusline telemetry,
+ * then runs the canonical selector. Returns the scored selection, not priority order.
+ */
+export function selectDryRunAccount(config: AisupConfig, circuitBreakerStatePath: string): AccountInfo | null {
+  const registry = new AccountRegistry(config);
+  const circuitBreaker = new CircuitBreaker({
+    maxFailures: config.failover.circuit_breaker_max_failures,
+    cooldownSeconds: config.failover.circuit_breaker_cooldown_seconds,
+    statePath: circuitBreakerStatePath,
+  });
+  refreshAccountScores({
+    registry,
+    statuslineDir: config.statusline.directory,
+    freshnessWindowS: config.statusline.freshness_window_s,
+    softPct: config.thresholds.soft_pct,
+    hardPct: config.thresholds.hard_pct,
+    circuitBreaker,
+  });
+  return selectSwitchTarget(registry.getAll(), '', []);
+}
 
 async function getDaemonUrl(): Promise<{ url: string; token: string }> {
   const pidPath = join(homedir(), '.aisup', 'daemon.pid');
@@ -54,7 +85,7 @@ export async function sessionStart(opts: {
       throw new Error(`cwd does not exist or is not a directory: ${resolvedCwd}`);
     }
     const config = await loadConfig();
-    const liveSessions = listSessions('aisup').filter((s) => s.startsWith('aisup-'));
+    const liveSessions = listSessions(config.session.tmux_socket).filter((s) => s.startsWith('aisup-'));
     const blocking = getBlockingSession(join(homedir(), '.aisup', 'sessions'), liveSessions);
     const admission = canStartNewSession(blocking);
     if (!admission.allowed) {
@@ -66,12 +97,11 @@ export async function sessionStart(opts: {
       accessSync(planPath, constants.R_OK);
       if (!statSync(planPath).isFile()) throw new Error(`plan is not a file: ${planPath}`);
     }
-    const account = config.accounts
-      .filter((a) => a.enabled)
-      .sort((a, b) => a.priority - b.priority)[0];
-    if (!account) throw new Error('no enabled account configured');
+    const cbStatePath = join(homedir(), '.aisup', 'circuit-breaker-state.json');
+    const account = selectDryRunAccount(config, cbStatePath);
+    if (!account) throw new Error('no eligible account available');
     const runner = { ...config.runner, command: validateRunner(config.runner) };
-    const command = buildLaunchCommand(runner, account.config_dir);
+    const command = buildLaunchCommand(runner, account.configDir);
     console.log(`[dry-run] cwd: ${resolvedCwd}`);
     if (planPath) console.log(`[dry-run] plan: ${planPath}`);
     console.log(`[dry-run] account: ${account.name}`);

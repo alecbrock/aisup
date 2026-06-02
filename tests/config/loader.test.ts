@@ -275,6 +275,139 @@ accounts:
     await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/config_dir.*not found|account.*not found/i);
   });
 
+  it('applies defaults for recovery, permissions, gates, and session.tmux_socket', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+`);
+
+    const config = await loadConfig(join(configDir, 'config.yaml'));
+
+    expect(config.session.tmux_socket).toBe('aisup');
+    expect(config.recovery.auto_resume_exhausted).toBe(true);
+    expect(config.recovery.exhausted_poll_interval_s).toBe(60);
+    expect(config.recovery.network_error_threshold).toBe(3);
+    expect(config.recovery.max_exhausted_retries).toBe(5);
+    expect(config.permissions.enabled).toBe(false);
+    expect(config.permissions.detection_patterns).toEqual([]);
+    expect(config.permissions.approval_key).toBe('y');
+    expect(config.permissions.denial_key).toBe('n');
+    expect(config.permissions.policy.default_action).toBe('deny');
+    expect(config.permissions.slack_routing).toBe(false);
+    expect(config.permissions.grant_ttl_seconds).toBe(300);
+    expect(config.gates.enabled).toBe(false);
+    expect(config.gates.gates).toEqual([]);
+    expect(config.gates.trigger).toBe('idle_and_skill');
+    expect(config.gates.idle_delay_seconds).toBe(30);
+  });
+
+  it('accepts custom recovery/permissions/gates values and detection-pattern overrides', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+session:
+  tmux_socket: aisup-test-123
+recovery:
+  auto_resume_exhausted: false
+  max_exhausted_retries: 9
+permissions:
+  enabled: true
+  detection_patterns:
+    - "Do you want to proceed"
+  approval_key: "1"
+  denial_key: "2"
+  policy:
+    default_action: allow
+gates:
+  enabled: true
+  trigger: manual
+  gates:
+    - name: typecheck
+      command: npx
+      args: ["tsc", "--noEmit"]
+      timeout_seconds: 60
+      required: true
+      cwd: null
+`);
+
+    const config = await loadConfig(join(configDir, 'config.yaml'));
+
+    expect(config.session.tmux_socket).toBe('aisup-test-123');
+    expect(config.recovery.auto_resume_exhausted).toBe(false);
+    expect(config.recovery.max_exhausted_retries).toBe(9);
+    expect(config.permissions.enabled).toBe(true);
+    expect(config.permissions.detection_patterns).toContain('Do you want to proceed');
+    expect(config.permissions.policy.default_action).toBe('allow');
+    expect(config.gates.enabled).toBe(true);
+    expect(config.gates.trigger).toBe('manual');
+    expect(config.gates.gates[0].command).toBe('npx');
+    expect(config.gates.gates[0].args).toEqual(['tsc', '--noEmit']);
+  });
+
+  it('rejects a gate command that embeds arguments', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+gates:
+  gates:
+    - name: typecheck
+      command: "npx tsc --noEmit"
+      args: []
+      timeout_seconds: 60
+      required: true
+      cwd: null
+`);
+
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/command|argument/i);
+  });
+
+  it('rejects an invalid tmux socket name', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+session:
+  tmux_socket: "bad/socket name"
+`);
+
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/tmux_socket/i);
+  });
+
+  it('rejects approval/denial keys that contain control characters', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+permissions:
+  approval_key: "\\n"
+`);
+
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/approval_key/i);
+  });
+
   it('should expand statusline.directory and validate Slack enabled prerequisites', async () => {
     const configDir = join(tmpDir, '.aisup');
     mkdirSync(configDir, { mode: 0o700 });

@@ -39,12 +39,51 @@ export function listTelemetryFiles(dir: string, freshnessWindowS = 300): Telemet
   }
 }
 
-function parseTelemetry(path: string): StatuslineTelemetry | null {
+type TelemetryParse =
+  | { ok: true; telemetry: StatuslineTelemetry }
+  | { ok: false; reason: 'missing' | 'invalid_json'; error: string };
+
+/** Read and parse a telemetry file, distinguishing a missing file from malformed JSON. */
+function parseTelemetryFile(path: string): TelemetryParse {
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(path, 'utf8')) as StatuslineTelemetry;
+    raw = readFileSync(path, 'utf8');
   } catch {
-    return null;
+    return { ok: false, reason: 'missing', error: 'file not found' };
   }
+  try {
+    return { ok: true, telemetry: JSON.parse(raw) as StatuslineTelemetry };
+  } catch (err) {
+    // Safe summary only — the parser message, never the file contents.
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: 'invalid_json', error: message.slice(0, 160) };
+  }
+}
+
+/** Convenience wrapper for callers that only need telemetry-or-null (account scoring, scan). */
+function parseTelemetry(path: string): StatuslineTelemetry | null {
+  const r = parseTelemetryFile(path);
+  return r.ok ? r.telemetry : null;
+}
+
+/** True when the file's mtime is older than the freshness window (or cannot be read). */
+function fileStale(path: string, freshnessWindowS: number): boolean {
+  try {
+    return Date.now() - lstatSync(path).mtime.getTime() > freshnessWindowS * 1000;
+  } catch {
+    return true;
+  }
+}
+
+interface ProjectIdentityCheck { present: boolean; matches: boolean; }
+
+/** A telemetry candidate carries project identity via cwd and/or workspace.project_dir. */
+function checkProjectIdentity(t: StatuslineTelemetry, expectedCwd: string): ProjectIdentityCheck {
+  const candidates: string[] = [];
+  if (t.cwd) candidates.push(t.cwd);
+  if (t.workspace?.project_dir) candidates.push(t.workspace.project_dir);
+  if (candidates.length === 0) return { present: false, matches: false };
+  return { present: true, matches: candidates.includes(expectedCwd) };
 }
 
 function transcriptMatchesAccount(transcriptPath: string, configDir: string): boolean {
@@ -74,27 +113,41 @@ export function readTelemetryForAccount(
 export interface SessionTelemetryResult {
   telemetry: StatuslineTelemetry | null;
   mismatch: string | null;
+  /** Set when the exact telemetry file exists but is not valid JSON. */
+  invalidJson: { error: string; stale: boolean } | null;
 }
 
 /**
  * Read telemetry for a specific known claude session ID.
- * Validates transcript is under expectedAccount configDir and cwd matches.
+ * Accepts only telemetry belonging to the expected account (transcript under configDir),
+ * the expected Claude session id, and the expected project identity (cwd or
+ * workspace.project_dir). Surfaces malformed JSON so callers can emit telemetry.invalid_json.
  */
 export function readTelemetryForSession(
   claudeSessionId: string,
   expectedConfigDir: string,
   expectedCwd: string,
-  statuslineDir: string
+  statuslineDir: string,
+  freshnessWindowS = 300
 ): SessionTelemetryResult {
   const filePath = join(statuslineDir, `statusline-${claudeSessionId}.json`);
-  const t = parseTelemetry(filePath);
+  const parsed = parseTelemetryFile(filePath);
 
-  if (!t) return { telemetry: null, mismatch: null };
+  if (!parsed.ok) {
+    if (parsed.reason === 'missing') return { telemetry: null, mismatch: null, invalidJson: null };
+    return {
+      telemetry: null,
+      mismatch: null,
+      invalidJson: { error: parsed.error, stale: fileStale(filePath, freshnessWindowS) },
+    };
+  }
+  const t = parsed.telemetry;
 
   if (t.session_id !== claudeSessionId) {
     return {
       telemetry: null,
       mismatch: `session_id mismatch: expected ${claudeSessionId}, got ${t.session_id}`,
+      invalidJson: null,
     };
   }
 
@@ -102,17 +155,27 @@ export function readTelemetryForSession(
     return {
       telemetry: null,
       mismatch: `transcript account mismatch: ${t.transcript_path} not under ${expectedConfigDir}`,
+      invalidJson: null,
     };
   }
 
-  if (t.cwd && t.cwd !== expectedCwd) {
+  const identity = checkProjectIdentity(t, expectedCwd);
+  if (!identity.present) {
     return {
       telemetry: null,
-      mismatch: `cwd mismatch: expected ${expectedCwd}, got ${t.cwd}`,
+      mismatch: 'project identity missing: neither cwd nor workspace.project_dir present',
+      invalidJson: null,
+    };
+  }
+  if (!identity.matches) {
+    return {
+      telemetry: null,
+      mismatch: `project identity mismatch: expected ${expectedCwd}`,
+      invalidJson: null,
     };
   }
 
-  return { telemetry: t, mismatch: null };
+  return { telemetry: t, mismatch: null, invalidJson: null };
 }
 
 /**
@@ -140,7 +203,8 @@ function scanTelemetryForActiveSession(opts: ActiveTelemetryScanOpts): Statuslin
     if (!t) continue;
     if (!t.transcript_path) continue;
     if (!transcriptMatchesAccount(t.transcript_path, currentAccountConfigDir)) continue;
-    if (t.cwd && t.cwd !== expectedCwd) continue;
+    const identity = checkProjectIdentity(t, expectedCwd);
+    if (!identity.present || !identity.matches) continue;
 
     return t;
   }
@@ -169,7 +233,8 @@ export function readTelemetryForActiveSession(
       first.claude_session_id,
       currentAccountConfigDir ?? '',
       first.cwd,
-      statuslineDir ?? ''
+      statuslineDir ?? '',
+      freshnessWindowS ?? 300
     );
   }
 
@@ -182,5 +247,6 @@ export function readTelemetryForActiveSession(
       freshnessWindowS: freshnessWindowS ?? 300,
     }),
     mismatch: null,
+    invalidJson: null,
   };
 }

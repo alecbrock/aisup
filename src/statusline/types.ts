@@ -11,6 +11,7 @@ export interface StatuslineTelemetry {
     seven_day?: RateLimitWindow;
   };
   cwd?: string;
+  workspace?: { project_dir?: string };
   model?: { id?: string; display_name?: string };
   context_window?: { used_percentage?: number; context_window_size?: number };
   cost?: { total_cost_usd?: number };

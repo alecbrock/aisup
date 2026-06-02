@@ -22,11 +22,38 @@ export interface MigrateOpts {
   claudeSessionId: string | null;
 }
 
+/** Safe, enumerable reasons a migration was rejected — never raw exception text. */
+export type MigrationRejectReason =
+  | 'source_not_found'
+  | 'symlink_rejected'
+  | 'not_regular_file'
+  | 'outside_source_dir'
+  | 'wrong_extension'
+  | 'not_under_projects'
+  | 'basename_mismatch'
+  | 'target_parent_symlink'
+  | 'target_path_traversal'
+  | 'target_symlink'
+  | 'target_non_regular'
+  | 'byte_count_mismatch'
+  | 'integrity_check_failed';
+
+/** Thrown on a rejected migration; carries a safe `reason` enum for journal events. */
+export class MigrationError extends Error {
+  readonly reason: MigrationRejectReason;
+  constructor(reason: MigrationRejectReason, message: string) {
+    super(message);
+    this.name = 'MigrationError';
+    this.reason = reason;
+  }
+}
+
 export interface MigrationResult {
   status: 'copied' | 'already_migrated' | 'collision_renamed' | 'skipped_no_transcript';
   targetPath?: string;
   sourceSha256?: string;
   targetSha256?: string;
+  sourceSize?: number;
 }
 
 async function sha256File(path: string): Promise<string> {
@@ -40,7 +67,8 @@ function validateTargetParentComponents(targetPath: string, resolvedTargetDir: s
   while (current !== resolvedTargetDir && current.length > resolvedTargetDir.length) {
     const stat = lstatSync(current, { throwIfNoEntry: false });
     if (stat?.isSymbolicLink()) {
-      throw new Error(
+      throw new MigrationError(
+        'target_parent_symlink',
         `migrateTranscript: symlinked target parent component rejected: ${current}`
       );
     }
@@ -76,13 +104,13 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
   try {
     srcStat = lstatSync(transcriptPath);
   } catch {
-    throw new Error(`migrateTranscript: source file not found: ${transcriptPath}`);
+    throw new MigrationError('source_not_found', `migrateTranscript: source file not found: ${transcriptPath}`);
   }
   if (srcStat.isSymbolicLink()) {
-    throw new Error(`migrateTranscript: symlink rejected: ${transcriptPath}`);
+    throw new MigrationError('symlink_rejected', `migrateTranscript: symlink rejected: ${transcriptPath}`);
   }
   if (!srcStat.isFile()) {
-    throw new Error(`migrateTranscript: not a regular file: ${transcriptPath}`);
+    throw new MigrationError('not_regular_file', `migrateTranscript: not a regular file: ${transcriptPath}`);
   }
 
   const resolvedSrc = realpathSync(transcriptPath);
@@ -90,27 +118,29 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
 
   // Must be under source config dir
   if (!resolvedSrc.startsWith(resolvedSrcDir + '/')) {
-    throw new Error(
+    throw new MigrationError(
+      'outside_source_dir',
       `migrateTranscript: path traversal — ${resolvedSrc} is not under ${resolvedSrcDir}`
     );
   }
 
   // Must be .jsonl
   if (!resolvedSrc.endsWith('.jsonl')) {
-    throw new Error(`migrateTranscript: file must be .jsonl, got ${resolvedSrc}`);
+    throw new MigrationError('wrong_extension', `migrateTranscript: file must be .jsonl, got ${resolvedSrc}`);
   }
 
   // Must be under projects/ subdirectory
   const rel = relative(resolvedSrcDir, resolvedSrc);
   if (!rel.startsWith('projects/')) {
-    throw new Error(`migrateTranscript: file must be under projects/ subdirectory, got ${rel}`);
+    throw new MigrationError('not_under_projects', `migrateTranscript: file must be under projects/ subdirectory, got ${rel}`);
   }
 
   // UUID basename must match claudeSessionId when known
   if (claudeSessionId !== null) {
     const fileBasename = basename(resolvedSrc, '.jsonl');
     if (fileBasename !== claudeSessionId) {
-      throw new Error(
+      throw new MigrationError(
+        'basename_mismatch',
         `migrateTranscript: basename UUID mismatch — file is ${fileBasename}, expected ${claudeSessionId}`
       );
     }
@@ -120,7 +150,7 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
   const rawTargetDir = resolve(targetConfigDir);
   const rawTargetStat = lstatSync(rawTargetDir, { throwIfNoEntry: false });
   if (rawTargetStat?.isSymbolicLink()) {
-    throw new Error(`migrateTranscript: symlinked target parent component rejected: ${rawTargetDir}`);
+    throw new MigrationError('target_parent_symlink', `migrateTranscript: symlinked target parent component rejected: ${rawTargetDir}`);
   }
 
   const resolvedTargetDir = realpathSync(rawTargetDir);
@@ -128,7 +158,7 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
 
   // Validate no target path traversal
   if (!targetPath.startsWith(resolvedTargetDir + '/')) {
-    throw new Error(`migrateTranscript: target path traversal detected`);
+    throw new MigrationError('target_path_traversal', `migrateTranscript: target path traversal detected`);
   }
 
   mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
@@ -141,35 +171,35 @@ export async function migrateTranscript(opts: MigrateOpts): Promise<MigrationRes
   if (existsSync(targetPath)) {
     const destStat = lstatSync(targetPath);
     if (destStat.isSymbolicLink()) {
-      throw new Error(`migrateTranscript: symlink at target path rejected`);
+      throw new MigrationError('target_symlink', `migrateTranscript: symlink at target path rejected`);
     }
     if (!destStat.isFile()) {
-      throw new Error(`migrateTranscript: non-regular file at target path`);
+      throw new MigrationError('target_non_regular', `migrateTranscript: non-regular file at target path`);
     }
     const destSha256 = await sha256File(targetPath);
     if (destSha256 === sourceSha256 && destStat.size === srcStat.size) {
-      return { status: 'already_migrated', targetPath, sourceSha256, targetSha256: destSha256 };
+      return { status: 'already_migrated', targetPath, sourceSha256, targetSha256: destSha256, sourceSize: srcStat.size };
     }
     // Collision — rename aside and recopy
     const bakPath = `${targetPath}.bak.${Date.now()}`;
     renameSync(targetPath, bakPath);
     const collisionCopy = await atomicCopy(resolvedSrc, targetPath);
     if (collisionCopy.bytesCopied !== srcStat.size) {
-      throw new Error(`migrateTranscript: byte count mismatch — expected ${srcStat.size}, got ${collisionCopy.bytesCopied}`);
+      throw new MigrationError('byte_count_mismatch', `migrateTranscript: byte count mismatch — expected ${srcStat.size}, got ${collisionCopy.bytesCopied}`);
     }
     const targetSha256 = await sha256File(targetPath);
-    return { status: 'collision_renamed', targetPath, sourceSha256, targetSha256 };
+    return { status: 'collision_renamed', targetPath, sourceSha256, targetSha256, sourceSize: srcStat.size };
   }
 
   const copyResult = await atomicCopy(resolvedSrc, targetPath);
   if (copyResult.bytesCopied !== srcStat.size) {
-    throw new Error(`migrateTranscript: byte count mismatch — expected ${srcStat.size}, got ${copyResult.bytesCopied}`);
+    throw new MigrationError('byte_count_mismatch', `migrateTranscript: byte count mismatch — expected ${srcStat.size}, got ${copyResult.bytesCopied}`);
   }
   const targetSha256 = await sha256File(targetPath);
 
   if (targetSha256 !== sourceSha256) {
-    throw new Error(`migrateTranscript: integrity check failed — SHA-256 mismatch after copy`);
+    throw new MigrationError('integrity_check_failed', `migrateTranscript: integrity check failed — SHA-256 mismatch after copy`);
   }
 
-  return { status: 'copied', targetPath, sourceSha256, targetSha256 };
+  return { status: 'copied', targetPath, sourceSha256, targetSha256, sourceSize: srcStat.size };
 }

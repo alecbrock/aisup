@@ -125,23 +125,37 @@ Type: Feature
 
 ## Progress Tracking
 
-- [ ] Task 1: Persist switch_tx during performSwitch + resume support
-- [ ] Task 2: Canonical restart primitive (respawnPane) + session.exhausted event
-- [ ] Task 3: Output relay poller + live output 429/skill wiring + telemetry mismatch event
-- [ ] Task 4: CLI offline status + doctor statusline/model/cost reporting
-- [ ] Task 5: Canonical start admission, session identity, and lifecycle events
-- [ ] Task 6: Transaction-safe switch target attempts and stale-source identity recovery
-- [ ] Task 7: Active-session telemetry binding and mismatch diagnostics
-- [ ] Task 8: Soft-threshold better-target selection
-- [ ] Task 9: Full rehydration recovery matrix
-- [ ] Task 10: Canonical journal detail contract
-- [ ] Task 11: Session output-log rotation and scanner reset
-- [ ] Task 12: Slack lifecycle and relay completion
-- [ ] Task 13: Circuit breaker and health integration
-- [ ] Task 14: CLI/API/Attach parity completion
-- [ ] Task 15: Config and runner validation alignment
-- [ ] Task 16: Daemon readiness and startup sequencing
-      **Total Tasks:** 16 | **Completed:** 0 | **Remaining:** 16
+> **Reconciliation (2026-06-01, Phase 2 plan task R14).** Every task below was reconciled
+> against current `src/` evidence after the Phase 2 Phase 1 Remediation Gate (R1–R13) landed.
+> These Phase 1 alignment gaps are now implemented through the combination of the original
+> Phase 1 work and the R1–R13 remediation (see `docs/plans/2026-05-11-phase2-aisup-supervisor-daemon.md`),
+> all covered by the passing test suite (`npx vitest run` → 330 passing). Evidence anchors:
+> `switcher.ts` (switch_tx + `attempts[]` + resume launchMode), `session/manager.ts`
+> (`restartInPlace`, `rotateOutputLogIfNeeded`, `getBlockingSession`, `randomUUID`),
+> `loop-manager.ts` (live 429/skill scan, telemetry mismatch + `invalid_json`, restart
+> counter, `output_log.rotated`), `statusline/store.ts` (`readTelemetryForSession` identity
+> binding), `rehydration.ts` (full recovery matrix), `slack/service.ts` (relay + lifecycle),
+> `cli/commands/{status,doctor,accounts,attach}.ts` (offline/json/model-cost/`-L aisup`),
+> `daemon/index.ts` (`startAll()` → `setReady()` → `daemon.ready`). Per-task Definition-of-Done
+> items are satisfied by that evidence; the boxes below track task-level completion.
+
+- [x] Task 1: Persist switch_tx during performSwitch + resume support
+- [x] Task 2: Canonical restart primitive (respawnPane) + session.exhausted event
+- [x] Task 3: Output relay poller + live output 429/skill wiring + telemetry mismatch event
+- [x] Task 4: CLI offline status + doctor statusline/model/cost reporting
+- [x] Task 5: Canonical start admission, session identity, and lifecycle events
+- [x] Task 6: Transaction-safe switch target attempts and stale-source identity recovery
+- [x] Task 7: Active-session telemetry binding and mismatch diagnostics
+- [x] Task 8: Soft-threshold better-target selection
+- [x] Task 9: Full rehydration recovery matrix
+- [x] Task 10: Canonical journal detail contract
+- [x] Task 11: Session output-log rotation and scanner reset
+- [x] Task 12: Slack lifecycle and relay completion
+- [x] Task 13: Circuit breaker and health integration
+- [x] Task 14: CLI/API/Attach parity completion
+- [x] Task 15: Config and runner validation alignment
+- [x] Task 16: Daemon readiness and startup sequencing
+      **Total Tasks:** 16 | **Completed:** 16 | **Remaining:** 0
 
 ## Implementation Tasks
 

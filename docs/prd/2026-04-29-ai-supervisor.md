@@ -18,7 +18,7 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 
 1. User runs `aisup start`
 2. Daemon scores all configured accounts by remaining headroom (5-hour and 7-day usage)
-3. Daemon creates a tmux session, spawns Pilot (or Claude) via node-pty under the best account's CLAUDE_CONFIG_DIR
+3. Daemon creates a tmux session, launches Pilot (or Claude) inside the tmux pane (output captured via tmux `pipe-pane`) under the best account's CLAUDE_CONFIG_DIR
 4. Daemon starts monitoring loops (rate-limit, health, recovery)
 5. Daemon creates a Slack channel for the session and posts session info
 6. User interacts with the session via `aisup attach` or Slack
@@ -38,7 +38,7 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 
 ### Flow 3: Reactive Failure Recovery
 
-1. Recovery handler detects: 429 string in PTY output, process exit, or PTY error
+1. Recovery handler detects: 429 string in the captured tmux output log, process exit (dead pane), or an externally destroyed tmux session
 2. If rate-limit: triggers the same failover sequence as Flow 2
 3. If process crash: restarts session on same account (if healthy) or switches
 4. Circuit breaker: after 3 consecutive failures, stops retrying and notifies user via Slack
@@ -64,10 +64,10 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 
 **MVP (Phase 1):**
 - Daemon process with manual start (`aisup daemon start`)
-- Session controller: tmux session management, node-pty PTY wrapping
+- Session controller: tmux session management, tmux `pipe-pane` output capture
 - Account registry: YAML config, usage scoring from statusline tap data, best-account selection
 - Proactive rate-limit failover: 85% soft switch, 95% hard switch, full migration sequence
-- Reactive recovery: PTY 429 regex detection, process crash restart, circuit breaker (3 failures)
+- Reactive recovery: 429 regex detection on captured tmux output, process crash restart, circuit breaker (3 failures)
 - Slack integration: per-session channel, bidirectional message relay, control commands
 - Event journal: JSONL log of all supervisor events
 - Status CLI: `aisup start`, `status`, `log`, `accounts`, `stop`, `attach`, `daemon start/stop`
@@ -75,11 +75,11 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 - Runner abstraction: configurable command (pilot or claude), detachable via config change
 
 **Phase 2:**
-- Full reactive recovery: auth failure detection, both-exhausted sleep-until-reset, network retry, remote-control reconnect
+- Full reactive recovery: auth failure detection, both-exhausted sleep-until-reset, network retry (remote-control reconnect is **deferred** — see the reconciliation note in Technical Context)
 - Permission fallback broker: observability (log all permission requests), one-time grant via Slack, policy allowlist/denylist
 - Approval routing: Slack-based approve/deny for pending permission prompts
 - Validation gate engine: configurable gates (test suite, lint, type check) after task completion
-- Cost/token tracking: aggregation from statusline tap, `aisup cost` CLI, daily/weekly summaries
+- Cost/token tracking: aggregation from statusline tap, `aisup cost` CLI with rolling `today`/`last_7d`/`last_30d` windows (itemized calendar summaries deferred)
 
 **Phase 3:**
 - Multi-LLM worker orchestration: Codex CLI, Gemini CLI, local LLM adapters
@@ -106,26 +106,50 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 
 ## Technical Context
 
+> **Implementation Status Reconciliation (2026-06-01).** This PRD predates implementation;
+> the following clarifications supersede stale current-behavior wording below:
+> - **Session I/O is tmux-native, not `node-pty`.** The runner (pilot/claude) executes
+>   directly inside a tmux pane; aisup captures output via tmux `pipe-pane` into a per-session
+>   output log and reads that log. There is no `node-pty` dependency. Remaining "PTY"/"node-pty"
+>   references describing aisup's own process are historical and superseded by this note; "PTY"
+>   references in the Prior Art section describe other projects and remain accurate.
+> - **Statusline telemetry is read, not installed.** aisup reads the existing Pilot/Claude
+>   statusline tap files (`statusline-<claude_session_id>.json`); it does **not** install its
+>   own statusline hook.
+> - **The event journal path is configurable** via `config.journal.path` (default
+>   `~/.aisup/journal.jsonl`); the literal `~/.aisup/events.jsonl` references are superseded.
+> - **Phase 1 implemented:** the Supervisor Daemon, Smart Account Selection, Proactive
+>   Failover, core Reactive Recovery, Slack Remote Control (E), Workflow Skill Propagation,
+>   and the Event Journal + Status CLI (I) are implemented and verified.
+> - **Phase 2 scope (in progress):** D₂ auth/network/exhausted recovery, the Permission
+>   Fallback Broker (F), Slack approval routing, the supervisor Validation Gate Engine (H₁),
+>   and Cost/Token Tracking (K). **Remote-control reconnect after an account switch is
+>   explicitly deferred** pending investigation of Claude Code remote-control behavior; the
+>   existing `runner.remote_control_prefix` remains supported but no reconnect orchestration
+>   ships in Phase 2.
+> - **Cost windows:** `aisup cost` reports rolling `today`, `last_7d`, and `last_30d` windows
+>   as the Phase 2 implementation of daily/weekly visibility; itemized calendar summaries
+>   remain deferred.
+
 ### Technology Stack
 
 - **Language:** Node.js 22+ with TypeScript
-- **PTY management:** node-pty
-- **Session persistence:** tmux
+- **Session I/O & persistence:** tmux — the runner runs natively in a tmux pane; output is captured via `pipe-pane` to a per-session log (no `node-pty`)
 - **Config format:** YAML (js-yaml)
 - **HTTP API:** fastify (or plain http module), localhost-only for MVP
 - **Slack:** @slack/bolt (Socket Mode), @slack/web-api
 - **Event journal:** JSONL (append-only file)
 - **Package manager:** npm
-- **Testing:** vitest, real integration tests for PTY/tmux/Slack
+- **Testing:** vitest, host-gated integration tests for tmux/Slack/Claude
 
 ### Relevant Architecture
 
-- Supervisor owns the process: `aisup daemon` → `tmux session` → `node-pty` → `pilot/claude`
-- Pilot Shell is treated as a black box — the supervisor spawns it and reads its PTY output, never imports Pilot internals
+- Supervisor owns the process: `aisup daemon` → `tmux session` (pipe-pane → output log) → `pilot/claude`
+- Pilot Shell is treated as a black box — the supervisor launches it in a tmux pane and reads its output log, never imports Pilot internals
 - Runner abstraction: `runner.command` in config (defaults to `pilot`, set to `claude` to detach Pilot)
-- Statusline tap: supervisor installs its own hook that writes telemetry JSON; reads existing tap files as fallback
+- Statusline tap: supervisor reads the existing Pilot/Claude statusline tap files (`statusline-<claude_session_id>.json`); it does not install its own hook
 - Account registry: YAML config with config_dir paths, scored by remaining usage headroom
-- Event journal: append-only JSONL at `~/.aisup/events.jsonl`
+- Event journal: append-only JSONL at the configured `config.journal.path` (default `~/.aisup/journal.jsonl`)
 - HTTP API: localhost-bound, powers CLI subcommands and future dashboard
 
 ### Constraints
@@ -165,11 +189,11 @@ To stop using Pilot Shell: change `command` to `claude`, adjust `args` as needed
 | Decision | Choice | Why |
 |----------|--------|-----|
 | Architecture | Full daemon + session model | Supports all features A-L. Sessions survive terminal close. HTTP API enables CLI, mobile dashboard, and Slack. No half-implementation — build the right thing once. |
-| Language | Node.js / TypeScript | Matches Claude Code ecosystem. node-pty is battle-tested for PTY wrapping. claude-nonstop proves the pattern. |
+| Language | Node.js / TypeScript | Matches Claude Code ecosystem. Session I/O is tmux-native (`pipe-pane` capture), so no `node-pty` is needed. claude-nonstop proves the broader pattern. |
 | Notification channel | Slack (MVP), ntfy as optional fallback | Slack provides bidirectional remote control (not just notifications). Free tier sufficient. Channel-per-session gives organized history. |
 | Config format | YAML | Human-readable, comments, widely understood. Good for nested account/policy config. |
 | Daemon lifecycle | Manual start only | User-controlled. `aisup daemon start` / `aisup daemon stop`. No launchd. |
-| Statusline tap | Supervisor-owned hook (primary), existing tap files (fallback) | Self-contained supervisor. Backward-compatible with existing hook during migration. |
+| Statusline tap | Read existing Pilot/Claude tap files | Supervisor reads `statusline-<claude_session_id>.json` tap files; it does **not** install its own hook. |
 | Project location | Separate repo | aisup is a standalone tool, not a feature of any specific project. Installable independently. |
 | HTTP API auth | Localhost-only for MVP | Security via network binding. Token auth added in Phase 4 for remote dashboard access. |
 | Pilot Shell dependency | Detachable via config | Runner abstraction means Pilot can be replaced with raw Claude (or any wrapper) by changing one config field. No code changes. |
@@ -233,7 +257,7 @@ To stop using Pilot Shell: change `command` to `claude`, adjust `args` as needed
 |------------|-------------|------------|
 | Node.js 22+ | Everything | `node --version` |
 | tmux | Session persistence | `tmux -V` |
-| node-pty | PTY wrapping | npm install + spawn test |
+| _(none — tmux pipe-pane)_ | Output capture | covered by tmux above; no `node-pty` dependency |
 | Pilot CLI or Claude CLI | Session running | `pilot --version` or `claude --version` |
 | Slack app (bot + app tokens) | Remote control | Token validation API call |
 | Multiple Claude config dirs | Account switching | Directory existence check |
@@ -242,19 +266,19 @@ To stop using Pilot Shell: change `command` to `claude`, adjust `args` as needed
 
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
-| A | Supervisor Daemon (manual start, tmux, node-pty, runner abstraction) | MVP | Approved |
-| B | Smart Account Selection (registry, scoring, best-account pick) | MVP | Approved |
-| C | Proactive Rate-Limit Failover (85%/95% thresholds, full switch sequence) | MVP | Approved |
-| D₁ | Reactive Recovery — core (429 regex, crash restart, circuit breaker) | MVP | Approved |
-| D₂ | Reactive Recovery — full (auth failure, exhausted, network, RC reconnect) | Phase 2 | Approved |
-| E | Slack Remote Control (channel per session, bidirectional relay, control cmds) | MVP | Approved |
-| F | Permission Fallback Broker (observability, one-time grant, policy allowlist) | Phase 2 | Approved |
+| A | Supervisor Daemon (manual start, tmux pipe-pane, runner abstraction) | MVP | Implemented (Phase 1) |
+| B | Smart Account Selection (registry, scoring, best-account pick) | MVP | Implemented (Phase 1) |
+| C | Proactive Rate-Limit Failover (85%/95% thresholds, full switch sequence) | MVP | Implemented (Phase 1) |
+| D₁ | Reactive Recovery — core (429 regex, crash restart, circuit breaker) | MVP | Implemented (Phase 1) |
+| D₂ | Reactive Recovery — full (auth failure, exhausted, network; RC reconnect deferred) | Phase 2 | In progress |
+| E | Slack Remote Control (channel per session, bidirectional relay, control cmds) | MVP | Implemented (Phase 1) |
+| F | Permission Fallback Broker (observability, one-time grant, policy allowlist) | Phase 2 | In progress |
 | G | Multi-LLM Worker Orchestration (Codex, Gemini, local; worktrees; review gate) | Phase 3 | Approved |
-| H₁ | Validation Gate Engine — supervisor (test/lint/type-check after completion) | Phase 2 | Approved |
+| H₁ | Validation Gate Engine — supervisor (test/lint/type-check after completion) | Phase 2 | In progress |
 | H₂ | Validation Gate Engine — workers (gates on worker output before merge) | Phase 3 | Approved |
-| I | Event Journal + Status CLI (JSONL, start/status/log/accounts/stop/attach) | MVP | Approved |
-| J | Workflow Skill Propagation (detect active skill, propagate on resume) | MVP | Approved |
-| K | Cost/Token Tracking (aggregation, `aisup cost` CLI, summaries) | Phase 2 | Approved |
+| I | Event Journal + Status CLI (JSONL, start/status/log/accounts/stop/attach) | MVP | Implemented (Phase 1) |
+| J | Workflow Skill Propagation (detect active skill, propagate on resume) | MVP | Implemented (Phase 1) |
+| K | Cost/Token Tracking (aggregation, `aisup cost` CLI, rolling windows) | Phase 2 | In progress |
 | L | Mobile Status Dashboard (HTTP endpoint, auto-refresh, token auth) | Phase 4 | Approved |
 
 ## State Model
@@ -280,13 +304,13 @@ HEALTHY → DEGRADED (soft limit breached)
 
 ## Account Switching Flow
 
-1. **Trigger**: threshold breach (85%/95%) OR 429 detected in PTY OR auth failure OR process crash
+1. **Trigger**: threshold breach (85%/95%) OR 429 detected in tmux output OR auth failure OR process crash
 2. **Snapshot**: `{session_id, transcript_path, active_skill, plan_file_path}`
 3. **Score**: rank remaining accounts by headroom, exclude unavailable/cooldown
 4. **Guard**: if no account available → EXHAUSTED state → sleep until earliest reset → notify via Slack
 5. **Stop**: graceful kill (SIGTERM → 2s timeout → SIGKILL)
 6. **Migrate**: copy transcript .jsonl to target account's project directory
-7. **Create**: new tmux session + node-pty under target CLAUDE_CONFIG_DIR
+7. **Create**: new tmux session (runner in-pane, pipe-pane capture) under target CLAUDE_CONFIG_DIR
 8. **Resume**: `runner.command` + `runner.resume_flag` + `session_id`
 9. **Inject**: continuation prompt referencing active workflow skill and current task position. Example: "You are continuing a /spec session. Plan file: docs/plans/2026-04-29-feature.md. Resume from the next uncompleted task in the plan. Read the plan file to re-orient."
 10. **Notify**: post switch event to Slack channel and event journal
@@ -297,7 +321,7 @@ HEALTHY → DEGRADED (soft limit breached)
 |------|----------|---------------|
 | Rate-limit monitor | 30s | Read statusline tap, check against 85%/95% thresholds |
 | Health checker | 60s | Verify account availability, update circuit breaker state |
-| Recovery handler | 5s | Watch for process exit, PTY errors, 429 strings in output |
+| Recovery handler | 5s | Watch for process exit (dead pane), destroyed tmux sessions, 429 strings in captured output |
 | Idle watchdog | 120s | Detect stalled sessions (no output for configurable duration) |
 | Notification emitter | Event-driven | Push events to Slack when they occur |
 
@@ -317,7 +341,7 @@ HEALTHY → DEGRADED (soft limit breached)
 
 ## Event Journal Schema
 
-File: `~/.aisup/events.jsonl`
+File: the configured `config.journal.path` (default `~/.aisup/journal.jsonl`)
 
 ```json
 {
@@ -372,7 +396,7 @@ notifications:
 
 daemon:
   http_port: 9222
-  event_journal_path: ~/.aisup/events.jsonl
+  event_journal_path: ~/.aisup/journal.jsonl   # actual config key: journal.path
   state_file_path: ~/.aisup/state.json
 
 monitoring:

@@ -1,4 +1,4 @@
-const KNOWN_COMMANDS = new Set(['interrupt', 'stop', 'status', 'cmd', 'relay', 'help', 'confirm', 'failover']);
+const KNOWN_COMMANDS = new Set(['interrupt', 'stop', 'status', 'cmd', 'relay', 'help', 'confirm', 'failover', 'permit', 'deny', 'gate']);
 
 export interface ParsedCommand {
   name: string;

@@ -338,6 +338,132 @@ describe('SlackService', () => {
     expect(say).toHaveBeenCalledWith(expect.stringMatching(/interrupt|stop|status|cmd/i));
   });
 
+  it('routes !permit to onPermissionGrant for the active session', async () => {
+    const onPermissionGrant = vi.fn().mockResolvedValue(undefined);
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+      onPermissionGrant,
+    });
+    await svc.start();
+
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text: '!permit', user: 'U123', channel: 'C123' }, say });
+
+    expect(onPermissionGrant).toHaveBeenCalledWith('sess-001');
+  });
+
+  it('routes !deny to onPermissionDeny for the active session', async () => {
+    const onPermissionDeny = vi.fn().mockResolvedValue(undefined);
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+      onPermissionDeny,
+    });
+    await svc.start();
+
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text: '!deny', user: 'U123', channel: 'C123' }, say });
+
+    expect(onPermissionDeny).toHaveBeenCalledWith('sess-001');
+  });
+
+  it('reports when permission approval is not wired for !permit', async () => {
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text: '!permit', user: 'U123', channel: 'C123' }, say });
+
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/not enabled|not available/i));
+  });
+
+  it('posts a permission request to the session channel via notifyPermissionRequest', async () => {
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+    await svc.onSessionStart(makeSession({ aisup_session_id: 'sess-perm' }));
+
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    appInstance.client.chat.postMessage.mockClear();
+    await svc.notifyPermissionRequest('sess-perm', { tool: 'Bash', detail: 'git push', raw: 'Bash: git push' });
+
+    expect(appInstance.client.chat.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringMatching(/permit|deny/i) })
+    );
+  });
+
+  it('runs gates on !gate and posts a summary', async () => {
+    const onGateRun = vi.fn().mockResolvedValue({ passed: true, results: [{ name: 'typecheck', status: 'passed', exitCode: 0, stdoutTail: '', stderrTail: '', required: true }] });
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+      onGateRun,
+    });
+    await svc.start();
+
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text: '!gate', user: 'U123', channel: 'C123' }, say });
+
+    expect(onGateRun).toHaveBeenCalled();
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/PASSED|FAILED/i));
+  });
+
+  it('reports the latest run on !gate status', async () => {
+    const getLatestGateRun = vi.fn().mockReturnValue({ passed: false, results: [{ name: 'typecheck', status: 'failed', exitCode: 1, stdoutTail: '', stderrTail: 'e', required: true }] });
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+      getLatestGateRun,
+    });
+    await svc.start();
+
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text: '!gate status', user: 'U123', channel: 'C123' }, say });
+
+    expect(getLatestGateRun).toHaveBeenCalled();
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/FAILED/i));
+  });
+
   it('should return null for unknown session channel ID', async () => {
     const svc = new SlackService({
       config: makeConfig(),
@@ -348,6 +474,93 @@ describe('SlackService', () => {
     });
     await svc.start();
     expect(svc.getChannelId('nonexistent')).toBeNull();
+  });
+
+  it('emits slack.channel_name_collision on an actual name_taken collision and retries with a suffix', async () => {
+    const { App } = await import('@slack/bolt');
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    // First create attempt collides (name_taken), second succeeds.
+    appInstance.client.conversations.create
+      .mockRejectedValueOnce({ data: { error: 'name_taken' } })
+      .mockResolvedValueOnce({ channel: { id: 'C999' } });
+
+    await svc.onSessionStart(makeSession({ aisup_session_id: 'sess-collide' }));
+
+    expect(journal.append).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'slack.channel_name_collision' })
+    );
+    expect(svc.getChannelId('sess-collide')).toBe('C999');
+  });
+
+  it('emits slack.rate_limited when the relay post is rate-limited', async () => {
+    vi.useFakeTimers();
+    const outputPath = join(tmpDir, 'output.log');
+    writeFileSync(outputPath, 'seen\n');
+    const session = makeSession({ output_log_path: outputPath });
+    sessionManager.getActiveSession.mockReturnValue(session);
+
+    const svc = new SlackService({
+      config: makeConfig({ relay_output_enabled: true }),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    appInstance.client.chat.postMessage.mockRejectedValueOnce({ code: 'slack_webapi_rate_limited_error', retryAfter: 30 });
+    const internals = svc as unknown as { channelMap: Map<string, string>; relayEnabled: Map<string, boolean> };
+    internals.channelMap.set(session.aisup_session_id, 'C123');
+    internals.relayEnabled.set('C123', true);
+
+    writeFileSync(outputPath, 'seen\nnew output line\n');
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(journal.append).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'slack.rate_limited',
+        details: expect.objectContaining({ retry_after_s: 30 }),
+      })
+    );
+    await svc.stop();
+    vi.useRealTimers();
+  });
+
+  it('routes !stop through the canonical terminal stop path (session.stop + channel notification)', async () => {
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    (svc as unknown as { channelMap: Map<string, string> }).channelMap.set('sess-001', 'C123');
+
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    const say = vi.fn();
+    await messageHandler({ message: { text: '!stop', user: 'U123', channel: 'C123' }, say });
+    await messageHandler({ message: { text: '!confirm', user: 'U123', channel: 'C123' }, say });
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith('aisup-sess0001', 'sess-001', { force: false });
+    expect(journal.append).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'session.stop', aisup_session_id: 'sess-001' })
+    );
+    // Canonical stop notification posted to the channel.
+    expect(appInstance.client.chat.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'C123', text: expect.stringContaining('ended') })
+    );
   });
 
   it('relays new output-log diffs to the mapped channel when relay is enabled', async () => {

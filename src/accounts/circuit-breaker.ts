@@ -1,6 +1,6 @@
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 
-type CBState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+export type CBState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
 interface AccountCBRecord {
   failures: number;

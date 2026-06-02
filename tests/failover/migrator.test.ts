@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync, existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { migrateTranscript, MigrationResult } from '../../src/failover/migrator.js';
+import { migrateTranscript, MigrationResult, MigrationError } from '../../src/failover/migrator.js';
 
 const CLAUDE_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const CONTENT = '{"role":"user","content":"hello"}\n{"role":"assistant","content":"world"}\n';
@@ -148,5 +148,40 @@ describe('migrateTranscript', () => {
     });
 
     expect(result.status).toBe('copied');
+  });
+
+  it('returns sourceSize equal to the source file byte length', async () => {
+    const result = await migrateTranscript({
+      transcriptPath,
+      sourceConfigDir,
+      targetConfigDir,
+      claudeSessionId: CLAUDE_ID,
+    });
+    expect(result.sourceSize).toBe(Buffer.byteLength(CONTENT));
+  });
+
+  it('throws a typed MigrationError with a safe reason enum for rejections', async () => {
+    // symlink source
+    const linkPath = join(projectsDir, 'link.jsonl');
+    symlinkSync(transcriptPath, linkPath);
+    await expect(
+      migrateTranscript({ transcriptPath: linkPath, sourceConfigDir, targetConfigDir, claudeSessionId: null })
+    ).rejects.toMatchObject({ reason: 'symlink_rejected' });
+
+    // wrong extension
+    const nonJsonl = join(projectsDir, 'config.yaml');
+    writeFileSync(nonJsonl, 'yaml: true');
+    await expect(
+      migrateTranscript({ transcriptPath: nonJsonl, sourceConfigDir, targetConfigDir, claudeSessionId: null })
+    ).rejects.toMatchObject({ reason: 'wrong_extension' });
+
+    // basename mismatch
+    const wrongId = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+    const wrongPath = join(projectsDir, `${wrongId}.jsonl`);
+    writeFileSync(wrongPath, CONTENT);
+    const err = await migrateTranscript({ transcriptPath: wrongPath, sourceConfigDir, targetConfigDir, claudeSessionId: CLAUDE_ID })
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(MigrationError);
+    expect((err as MigrationError).reason).toBe('basename_mismatch');
   });
 });

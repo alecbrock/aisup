@@ -9,11 +9,14 @@ import type { SessionInfo, SessionState } from '../session/types.js';
 import type { SessionManager } from '../session/manager.js';
 import type { AccountRegistry } from '../accounts/registry.js';
 import type { JournalWriter } from '../journal/types.js';
-import { validateManualFailoverTarget, performSwitch } from '../failover/switcher.js';
+import { validateManualFailoverTarget, performSwitch, selectSwitchTarget } from '../failover/switcher.js';
 import { SwitchReason } from '../failover/types.js';
 import { buildLaunchCommand, buildResumeCommand } from '../runner/builder.js';
 import type { RunnerConfig } from '../config/schema.js';
 import { readEvents } from '../journal/reader.js';
+import { aggregateCosts } from '../cost/aggregator.js';
+import type { GateRunResult } from '../gates/types.js';
+import { readTelemetryForAccount } from '../statusline/store.js';
 
 export interface DaemonServerOptions {
   tokenPath: string;
@@ -27,12 +30,46 @@ export interface DaemonServerOptions {
   runner?: RunnerConfig;
   onSessionStart?: (session: SessionState) => Promise<void> | void;
   onSessionStop?: (session: SessionState, force: boolean) => Promise<void> | void;
+  /** Refresh account scores/state from telemetry + circuit breaker before an automatic selection. */
+  refreshAccounts?: () => void | Promise<void>;
+  /** Statusline telemetry source for /api/accounts usage/model parity with offline `aisup accounts`. */
+  statuslineDir?: string;
+  statuslineFreshnessWindowS?: number;
+  /** Emit a final cost snapshot at a lifecycle boundary (pre-stop / pre-manual-failover). */
+  captureCostSnapshot?: (sessionId: string, trigger: string) => void;
+  /** Drop a session's cost tracking on terminal stop. */
+  clearCostTracking?: (sessionId: string) => void;
+  /** Run the configured validation gates (manual trigger from API/Slack/CLI). */
+  runGates?: () => Promise<GateRunResult>;
+  /** Latest gate run for GET /api/gates. */
+  getLatestGateRun?: () => GateRunResult | null;
 }
 
 declare module 'fastify' {
   interface FastifyInstance {
     setReady(): void;
     setSessionState(session: SessionInfo | Partial<SessionState> | null): void;
+  }
+}
+
+/** Human-readable recovery guidance per session status for the status surface. */
+function recoveryGuidance(status: SessionState['status']): string {
+  switch (status) {
+    case 'EXHAUSTED':
+      return 'No eligible failover account is available. Auto-resume will retry when an account becomes runnable; otherwise stop the session or run a manual failover.';
+    case 'SWITCHING':
+      return 'A failover is in progress.';
+    case 'SWITCH_PENDING_AT_IDLE':
+      return 'A soft-threshold switch is pending until the session goes idle.';
+    case 'CREATING':
+      return 'The session is starting.';
+    case 'STOPPING':
+      return 'The session is stopping.';
+    case 'STOPPED':
+      return 'The session has stopped.';
+    case 'ACTIVE':
+    default:
+      return 'The session is active.';
   }
 }
 
@@ -71,7 +108,16 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
   });
 
   app.get('/api/status', async (_req, reply) => {
-    return reply.send({ session: sessionState });
+    // Read the freshest persisted state on request so skill detection and failover/EXHAUSTED
+    // transitions (which loop-manager patches to disk) are visible, not a stale in-memory copy.
+    let session: SessionInfo | Partial<SessionState> | null = sessionState;
+    const id = sessionState?.aisup_session_id;
+    if (id && typeof opts.sessionManager?.readState === 'function') {
+      const fresh = opts.sessionManager.readState(id);
+      if (fresh) session = fresh;
+    }
+    const recovery_guidance = session?.status ? recoveryGuidance(session.status) : null;
+    return reply.send({ session, recovery_guidance });
   });
 
   app.post('/api/sessions', async (req, reply) => {
@@ -103,8 +149,11 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
       return reply.status(201).send({ status: 'created', cwd, message: 'deps not wired' });
     }
 
+    // Refresh scores/state from telemetry + circuit breaker, then use the canonical
+    // selector so admission honours scoring and excludes UNAVAILABLE/COOLDOWN accounts.
+    await opts.refreshAccounts?.();
     const accounts = opts.accountRegistry.getAll();
-    const bestAccount = accounts.sort((a, b) => a.priority - b.priority).find((a) => a.enabled && a.state !== 'UNAVAILABLE');
+    const bestAccount = selectSwitchTarget(accounts, '', []);
     if (!bestAccount) {
       return reply.status(409).send({ error: 'no eligible account available' });
     }
@@ -146,6 +195,8 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     const force = body?.force === true;
     const state = opts.sessionManager.readState(sessionState.aisup_session_id);
     if (state) {
+      // Capture the final cost snapshot before the pane is destroyed, then clean up cost tracking.
+      opts.captureCostSnapshot?.(state.aisup_session_id, 'pre_stop');
       await opts.sessionManager.stopSession(state.tmux_name, state.aisup_session_id, { force });
       await opts.journal?.append({
         ts: new Date().toISOString(),
@@ -154,6 +205,7 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
         details: { reason: 'user_requested', force, account: state.account, cwd: state.cwd },
       });
       await opts.onSessionStop?.(state, force);
+      opts.clearCostTracking?.(state.aisup_session_id);
     }
     sessionState = null;
     return reply.send({ status: 'stopped' });
@@ -167,13 +219,44 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     return reply.send({ events, limit });
   });
 
+  app.get('/api/cost', async (_req, reply) => {
+    if (!opts.journalPath) {
+      const empty = { total_cost_usd: 0, by_account: {}, by_session: {} };
+      return reply.send({ today: empty, last_7d: empty, last_30d: empty });
+    }
+    const windows = await aggregateCosts({ journalPath: opts.journalPath });
+    return reply.send(windows);
+  });
+
+  app.get('/api/gates', async (_req, reply) => {
+    return reply.send({ latest: opts.getLatestGateRun?.() ?? null });
+  });
+
+  app.post('/api/gates/run', async (_req, reply) => {
+    if (!opts.runGates) return reply.code(503).send({ error: 'gates not configured' });
+    const result = await opts.runGates();
+    return reply.send(result);
+  });
+
   app.get('/api/accounts', async (_req, reply) => {
     if (!opts.accountRegistry) {
       return reply.send({ accounts: [] });
     }
-    const accounts = opts.accountRegistry.getAll().map((a) => ({
-      name: a.name, state: a.state, priority: a.priority, enabled: a.enabled, score: a.score,
-    }));
+    const slDir = opts.statuslineDir;
+    const freshness = opts.statuslineFreshnessWindowS ?? 300;
+    const accounts = opts.accountRegistry.getAll().map((a) => {
+      // Read telemetry so online /api/accounts matches offline `aisup accounts` (usage + model).
+      const telemetry = slDir ? readTelemetryForAccount(a.configDir, slDir, freshness) : null;
+      const five = telemetry?.rate_limits?.five_hour?.used_percentage;
+      const seven = telemetry?.rate_limits?.seven_day?.used_percentage;
+      return {
+        name: a.name, state: a.state, priority: a.priority, enabled: a.enabled, score: a.score,
+        cooldown_until: a.cooldownUntil ? a.cooldownUntil.toISOString() : null,
+        five_hour_pct: typeof five === 'number' ? five : null,
+        seven_day_pct: typeof seven === 'number' ? seven : null,
+        model: telemetry?.model?.id ?? null,
+      };
+    });
     return reply.send({ accounts });
   });
 
@@ -200,6 +283,8 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     }
 
     const currentState = opts.sessionManager.readState(sessionState.aisup_session_id!);
+    // Capture the pre-switch final cost snapshot before performSwitch destroys the source pane.
+    opts.captureCostSnapshot?.(sessionState.aisup_session_id!, 'pre_manual_failover');
     const result = await performSwitch(
       {
         aisupSessionId: sessionState.aisup_session_id!,
@@ -216,9 +301,9 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
       {
         sessionManager: opts.sessionManager,
         journal: opts.journal,
-        createSessionForTarget: async (target, snapshot) => {
+        createSessionForTarget: async (target, snapshot, launchMode) => {
           const commandForTarget = opts.runner
-            ? (snapshot.claudeSessionId
+            ? ((launchMode === 'resumed' && snapshot.claudeSessionId)
               ? buildResumeCommand(opts.runner, target.configDir, snapshot.claudeSessionId)
               : buildLaunchCommand(opts.runner, target.configDir))
             : opts.runnerConfig!;

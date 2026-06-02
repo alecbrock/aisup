@@ -29,7 +29,32 @@ vi.mock('../../src/session/tmux.js', () => ({
 
 import { rehydrateSessions, type RehydrationDeps } from '../../src/daemon/rehydration.js';
 import * as tmuxModule from '../../src/session/tmux.js';
-import type { SessionState } from '../../src/session/types.js';
+import type { SessionState, SwitchTx } from '../../src/session/types.js';
+import { SwitchReason } from '../../src/failover/types.js';
+
+function switchingState(phase: SwitchTx['switch_phase'], overrides: Partial<SwitchTx> = {}): SessionState {
+  return makeSessionState({
+    status: 'SWITCHING',
+    switch_tx: {
+      switch_phase: phase,
+      source_account: 'primary',
+      target_account: 'account2',
+      source_tmux_name: 'aisup-sess0001',
+      source_tmux_session_id: '$1',
+      source_pane_id: '%1',
+      target_tmux_name: null,
+      target_tmux_session_id: null,
+      target_pane_id: null,
+      source_transcript_path: null,
+      source_transcript_sha256: null,
+      source_destroyed: true,
+      tried_accounts: [],
+      phase_timestamps: {},
+      error_summary: null,
+      ...overrides,
+    },
+  });
+}
 
 function makeSessionState(overrides: Partial<SessionState> = {}): SessionState {
   return {
@@ -107,6 +132,49 @@ describe('rehydrateSessions', () => {
     expect(tmuxModule.startOutputLog).toHaveBeenCalledWith(
       'aisup-test', session.tmux_name, session.output_log_path
     );
+  });
+
+  it('uses the shared resolver to flag stale source-account telemetry for a rehydrated known session', async () => {
+    const statuslineDir = join(tmpDir, 'statusline');
+    const currentConfigDir = join(tmpDir, '.claude-current');
+    const oldConfigDir = join(tmpDir, '.claude-old');
+    mkdirSync(statuslineDir, { recursive: true });
+    mkdirSync(currentConfigDir, { recursive: true });
+    mkdirSync(oldConfigDir, { recursive: true });
+    const claudeId = '99999999-1111-2222-3333-444444444444';
+    // The lingering statusline file's transcript belongs to the OLD account → identity mismatch.
+    writeFileSync(join(statuslineDir, `statusline-${claudeId}.json`), JSON.stringify({
+      session_id: claudeId,
+      transcript_path: `${oldConfigDir}/projects/p/x.jsonl`,
+      cwd: '/tmp/project',
+    }));
+
+    const session = makeSessionState({
+      output_log_path: join(tmpDir, 'output.log'),
+      claude_session_id: claudeId,
+      account: 'current',
+      cwd: '/tmp/project',
+    });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isPipePaneActive).mockReturnValue(true);
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name]),
+      setSessionState: vi.fn(),
+      journal,
+      statuslineDir,
+      statuslineFreshnessWindowS: 300,
+      accountConfigDir: (account: string) => (account === 'current' ? currentConfigDir : oldConfigDir),
+    });
+
+    const events = journal.append.mock.calls.map((c) => c[0] as { event_type: string; details: Record<string, unknown> });
+    const mismatch = events.find((e) => e.event_type === 'telemetry.session_mismatch');
+    expect(mismatch).toBeDefined();
+    expect(mismatch?.details.expected_account).toBe('current');
+    expect(mismatch?.details.expected_session_id).toBe(claudeId);
   });
 
   it('should NOT call startOutputLog when pipe-pane is already active', async () => {
@@ -251,6 +319,127 @@ describe('rehydrateSessions', () => {
     expect(setSessionState).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'ACTIVE', aisup_session_id: session.aisup_session_id })
     );
+  });
+
+  it.each(['source_destroyed', 'migrating', 'creating'] as const)(
+    'continues an interrupted %s phase via onSwitch when a recovery callback is provided',
+    async (phase) => {
+      const session = switchingState(phase);
+      const stateDir = setupStateDir(tmpDir, [session]);
+      vi.mocked(tmuxModule.isProcessDead).mockReturnValue(true);
+      const onSwitch = vi.fn().mockResolvedValue(undefined);
+
+      await rehydrateSessions({
+        stateDir,
+        tmuxSocket: 'aisup-test',
+        liveSessions: new Set<string>(),
+        setSessionState: vi.fn(),
+        journal: { append: vi.fn().mockResolvedValue(undefined) },
+        onSwitch,
+        onRestart: vi.fn().mockResolvedValue(undefined),
+      });
+
+      expect(onSwitch).toHaveBeenCalledWith(session.aisup_session_id, SwitchReason.SourceDead);
+    }
+  );
+
+  it('continues a resuming phase with a dead target via onSwitch', async () => {
+    const session = switchingState('resuming', { target_tmux_name: 'aisup-target', target_account: 'account2' });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isProcessDead).mockReturnValue(true); // target dead
+    const onSwitch = vi.fn().mockResolvedValue(undefined);
+
+    await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set<string>(),
+      setSessionState: vi.fn(),
+      journal: { append: vi.fn().mockResolvedValue(undefined) },
+      onSwitch,
+      onRestart: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(onSwitch).toHaveBeenCalledWith(session.aisup_session_id, SwitchReason.SourceDead);
+  });
+
+  it('falls back to deterministic needs_manual_failover for source_destroyed when no callback is provided', async () => {
+    const session = switchingState('source_destroyed');
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isProcessDead).mockReturnValue(true);
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+
+    await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set<string>(),
+      setSessionState: vi.fn(),
+      journal,
+    });
+
+    const failed = journal.append.mock.calls.map((c) => c[0]).find((e) => e.event_type === 'recovery.failed');
+    expect(failed?.details.action).toBe('needs_manual_failover');
+  });
+
+  it('restarts an ACTIVE session whose tmux is gone via onRestart when provided', async () => {
+    const session = makeSessionState();
+    const stateDir = setupStateDir(tmpDir, [session]);
+    const onRestart = vi.fn().mockResolvedValue(undefined);
+
+    await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set<string>(), // tmux gone
+      setSessionState: vi.fn(),
+      journal: { append: vi.fn().mockResolvedValue(undefined) },
+      onSwitch: vi.fn().mockResolvedValue(undefined),
+      onRestart,
+    });
+
+    expect(onRestart).toHaveBeenCalledWith(session.aisup_session_id);
+  });
+
+  it('restores a persisted EXHAUSTED session for visibility and returns its id for poller re-arm', async () => {
+    const session = makeSessionState({ status: 'EXHAUSTED' });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    const setSessionState = vi.fn();
+
+    const result = await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set<string>(),
+      setSessionState,
+      journal: { append: vi.fn().mockResolvedValue(undefined) },
+    });
+
+    // Visibility restored without putting the session into active loops.
+    expect(setSessionState).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'EXHAUSTED', aisup_session_id: session.aisup_session_id, hasTmux: false })
+    );
+    // Handoff to Task 7: persisted-EXHAUSTED ids surfaced for the daemon to re-arm polling.
+    expect(result.exhaustedSessionIds).toEqual([session.aisup_session_id]);
+  });
+
+  it('reports an unmatched live tmux session as an orphan without destroying it', async () => {
+    const session = makeSessionState({ output_log_path: join(tmpDir, 'output.log') });
+    const stateDir = setupStateDir(tmpDir, [session]);
+    vi.mocked(tmuxModule.isPipePaneActive).mockReturnValue(true);
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+
+    const result = await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set([session.tmux_name, 'aisup-orphan99']),
+      setSessionState: vi.fn(),
+      journal,
+    });
+
+    // A live tmux session with no persisted state is reported as an orphan, never auto-destroyed.
+    expect(result.orphans).toBe(1);
+    expect(tmuxModule.destroyTmuxSession).not.toHaveBeenCalled();
+    const rehydratedEvent = journal.append.mock.calls
+      .map((c) => c[0])
+      .find((e) => e.event_type === 'daemon.rehydrated');
+    expect(rehydratedEvent?.details.orphan_count).toBe(1);
   });
 
   it('should handle state-without-tmux: ACTIVE session no live tmux logs event', async () => {

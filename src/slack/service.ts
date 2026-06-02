@@ -10,9 +10,11 @@ import {
 import { parseCommand, ConfirmationStore } from './commands.js';
 import { isAllowedUser, isBotMessage, redactSecrets } from './relay.js';
 import { buildChannelName, slugifyProjectName, isChannelNameTaken } from './channels.js';
-import type { SlackConfig } from '../config/schema.js';
+import type { SlackConfig, PermissionsConfig } from '../config/schema.js';
 import type { JournalWriter } from '../journal/types.js';
 import type { SessionState } from '../session/types.js';
+import type { PermissionRequest } from '../permissions/types.js';
+import type { GateRunResult } from '../gates/types.js';
 
 export interface SlackServiceOpts {
   config: SlackConfig;
@@ -23,6 +25,34 @@ export interface SlackServiceOpts {
   tmuxSocket: string;
   journal: JournalWriter;
   channelMapPath: string;
+  permissionsConfig?: PermissionsConfig;
+  /** Resolve a Slack-routed permission via !permit (acts on the active session's pending prompt). */
+  onPermissionGrant?: (sessionId: string) => void | Promise<void>;
+  /** Resolve a Slack-routed permission via !deny. */
+  onPermissionDeny?: (sessionId: string) => void | Promise<void>;
+  /** Run the configured validation gates (Slack !gate). */
+  onGateRun?: () => Promise<GateRunResult>;
+  /** Latest gate run for Slack !gate status. */
+  getLatestGateRun?: () => GateRunResult | null;
+}
+
+/** Upper bound on channel-name suffix retries before giving up on creation. */
+const MAX_CHANNEL_SUFFIX = 100;
+
+/** True when a Slack Web API error represents a rate-limit response. */
+function isRateLimited(err: unknown): boolean {
+  const e = err as { code?: string; data?: { error?: string }; status?: number } | null;
+  return (
+    e?.code === 'slack_webapi_rate_limited_error' ||
+    e?.data?.error === 'ratelimited' ||
+    e?.status === 429
+  );
+}
+
+/** Extract the retry-after seconds from a Slack rate-limit error, or null. */
+function rateLimitRetryAfter(err: unknown): number | null {
+  const e = err as { retryAfter?: number; data?: { retry_after?: number } } | null;
+  return e?.retryAfter ?? e?.data?.retry_after ?? null;
 }
 
 export class SlackService {
@@ -91,13 +121,28 @@ export class SlackService {
         channelId = (result as { channel?: { id?: string } }).channel?.id;
       } catch (err) {
         if (isChannelNameTaken(err)) {
-          nameSuffix++;
-        } else {
           await this.opts.journal.append({
             ts: new Date().toISOString(),
             event_type: 'slack.channel_name_collision',
             aisup_session_id: session.aisup_session_id,
-            details: { error: String(err) },
+            details: { attempted_name: name, next_suffix: nameSuffix + 1 },
+          });
+          nameSuffix++;
+          if (nameSuffix > MAX_CHANNEL_SUFFIX) {
+            await this.opts.journal.append({
+              ts: new Date().toISOString(),
+              event_type: 'slack.connection_error',
+              aisup_session_id: session.aisup_session_id,
+              details: { error: 'channel name suffix limit exceeded', op: 'conversations.create' },
+            });
+            return;
+          }
+        } else {
+          await this.opts.journal.append({
+            ts: new Date().toISOString(),
+            event_type: 'slack.connection_error',
+            aisup_session_id: session.aisup_session_id,
+            details: { error: String(err), op: 'conversations.create' },
           });
           return;
         }
@@ -136,6 +181,39 @@ export class SlackService {
         text: `Session \`${sessionId}\` has ended.`,
       });
     } catch { /* best effort */ }
+  }
+
+  /** Notify the session channel that the session is EXHAUSTED (no failover target available). */
+  async onSessionExhausted(sessionId: string, reason: string): Promise<void> {
+    if (!this.app) return;
+    const channelId = this.channelMap.get(sessionId);
+    if (!channelId) return;
+
+    try {
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `:warning: Session \`${sessionId}\` is EXHAUSTED — no eligible failover account is available (reason: ${reason}).`,
+      });
+    } catch { /* best effort */ }
+  }
+
+  /** Post a detected permission prompt to the session's channel for an `!permit`/`!deny` decision. */
+  async notifyPermissionRequest(sessionId: string, request: PermissionRequest): Promise<void> {
+    if (!this.app) return;
+    const channelId = this.channelMap.get(sessionId);
+    if (!channelId) return;
+    try {
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `:lock: Claude is requesting permission: \`${request.tool}: ${this.redactAndTruncate(request.detail, 200)}\`\nReply \`!permit\` to allow or \`!deny\` to deny.`,
+      });
+    } catch { /* best effort */ }
+  }
+
+  private formatGateSummary(result: GateRunResult): string {
+    const head = `Gates: ${result.passed ? ':white_check_mark: PASSED' : ':x: FAILED'}`;
+    const failed = result.results.filter((r) => r.status !== 'passed').map((r) => `${r.name} (${r.status})`);
+    return failed.length ? `${head}\nFailed: ${failed.join(', ')}` : head;
   }
 
   resetRelayCursor(sessionId: string, path: string): void {
@@ -230,6 +308,13 @@ export class SlackService {
           const state = sessionManager.getActiveSession();
           if (state) {
             await sessionManager.stopSession(state.tmux_name, state.aisup_session_id, { force: false });
+            await this.opts.journal.append({
+              ts: new Date().toISOString(),
+              event_type: 'session.stop',
+              aisup_session_id: state.aisup_session_id,
+              details: { reason: 'slack_requested', force: false, account: state.account, cwd: state.cwd },
+            });
+            await this.onSessionStop(state.aisup_session_id);
             await say('Session stopped.');
           }
           return;
@@ -282,16 +367,52 @@ export class SlackService {
         break;
       }
 
+      case 'permit': {
+        if (!session) { await say('No active session.'); return; }
+        if (!this.opts.onPermissionGrant) { await say('Permission approval is not enabled.'); return; }
+        await this.opts.onPermissionGrant(session.aisup_session_id);
+        await say('Permission granted.');
+        break;
+      }
+
+      case 'deny': {
+        if (!session) { await say('No active session.'); return; }
+        if (!this.opts.onPermissionDeny) { await say('Permission approval is not enabled.'); return; }
+        await this.opts.onPermissionDeny(session.aisup_session_id);
+        await say('Permission denied.');
+        break;
+      }
+
+      case 'gate': {
+        if (args.trim().toLowerCase() === 'status') {
+          const latest = this.opts.getLatestGateRun?.();
+          await say(latest ? this.formatGateSummary(latest) : 'No gate run recorded yet.');
+          return;
+        }
+        if (!this.opts.onGateRun) { await say('Gates are not enabled.'); return; }
+        await say('Running validation gates…');
+        const result = await this.opts.onGateRun();
+        await say(this.formatGateSummary(result));
+        break;
+      }
+
       case 'help': {
-        await say([
+        const lines = [
           '*aisup Slack commands:*',
           '`!interrupt` — send Ctrl+C to session',
           '`!stop` — stop session (requires `!confirm`)',
           '`!status` — show recent session output',
           '`!cmd <text>` — send text to session',
           '`!relay on|off` — toggle output relay',
-          '`!help` — show this message',
-        ].join('\n'));
+        ];
+        if (this.opts.permissionsConfig?.enabled) {
+          lines.push('`!permit` / `!deny` — approve or deny a pending permission prompt');
+        }
+        if (this.opts.onGateRun) {
+          lines.push('`!gate` / `!gate status` — run validation gates or show the latest run');
+        }
+        lines.push('`!help` — show this message');
+        await say(lines.join('\n'));
         break;
       }
 
@@ -368,12 +489,21 @@ export class SlackService {
       cursor.offset = size;
       this.lastPostTime.set(channelId, Date.now());
     } catch (err) {
-      await this.opts.journal.append({
-        ts: new Date().toISOString(),
-        event_type: 'slack.queue_dropped',
-        aisup_session_id: session.aisup_session_id,
-        details: { reason: 'relay_poll_failed', error: String(err).slice(0, 300) },
-      });
+      if (isRateLimited(err)) {
+        await this.opts.journal.append({
+          ts: new Date().toISOString(),
+          event_type: 'slack.rate_limited',
+          aisup_session_id: session.aisup_session_id,
+          details: { retry_after_s: rateLimitRetryAfter(err), channel: channelId },
+        });
+      } else {
+        await this.opts.journal.append({
+          ts: new Date().toISOString(),
+          event_type: 'slack.queue_dropped',
+          aisup_session_id: session.aisup_session_id,
+          details: { reason: 'relay_poll_failed', error: String(err).slice(0, 300) },
+        });
+      }
     }
   }
 

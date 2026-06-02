@@ -30,6 +30,32 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts'> = {
     output_log_max_size_mb: 50,
     output_log_retention_days: 7,
     resume_prompt_mode: 'never',
+    tmux_socket: 'aisup',
+  },
+  recovery: {
+    auto_resume_exhausted: true,
+    exhausted_poll_interval_s: 60,
+    network_error_threshold: 3,
+    max_exhausted_retries: 5,
+  },
+  permissions: {
+    enabled: false,
+    detection_patterns: [],
+    approval_key: 'y',
+    denial_key: 'n',
+    policy: {
+      allowlist: [],
+      denylist: [],
+      default_action: 'deny',
+    },
+    slack_routing: false,
+    grant_ttl_seconds: 300,
+  },
+  gates: {
+    enabled: false,
+    gates: [],
+    trigger: 'idle_and_skill',
+    idle_delay_seconds: 30,
   },
   slack: {
     enabled: false,

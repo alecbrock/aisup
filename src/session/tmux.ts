@@ -176,6 +176,16 @@ export function respawnPane(
   tmuxWithTimeout(socket, ['set-window-option', '-t', name, 'remain-on-exit', 'on']);
 }
 
+/** True when a tmux session container with this name currently exists. */
+export function hasSession(socket: string, name: string): boolean {
+  try {
+    tmuxWithTimeout(socket, ['has-session', '-t', name]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function listSessions(socket: string): string[] {
   try {
     const out = tmuxWithTimeout(socket, ['list-sessions', '-F', '#{session_name}']);

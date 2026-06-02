@@ -1,22 +1,43 @@
 import { RateLimitMonitor } from './loops/rate-limit-monitor.js';
 import { RecoveryHandler, readLogTail, detect429InOutput } from './loops/recovery-handler.js';
+import { detectAuthFailure, detectNetworkError } from '../recovery/patterns.js';
+import type { PermissionDetector } from '../permissions/detector.js';
+import type { PermissionRequest } from '../permissions/types.js';
 import { HealthChecker, checkAccountHealth } from './loops/health-checker.js';
 import { IdleWatchdog, isSessionIdle } from './loops/idle-watchdog.js';
-import { isProcessDead } from '../session/tmux.js';
+import { isProcessDead, hasSession } from '../session/tmux.js';
 import { readTelemetryForActiveSession } from '../statusline/store.js';
 import { selectSwitchTarget } from '../failover/switcher.js';
+import { refreshAccountScores } from '../accounts/refresh.js';
 import { SwitchReason } from '../failover/types.js';
 import { detectSkill } from '../skills/detector.js';
 import type { SessionManager } from '../session/manager.js';
+import type { SessionState } from '../session/types.js';
 import type { AccountRegistry } from '../accounts/registry.js';
 import type { CircuitBreaker } from '../accounts/circuit-breaker.js';
 import type { JournalWriter } from '../journal/types.js';
 import type { HealthCheckResult } from './loops/health-checker.js';
 import type { ThresholdCheckResult } from './loops/rate-limit-monitor.js';
+import type { StatuslineTelemetry } from '../statusline/types.js';
 
 const RECOVERY_LOG_SCAN_BYTES = 65536; // 64KB
 const RESTART_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_RESTARTS_BEFORE_SWITCH = 3;
+/** Default minimum interval between automatic gate runs for a session. */
+const DEFAULT_GATE_DEBOUNCE_MS = 30 * 1000;
+/** Minimum upward cost delta (USD) that is journaled as a periodic cost.snapshot. */
+const COST_MIN_DELTA_USD = 0.01;
+
+interface CostState {
+  /** Latest observed cumulative cost for the active Claude segment. */
+  observed: number;
+  /** Last journaled (baseline) cost — upward deltas are measured from here. */
+  emitted: number;
+  modelId?: string;
+  contextWindowSize?: number;
+  claudeSessionId: string | null;
+  account: string;
+}
 
 export interface LoopManagerDeps {
   sessionManager: SessionManager;
@@ -27,14 +48,24 @@ export interface LoopManagerDeps {
   statuslineDir: string;
   statuslineFreshnessWindowS: number;
   tmuxSocket: string;
+  /** Consecutive network errors required before escalating to a same-account restart. */
+  networkErrorThreshold: number;
   journal: JournalWriter;
   trackedSkills?: string[];
   onOutputLogRotated?: (sessionId: string, path: string) => void;
   circuitBreaker?: CircuitBreaker;
   /** Called when a loop determines a switch should be triggered. */
   onSwitch: (sessionId: string, reason: SwitchReason) => Promise<void>;
-  /** Called when same-account restart should be triggered. */
-  onRestart: (sessionId: string) => Promise<void>;
+  /** Called when same-account restart should be triggered. Returns true when the restart succeeded. */
+  onRestart: (sessionId: string) => Promise<boolean>;
+  /** Permission-prompt detector (present only when permissions are enabled). */
+  permissionDetector?: PermissionDetector;
+  /** Called for each detected permission prompt; the broker (policy/Slack) acts on it. */
+  onPermissionDetected?: (sessionId: string, request: PermissionRequest) => void;
+  /** Called when an idle session has a completed skill — runs validation gates (auto trigger). */
+  onGateTrigger?: (sessionId: string, completedSkill: string) => Promise<void>;
+  /** Minimum interval between automatic gate runs for a session (defaults to 30s). */
+  gateDebounceMs?: number;
 }
 
 export interface LoopManagerOpts {
@@ -59,7 +90,15 @@ export class LoopManager {
   private onHealthResult: (result: HealthCheckResult) => void;
   private onIdle: (sessionId: string) => void;
   private restartAttempts = new Map<string, { count: number; firstAt: number }>();
+  /** Per-session consecutive network-error count; resets alongside restartAttempts. */
+  private networkErrors = new Map<string, number>();
   private lastNoTargetNotice = new Map<string, number>();
+  /** Sessions for which the current continuous idle period has already emitted onIdle. */
+  private idleEmitted = new Set<string>();
+  /** Last automatic gate-run time per session (debounce window). */
+  private lastGateRun = new Map<string, number>();
+  /** Per-session cost tracking for delta-filtered periodic + lifecycle cost snapshots. */
+  private costState = new Map<string, CostState>();
 
   constructor(opts: LoopManagerOpts) {
     this.deps = opts.deps;
@@ -122,11 +161,33 @@ export class LoopManager {
     const telemetry = telemetryResult.telemetry;
 
     if (!telemetry && telemetryResult.mismatch) {
+      // Safe expected/observed identity for diagnosis — the reason string carries the
+      // observed criteria (session id / transcript path), never transcript contents.
       void d.journal.append({
         ts: new Date().toISOString(),
         event_type: 'telemetry.session_mismatch',
         aisup_session_id: session.aisup_session_id,
-        details: { reason: telemetryResult.mismatch, account: session.account, cwd: session.cwd },
+        details: {
+          reason: telemetryResult.mismatch,
+          expected_account: session.account,
+          expected_session_id: session.claude_session_id,
+          expected_cwd: session.cwd,
+        },
+      });
+    }
+
+    if (!telemetry && telemetryResult.invalidJson) {
+      // R7/R12: malformed telemetry file for the active session — safe parse summary
+      // plus freshness context, never the file contents.
+      void d.journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'telemetry.invalid_json',
+        aisup_session_id: session.aisup_session_id,
+        details: {
+          account: session.account,
+          error: telemetryResult.invalidJson.error,
+          stale: telemetryResult.invalidJson.stale,
+        },
       });
     }
 
@@ -137,6 +198,10 @@ export class LoopManager {
         transcript_path: telemetry.transcript_path ?? null,
       });
     }
+
+    // Cost snapshot — captured BEFORE the rate_limits guard so cost is recorded even when
+    // rate-limit telemetry is temporarily absent (Task 3).
+    if (telemetry) this.trackCost(d, session, telemetry);
 
     if (!telemetry?.rate_limits) return;
 
@@ -164,6 +229,7 @@ export class LoopManager {
       if (session.status === 'SWITCH_PENDING_AT_IDLE') {
         // Already pending — check if idle condition met
         if (isSessionIdle(session.output_log_path, d.idleBoundarySeconds)) {
+          this.refreshAccounts(d);
           const accounts = d.accountRegistry.getAll();
           const target = selectSwitchTarget(accounts, session.account, [], {
             reason: SwitchReason.SoftThreshold,
@@ -193,6 +259,7 @@ export class LoopManager {
       }
 
       // Not yet pending — precheck target availability
+      this.refreshAccounts(d);
       const accounts = d.accountRegistry.getAll();
       const target = selectSwitchTarget(accounts, session.account, [], {
         reason: SwitchReason.SoftThreshold,
@@ -215,6 +282,75 @@ export class LoopManager {
     }
   }
 
+  /**
+   * Track cost telemetry for the active session and journal a periodic `cost.snapshot` only on a
+   * meaningful upward delta. A downward delta is the expected reset at a segment boundary (account
+   * switch / new transcript) and is re-baselined silently — the new segment is journaled as it
+   * accrues upward again. Every event carries `claude_session_id`/`account` so Task 4 can segment.
+   */
+  private trackCost(d: LoopManagerDeps, session: SessionState, telemetry: StatuslineTelemetry): void {
+    const cost = telemetry.cost?.total_cost_usd;
+    if (typeof cost !== 'number') return;
+
+    const id = session.aisup_session_id;
+    const claudeSessionId = telemetry.session_id ?? session.claude_session_id ?? null;
+    const modelId = telemetry.model?.id;
+    const contextWindowSize = telemetry.context_window?.context_window_size;
+    const prev = this.costState.get(id);
+
+    if (prev === undefined) {
+      this.costState.set(id, { observed: cost, emitted: cost, modelId, contextWindowSize, claudeSessionId, account: session.account });
+      if (cost >= COST_MIN_DELTA_USD) this.appendCostSnapshot(d, id, 'periodic');
+      return;
+    }
+
+    const entry: CostState = { observed: cost, emitted: prev.emitted, modelId, contextWindowSize, claudeSessionId, account: session.account };
+    if (cost - prev.emitted >= COST_MIN_DELTA_USD) {
+      entry.emitted = cost; // re-baseline at the journaled value so increments accumulate
+      this.costState.set(id, entry);
+      this.appendCostSnapshot(d, id, 'periodic');
+    } else if (cost < prev.emitted) {
+      entry.emitted = cost; // downward reset at a segment boundary — re-baseline silently
+      this.costState.set(id, entry);
+    } else {
+      this.costState.set(id, entry); // sub-threshold upward — keep baseline, refresh metadata
+    }
+  }
+
+  /**
+   * Emit a final (unconditional) cost snapshot at a lifecycle boundary (pre-switch, pre-stop,
+   * pre-manual-failover) using the last observed periodic cost. When a boundary cannot read fresh
+   * telemetry (e.g. the pane is already gone) this last-periodic value is the documented fallback
+   * rather than silently omitting cost. No-op when no cost has been observed for the session.
+   */
+  captureFinalCostSnapshot(sessionId: string, trigger: string): void {
+    if (!this.deps || !this.costState.has(sessionId)) return;
+    this.appendCostSnapshot(this.deps, sessionId, trigger);
+  }
+
+  /** Drop a session's cost tracking on terminal stop. */
+  clearCostTracking(sessionId: string): void {
+    this.costState.delete(sessionId);
+  }
+
+  private appendCostSnapshot(d: LoopManagerDeps, sessionId: string, trigger: string): void {
+    const entry = this.costState.get(sessionId);
+    if (!entry) return;
+    void d.journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'cost.snapshot',
+      aisup_session_id: sessionId,
+      claude_session_id: entry.claudeSessionId ?? undefined,
+      account: entry.account,
+      details: {
+        total_cost_usd: entry.observed,
+        model_id: entry.modelId ?? null,
+        context_window_size: entry.contextWindowSize ?? null,
+        trigger,
+      },
+    });
+  }
+
   private healthTick(d: LoopManagerDeps): void {
     for (const account of d.accountRegistry.getAll()) {
       const result = checkAccountHealth(account, d.statuslineDir);
@@ -227,8 +363,28 @@ export class LoopManager {
   private idleTick(d: LoopManagerDeps): void {
     const session = d.sessionManager.getActiveSession();
     if (!session) return;
+    const sessionId = session.aisup_session_id;
     if (isSessionIdle(session.output_log_path, d.idleBoundarySeconds)) {
-      this.onIdle(session.aisup_session_id);
+      // Emit once when the idle period begins; subsequent idle ticks are throttled
+      // until activity resumes (lastIdleEmit semantics) to avoid journal spam.
+      if (!this.idleEmitted.has(sessionId)) {
+        this.idleEmitted.add(sessionId);
+        this.onIdle(sessionId);
+      }
+      // Gate trigger: idle plus a completed (non-null) skill. Clear the skill so a given
+      // completion fires once; the debounce window guards against rapid re-triggers.
+      if (d.onGateTrigger && session.active_skill) {
+        const now = Date.now();
+        const debounceMs = d.gateDebounceMs ?? DEFAULT_GATE_DEBOUNCE_MS;
+        if (now - (this.lastGateRun.get(sessionId) ?? 0) >= debounceMs) {
+          this.lastGateRun.set(sessionId, now);
+          const completedSkill = session.active_skill;
+          d.sessionManager.patchState(sessionId, { active_skill: null });
+          void d.onGateTrigger(sessionId, completedSkill);
+        }
+      }
+    } else {
+      this.idleEmitted.delete(sessionId);
     }
   }
 
@@ -236,7 +392,8 @@ export class LoopManager {
     const session = d.sessionManager.getActiveSession();
     if (!session) return;
 
-    // Only process ACTIVE and SWITCH_PENDING_AT_IDLE sessions
+    // Only process ACTIVE and SWITCH_PENDING_AT_IDLE sessions — auth/network/429 output
+    // detection therefore does not run for EXHAUSTED, SWITCHING, CREATING, or STOPPING.
     if (session.status !== 'ACTIVE' && session.status !== 'SWITCH_PENDING_AT_IDLE') return;
 
     const rotation = d.sessionManager.rotateOutputLogIfNeeded?.(session.aisup_session_id) ?? { rotated: false, path: session.output_log_path };
@@ -249,6 +406,22 @@ export class LoopManager {
         aisup_session_id: session.aisup_session_id,
         details: { path: rotation.path, rotated_path: rotation.rotatedPath ?? null },
       });
+    }
+
+    // R11: an externally destroyed tmux session container is distinct from a dead
+    // runner pane. Check container existence before reading pane liveness.
+    if (!hasSession(d.tmuxSocket, session.tmux_name)) {
+      const cursor = this.recoveryHandler.getCursor(session.aisup_session_id);
+      const logContent = readLogTail(session.output_log_path, cursor?.offset ?? 0, RECOVERY_LOG_SCAN_BYTES);
+      const has429 = detect429InOutput(logContent);
+      await d.journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'session.destroyed_externally',
+        aisup_session_id: session.aisup_session_id,
+        details: { has429, source: 'recovery_handler', tmux_name: session.tmux_name },
+      });
+      await this.handleDeadSessionRecovery(d, session, has429);
+      return;
     }
 
     const paneDead = isProcessDead(d.tmuxSocket, session.tmux_name);
@@ -276,6 +449,49 @@ export class LoopManager {
               });
             }
 
+            // Permission prompts are observed and routed to the broker, but never block a
+            // higher-priority 429/auth recovery action — detect first, then fall through.
+            if (d.permissionDetector) {
+              for (const request of d.permissionDetector.scan(output)) {
+                await d.journal.append({
+                  ts: new Date().toISOString(),
+                  event_type: 'permission.detected',
+                  aisup_session_id: session.aisup_session_id,
+                  details: { tool: request.tool, detail: request.detail },
+                });
+                d.onPermissionDetected?.(session.aisup_session_id, request);
+              }
+            }
+
+            // Detection priority: auth failure → 429 → network error escalation.
+            // An auth failure is terminal for the account, so it switches immediately.
+            if (detectAuthFailure(output)) {
+              cursor.advance(currentSize);
+              await d.journal.append({
+                ts: new Date().toISOString(),
+                event_type: 'failure.auth_detected',
+                aisup_session_id: session.aisup_session_id,
+                details: { source: 'live_output', tmux_name: session.tmux_name },
+              });
+              if (this.failoverInProgress) {
+                await d.journal.append({
+                  ts: new Date().toISOString(),
+                  event_type: 'failover.skipped_concurrent',
+                  aisup_session_id: session.aisup_session_id,
+                  details: { reason: 'live_auth_detected' },
+                });
+                return;
+              }
+              // Record an account-level failure so a persistently broken account cools
+              // down rather than being re-selected into a switch-back loop.
+              this.recordRateLimitFailure(d, session.account, session.aisup_session_id, 'live_auth');
+              this.failoverInProgress = true;
+              await d.onSwitch(session.aisup_session_id, SwitchReason.AuthFailure).finally(() => {
+                this.failoverInProgress = false;
+              });
+              return;
+            }
+
             if (detect429InOutput(output)) {
               cursor.advance(currentSize);
               await d.journal.append({
@@ -300,6 +516,47 @@ export class LoopManager {
               });
               return;
             }
+
+            // Network errors are transient: count them and escalate to a same-account
+            // restart once they reach the threshold. A failed restart escalates to a
+            // switch (NetworkError). Counters reset on switch/stop/successful restart.
+            if (detectNetworkError(output)) {
+              cursor.advance(currentSize);
+              const count = (this.networkErrors.get(session.aisup_session_id) ?? 0) + 1;
+              this.networkErrors.set(session.aisup_session_id, count);
+              await d.journal.append({
+                ts: new Date().toISOString(),
+                event_type: 'failure.network_detected',
+                aisup_session_id: session.aisup_session_id,
+                details: { source: 'live_output', tmux_name: session.tmux_name, count, threshold: d.networkErrorThreshold },
+              });
+              if (count >= d.networkErrorThreshold) {
+                this.networkErrors.delete(session.aisup_session_id);
+                if (this.failoverInProgress) {
+                  await d.journal.append({
+                    ts: new Date().toISOString(),
+                    event_type: 'failover.skipped_concurrent',
+                    aisup_session_id: session.aisup_session_id,
+                    details: { reason: 'live_network_threshold' },
+                  });
+                  return;
+                }
+                const restarted = await d.onRestart(session.aisup_session_id);
+                if (restarted) {
+                  this.restartAttempts.delete(session.aisup_session_id);
+                } else {
+                  this.failoverInProgress = true;
+                  await d.onSwitch(session.aisup_session_id, SwitchReason.NetworkError).finally(() => {
+                    this.failoverInProgress = false;
+                  });
+                }
+              }
+              return;
+            }
+
+            // Clean output (no auth/429/network signal) — the runner is producing
+            // normal output, so the transient network-error window has recovered.
+            this.networkErrors.delete(session.aisup_session_id);
           }
           cursor.advance(currentSize);
         } catch { /* non-fatal */ }
@@ -320,6 +577,15 @@ export class LoopManager {
       details: { has429, source: 'recovery_handler', tmux_name: session.tmux_name },
     });
 
+    await this.handleDeadSessionRecovery(d, session, has429);
+  }
+
+  /**
+   * Shared recovery matrix for a non-running session — whether the runner pane died
+   * or the tmux container was destroyed externally. Routes through switch-on-429,
+   * switch-while-pending, restart-escalation, or same-account restart.
+   */
+  private async handleDeadSessionRecovery(d: LoopManagerDeps, session: SessionState, has429: boolean): Promise<void> {
     if (has429 || session.status === 'SWITCH_PENDING_AT_IDLE') {
       // 429 crash or crash-while-pending → immediate account switch
       if (this.failoverInProgress) {
@@ -333,6 +599,7 @@ export class LoopManager {
       }
       this.failoverInProgress = true;
       this.restartAttempts.delete(session.aisup_session_id);
+      this.networkErrors.delete(session.aisup_session_id);
       const switchReason = has429 ? SwitchReason.RateLimit429 : SwitchReason.ProcessCrash;
       if (has429) this.recordRateLimitFailure(d, session.account, session.aisup_session_id, 'crash_429');
       await d.onSwitch(session.aisup_session_id, switchReason).finally(() => {
@@ -341,29 +608,52 @@ export class LoopManager {
       return;
     }
 
-    // No 429 — attempt same-account restart
-    const attempts = this.restartAttempts.get(session.aisup_session_id);
-    const now = Date.now();
+    // No 429 — attempt a same-account restart and track FAILED restarts in a rolling window.
+    const restarted = await d.onRestart(session.aisup_session_id);
+    if (restarted) {
+      // A successful restart resolves the incident and clears the failure windows.
+      this.restartAttempts.delete(session.aisup_session_id);
+      this.networkErrors.delete(session.aisup_session_id);
+      return;
+    }
 
-    if (attempts && (now - attempts.firstAt) < RESTART_FAILURE_WINDOW_MS && attempts.count >= MAX_RESTARTS_BEFORE_SWITCH) {
-      // Too many restarts — escalate to account switch
+    const now = Date.now();
+    const attempts = this.restartAttempts.get(session.aisup_session_id);
+    if (!attempts || (now - attempts.firstAt) >= RESTART_FAILURE_WINDOW_MS) {
+      // First failure, or the previous window has rolled over — start a fresh window.
+      this.restartAttempts.set(session.aisup_session_id, { count: 1, firstAt: now });
+    } else {
+      attempts.count += 1;
+    }
+
+    if ((this.restartAttempts.get(session.aisup_session_id)?.count ?? 0) >= MAX_RESTARTS_BEFORE_SWITCH) {
+      // Third failed restart inside the window — escalate to an account switch.
       this.restartAttempts.delete(session.aisup_session_id);
       if (this.failoverInProgress) return;
       this.failoverInProgress = true;
       await d.onSwitch(session.aisup_session_id, SwitchReason.RestartFailures).finally(() => {
         this.failoverInProgress = false;
       });
-      return;
     }
+  }
 
-    // Track this restart attempt
-    if (!attempts || (now - attempts.firstAt) >= RESTART_FAILURE_WINDOW_MS) {
-      this.restartAttempts.set(session.aisup_session_id, { count: 1, firstAt: now });
-    } else {
-      attempts.count += 1;
-    }
+  /** Clear a session's recovery counters (restart-failure window + network-error window)
+   *  — on successful recovery, session stop, or switch. */
+  clearRecoveryCounters(sessionId: string): void {
+    this.restartAttempts.delete(sessionId);
+    this.networkErrors.delete(sessionId);
+  }
 
-    await d.onRestart(session.aisup_session_id);
+  /** Refresh scores/state from telemetry + circuit breaker before a failover selection. */
+  private refreshAccounts(d: LoopManagerDeps): void {
+    refreshAccountScores({
+      registry: d.accountRegistry,
+      statuslineDir: d.statuslineDir,
+      freshnessWindowS: d.statuslineFreshnessWindowS,
+      softPct: d.softPct,
+      hardPct: d.hardPct,
+      circuitBreaker: d.circuitBreaker,
+    });
   }
 
   private appendNoTarget(d: LoopManagerDeps, sessionId: string, details: Record<string, unknown>): void {

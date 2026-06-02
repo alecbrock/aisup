@@ -3,8 +3,8 @@
 Created: 2026-05-11
 Review merge: 2026-05-29
 Author: alec.m.brock@gmail.com
-Status: PENDING
-Approved: No
+Status: VERIFIED
+Approved: Yes
 Iterations: 4
 Worktree: No
 Type: Feature
@@ -661,6 +661,44 @@ Phase 2 implementation must not begin until all CRITICAL and HIGH Phase 1 remedi
 - Add `gate` to `KNOWN_COMMANDS` and add `case 'gate'` in Slack dispatch: `!gate` runs gates, `!gate status` reports latest results.
 **Tests:** Idle + active skill triggers; no active skill does not trigger; debounce; active_skill clears; manual CLI/API/Slack runs; latest status; Slack notification.
 **Acceptance Criteria:** Gates are runnable manually and automatically without depending on a nonexistent skill-null transition.
+
+## Progress Tracking
+
+Completed: 28 / 28 — Remaining: 0
+
+**Phase 1 Remediation Gate**
+- [x] R1: Wire account scoring and eligibility (CRITICAL)
+- [x] R2: Persist terminal no-target EXHAUSTED state (CRITICAL)
+- [x] R3: Make migration outcome own resume eligibility (CRITICAL)
+- [x] R4: Add recovery callbacks to rehydration (HIGH)
+- [x] R5: Fix idle event contract (HIGH)
+- [x] R6: Correct retry eligibility and soft-target execution (HIGH)
+- [x] R7: Complete canonical journal details (HIGH)
+- [x] R8: Rehydrate persisted EXHAUSTED sessions (HIGH)
+- [x] R9: Use current sources for status, log, accounts (HIGH)
+- [x] R10: Finish Slack edge contracts (MEDIUM)
+- [x] R11: Distinguish missing tmux session from dead pane (MEDIUM)
+- [x] R12: Enforce active-session telemetry identity (HIGH) — also delivers the R7 `telemetry.invalid_json` emission (safe parse-error summary + freshness) via the shared telemetry resolver refactor, deferred from R7 to avoid refactoring the resolver twice.
+- [x] R13: Fix restart counter state machine (MEDIUM)
+- [x] R14: Update alignment scan progress (MEDIUM, doc-only)
+
+**Cross-Cutting Consolidation**
+- [x] C1: Event and config contract baseline
+
+**Phase 2 Implementation Tasks**
+- [x] Task 0: Update PRD to match current reality (doc-only)
+- [x] Task 1: Integration smoke test
+- [x] Task 2: Rehydration automatic recovery
+- [x] Task 3: Cost snapshot collection
+- [x] Task 4: Cost aggregation module
+- [x] Task 5: aisup cost, /api/cost, aisup log --type
+- [x] Task 6: Auth and network failure detection
+- [x] Task 7: EXHAUSTED auto-recovery
+- [x] Task 8: Permission prompt detection
+- [x] Task 9: Permission policy engine
+- [x] Task 10: Permission broker and Slack approval routing
+- [x] Task 11: Validation gate config and engine
+- [x] Task 12: Gate trigger wiring, CLI/API, and Slack `!gate`
 
 ## Validation Gates
 
