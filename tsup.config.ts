@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  entry: { 'cli/index': 'src/cli/index.ts' },
+  entry: { 'cli/index': 'src/cli/index.ts', 'daemon/index': 'src/daemon/index.ts' },
   format: ['esm'],
   target: 'node22',
   outDir: 'dist',
