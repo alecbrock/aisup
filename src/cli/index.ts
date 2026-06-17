@@ -7,6 +7,16 @@ import { showStatus } from './commands/status.js';
 import { showLog } from './commands/log.js';
 import { sessionCost } from './commands/cost.js';
 import { showGates, runGateCommand } from './commands/gate.js';
+import {
+  workerDispatch,
+  workerList,
+  workerStatus,
+  workerReview,
+  workerApprove,
+  workerDeny,
+  workerCancel,
+  workerLogs,
+} from './commands/worker.js';
 import { showAccounts } from './commands/accounts.js';
 import { runDoctor } from './commands/doctor.js';
 import { runInit } from './commands/init.js';
@@ -110,5 +120,50 @@ program
   .description('Trigger manual account failover')
   .requiredOption('--to <account>', 'Target account name')
   .action((opts: { to: string }) => void triggerFailover(opts.to));
+
+const worker = program.command('worker').description('Manage multi-LLM workers');
+worker
+  .command('dispatch')
+  .description('Dispatch a bounded task to an LLM worker')
+  .option('--task-type <type>', 'Routing key (e.g. implement, bugfix)')
+  .requiredOption('--prompt <text|@file>', 'Task prompt, or @path to load from a file')
+  .option('--title <title>', 'Short title (defaults to the truncated prompt)')
+  .option('--implementer <adapter>', 'Override the implementer adapter')
+  .option('--reviewer <adapter>', 'Override the reviewer adapter')
+  .option('--base <ref>', 'Base git ref to branch the worktree from')
+  .option('--workspace <path>', 'Workspace root (main git repo)')
+  .action((opts: { taskType?: string; prompt?: string; title?: string; implementer?: string; reviewer?: string; base?: string; workspace?: string }) =>
+    void workerDispatch(opts)
+  );
+worker
+  .command('list')
+  .description('List workers')
+  .option('--json', 'Print machine-readable JSON')
+  .action((opts: { json?: boolean }) => void workerList({ json: opts.json ?? false }));
+worker
+  .command('status <id>')
+  .description('Show a worker\'s status')
+  .option('--json', 'Print machine-readable JSON')
+  .action((id: string, opts: { json?: boolean }) => void workerStatus(id, { json: opts.json ?? false }));
+worker
+  .command('review <id>')
+  .description('Show the cross-model review verdict')
+  .action((id: string) => void workerReview(id));
+worker
+  .command('logs <id>')
+  .description('Show the worker\'s sanitized stdout/stderr tails and artifact paths')
+  .action((id: string) => void workerLogs(id));
+worker
+  .command('approve <id>')
+  .description('Approve and merge a worker patch')
+  .action((id: string) => void workerApprove(id));
+worker
+  .command('deny <id>')
+  .description('Deny a worker patch')
+  .action((id: string) => void workerDeny(id));
+worker
+  .command('cancel <id>')
+  .description('Cancel a worker')
+  .action((id: string) => void workerCancel(id));
 
 program.parse(process.argv);

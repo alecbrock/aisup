@@ -7,7 +7,7 @@ import type { GateExecResult, GateResult, GateRunResult, GateRunner, GateStatus 
 export const GATE_OUTPUT_TAIL_LIMIT = 2000;
 
 /** Cap on captured subprocess output to bound memory before truncation. */
-const MAX_BUFFER = 10 * 1024 * 1024;
+export const MAX_BUFFER = 10 * 1024 * 1024;
 
 /** Default runner: shell-free `execFile(command, args)` — never a shell string. */
 const defaultGateRunner: GateRunner = (command, args, opts) =>

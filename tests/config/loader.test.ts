@@ -430,3 +430,196 @@ slack:
     await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/allowed_user_ids/i);
   });
 });
+
+describe('loadConfig — workers section', () => {
+  let tmpDir: string;
+  let origHome: string | undefined;
+  let accountDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'aisup-workers-'));
+    origHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir, { recursive: true });
+    resetConfigCache();
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    rmSync(tmpDir, { recursive: true, force: true });
+    resetConfigCache();
+  });
+
+  function writeConfig(workersYaml: string): string {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const path = join(configDir, 'config.yaml');
+    writeFileSync(
+      path,
+      `accounts:\n  - name: primary\n    config_dir: ${accountDir}\n${workersYaml}`
+    );
+    return path;
+  }
+
+  // A fully-valid enabled workers config; flip one field per invalid-case test.
+  const enabledBase = `workers:
+  enabled: true
+  adapters:
+    codex:
+      enabled: true
+    gemini:
+      enabled: true
+  routing:
+    default_implementer: codex
+    default_reviewer: gemini
+  validation_gates:
+    - name: test
+      command: "true"
+      args: []
+      timeout_seconds: 60
+      required: true
+      cwd: null
+`;
+
+  it('returns a fully-populated workers section for an empty config (defaults)', async () => {
+    const config = await loadConfig(writeConfig(''));
+    expect(config.workers.enabled).toBe(false);
+    expect(config.workers.workspace_root).toBeNull();
+    expect(config.workers.worktree_dir).toBe('.aisup-workers');
+    expect(config.workers.base_ref).toBe('HEAD');
+    expect(config.workers.max_concurrent).toBe(2);
+    expect(config.workers.retention.max_age_hours).toBe(168);
+    expect(config.workers.security.boundary_audit).toBe(true);
+    expect(config.workers.security.forbidden_path_globs).toContain('**/.env');
+    expect(config.workers.adapters.codex.command).toBe('codex');
+    expect(config.workers.adapters.codex.name).toBe('codex');
+    expect(config.workers.adapters.codex.enabled).toBe(false);
+    expect(config.workers.routing.default_implementer).toBe('codex');
+    expect(config.workers.review.allow_same_model_review).toBe(false);
+    expect(config.workers.merge.require_approval).toBe(true);
+    expect(config.workers.validation.allow_no_validation).toBe(false);
+  });
+
+  it('returns a custom enabled workers section and injects adapter names from keys', async () => {
+    const config = await loadConfig(writeConfig(enabledBase));
+    expect(config.workers.enabled).toBe(true);
+    expect(config.workers.adapters.codex.enabled).toBe(true);
+    expect(config.workers.adapters.gemini.enabled).toBe(true);
+    expect(config.workers.adapters.gemini.name).toBe('gemini');
+    expect(config.workers.validation_gates).toHaveLength(1);
+    expect(config.workers.validation_gates[0].required).toBe(true);
+  });
+
+  it('rejects merge.require_approval: false', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  merge:\n    require_approval: false\n'))
+    ).rejects.toThrow(/require_approval/i);
+  });
+
+  it('rejects security.boundary_audit: false', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  security:\n    boundary_audit: false\n'))
+    ).rejects.toThrow(/boundary_audit/i);
+  });
+
+  it('rejects an adapter command that embeds arguments (whitespace)', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  adapters:\n    codex:\n      command: "codex --run"\n'))
+    ).rejects.toThrow(/command|argument/i);
+  });
+
+  it('rejects routing referencing an undefined adapter', async () => {
+    await expect(
+      loadConfig(
+        writeConfig('workers:\n  routing:\n    default_reviewer: nonesuch\n')
+      )
+    ).rejects.toThrow(/nonesuch|adapter/i);
+  });
+
+  it('rejects worktree_dir containing ..', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  worktree_dir: "../escape"\n'))
+    ).rejects.toThrow(/worktree_dir/i);
+  });
+
+  it('rejects worktree_dir of "."', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  worktree_dir: "."\n'))
+    ).rejects.toThrow(/worktree_dir/i);
+  });
+
+  it('rejects worktree_dir of ".git"', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  worktree_dir: ".git"\n'))
+    ).rejects.toThrow(/worktree_dir/i);
+  });
+
+  it('rejects a validation_gates entry carrying a non-null cwd', async () => {
+    const badGate = enabledBase.replace('      cwd: null\n', '      cwd: /some/path\n');
+    await expect(loadConfig(writeConfig(badGate))).rejects.toThrow(/cwd/i);
+  });
+
+  it('rejects default_implementer naming a disabled adapter when enabled', async () => {
+    const yaml = `workers:
+  enabled: true
+  adapters:
+    gemini:
+      enabled: true
+  routing:
+    default_implementer: codex
+    default_reviewer: gemini
+  validation_gates:
+    - name: test
+      command: "true"
+      args: []
+      timeout_seconds: 60
+      required: true
+      cwd: null
+`;
+    await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/codex|enabled|implementer/i);
+  });
+
+  it('rejects a by_task_type reviewer naming a disabled adapter', async () => {
+    // append a by_task_type referencing disabled "local"
+    const withRoute = enabledBase.replace(
+      '    default_reviewer: gemini\n',
+      '    default_reviewer: gemini\n    by_task_type:\n      bugfix:\n        implementer: codex\n        reviewer: local\n'
+    );
+    await expect(loadConfig(writeConfig(withRoute))).rejects.toThrow(/local|disabled|reviewer/i);
+  });
+
+  it('rejects base_ref beginning with -', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  base_ref: "--help"\n'))
+    ).rejects.toThrow(/base_ref/i);
+  });
+
+  it('rejects the removed review.parse_failure_verdict field', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  review:\n    parse_failure_verdict: approve\n'))
+    ).rejects.toThrow(/parse_failure_verdict/i);
+  });
+
+  it('rejects the removed review.require_cross_model field', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  review:\n    require_cross_model: true\n'))
+    ).rejects.toThrow(/require_cross_model/i);
+  });
+
+  it('rejects enabled workers with no required validation gate and allow_no_validation: false', async () => {
+    const yaml = `workers:
+  enabled: true
+  adapters:
+    codex:
+      enabled: true
+    gemini:
+      enabled: true
+  routing:
+    default_implementer: codex
+    default_reviewer: gemini
+  validation_gates: []
+`;
+    await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/validation|required|gate/i);
+  });
+});

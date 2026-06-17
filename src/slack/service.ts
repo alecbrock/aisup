@@ -15,6 +15,7 @@ import type { JournalWriter } from '../journal/types.js';
 import type { SessionState } from '../session/types.js';
 import type { PermissionRequest } from '../permissions/types.js';
 import type { GateRunResult } from '../gates/types.js';
+import type { WorkerState } from '../workers/types.js';
 
 export interface SlackServiceOpts {
   config: SlackConfig;
@@ -34,6 +35,12 @@ export interface SlackServiceOpts {
   onGateRun?: () => Promise<GateRunResult>;
   /** Latest gate run for Slack !gate status. */
   getLatestGateRun?: () => GateRunResult | null;
+  /** Approve a worker patch via `!worker approve <id>` — resolves ok only on a real transition. */
+  onWorkerApprove?: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Deny a worker patch via `!worker deny <id>` — resolves ok only on a real transition. */
+  onWorkerDeny?: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Current worker states for `!worker status`. */
+  getWorkerStatus?: () => WorkerState[];
 }
 
 /** Upper bound on channel-name suffix retries before giving up on creation. */
@@ -216,6 +223,10 @@ export class SlackService {
     return failed.length ? `${head}\nFailed: ${failed.join(', ')}` : head;
   }
 
+  private formatWorkerSummary(workers: WorkerState[]): string {
+    return ['*Workers:*', ...workers.map((w) => `\`${w.task.id}\` ${w.status} — ${w.task.title}`)].join('\n');
+  }
+
   resetRelayCursor(sessionId: string, path: string): void {
     const existing = this.outputCursors.get(sessionId);
     this.outputCursors.set(sessionId, {
@@ -328,6 +339,18 @@ export class SlackService {
           await say(`Sent: \`${this.redactAndTruncate(pendingCmd.payload, 300)}\``);
           return;
         }
+        // Check for a pending worker approve/deny (applies a patch to the workspace).
+        for (const wAction of ['approve', 'deny'] as const) {
+          const pendingWorker = this.confirmations.get(channelId, userId, `worker_${wAction}`);
+          if (!pendingWorker) continue;
+          const handler = wAction === 'approve' ? this.opts.onWorkerApprove : this.opts.onWorkerDeny;
+          if (!handler) { await say('Worker actions are not enabled.'); return; }
+          const res = await handler(pendingWorker.payload);
+          await say(res.ok
+            ? `Worker ${pendingWorker.payload}: ${wAction} ok.`
+            : `Worker ${pendingWorker.payload}: ${wAction} did not apply${res.reason ? ` (${res.reason})` : ''}.`);
+          return;
+        }
         await say('No pending confirmation.');
         break;
       }
@@ -397,6 +420,29 @@ export class SlackService {
         await say('Running validation gates…');
         const result = await this.opts.onGateRun();
         await say(this.formatGateSummary(result));
+        break;
+      }
+
+      // Worker actions are SUBCOMMANDS of `!worker` — never top-level `!approve`/`!deny`, so the
+      // existing `!deny` permission command is preserved (MD-001).
+      case 'worker': {
+        const [sub, id] = args.trim().split(/\s+/, 2);
+        const action = (sub ?? '').toLowerCase();
+        if (action === 'status') {
+          const workers = this.opts.getWorkerStatus?.() ?? [];
+          await say(workers.length ? this.formatWorkerSummary(workers) : 'No workers.');
+          return;
+        }
+        if (action === 'approve' || action === 'deny') {
+          if (!id) { await say(`Usage: \`!worker ${action} <id>\``); return; }
+          const handler = action === 'approve' ? this.opts.onWorkerApprove : this.opts.onWorkerDeny;
+          if (!handler) { await say('Worker actions are not enabled.'); return; }
+          // Applying a worker patch mutates the workspace — gate it behind !confirm, like !stop.
+          this.confirmations.set(channelId, userId, `worker_${action}`, id);
+          await say(`Worker ${id}: ${action} requested. Reply \`!confirm\` within 60s to proceed.`);
+          return;
+        }
+        await say('Usage: `!worker status` | `!worker approve <id>` | `!worker deny <id>`');
         break;
       }
 

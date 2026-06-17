@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { appendEvent, createJournalWriter } from '../../src/journal/writer.js';
-import type { JournalEvent } from '../../src/journal/types.js';
+import type { JournalEvent, EventType } from '../../src/journal/types.js';
 
 describe('appendEvent', () => {
   let tmpDir: string;
@@ -170,5 +170,37 @@ describe('appendEvent', () => {
     expect(parsed.account).toBe('primary');
     expect(parsed.tokens).toBe(1000);
     expect(parsed.cost_usd).toBe(0.05);
+  });
+
+  it('accepts all worker.* event types with safe details', async () => {
+    const workerEvents: EventType[] = [
+      'worker.queued', 'worker.dispatched', 'worker.completed', 'worker.failed',
+      'worker.validated', 'worker.validation_failed', 'worker.review_started',
+      'worker.review_passed', 'worker.review_failed', 'worker.review_degraded',
+      'worker.awaiting_approval', 'worker.approved', 'worker.denied',
+      'worker.merge_started', 'worker.merged', 'worker.merge_failed',
+      'worker.boundary_violation', 'worker.security_denied', 'worker.cancelled',
+      'worker.cleanup', 'worker.rehydrated_failed', 'worker.rehydrated_merged',
+    ];
+    for (const event_type of workerEvents) {
+      await appendEvent(journalPath, {
+        ts: new Date().toISOString(),
+        event_type,
+        details: { worker_task_id: 'w-1', reason: 'ok' },
+      });
+    }
+    const lines = readFileSync(journalPath, 'utf8').trim().split('\n').filter(Boolean);
+    expect(lines).toHaveLength(workerEvents.length);
+    expect(JSON.parse(lines[0]).event_type).toBe('worker.queued');
+  });
+
+  it('still rejects a secret key inside a worker event details', async () => {
+    await expect(
+      appendEvent(journalPath, {
+        ts: new Date().toISOString(),
+        event_type: 'worker.security_denied',
+        details: { bot_token: 'xoxb-leak' } as Record<string, unknown>,
+      })
+    ).rejects.toThrow(/forbidden.*key/i);
   });
 });

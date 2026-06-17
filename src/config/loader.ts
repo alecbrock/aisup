@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, accessSyn
 import { join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import yaml from 'js-yaml';
-import type { AisupConfig, AccountConfig, GateCommandConfig } from './schema.js';
+import type { AisupConfig, AccountConfig, GateCommandConfig, WorkersConfig, WorkerAdapterConfig } from './schema.js';
 import { CONFIG_DEFAULTS } from './defaults.js';
 
 const DEFAULT_CONFIG_PATH = join(homedir(), '.aisup', 'config.yaml');
@@ -106,6 +106,154 @@ function validateGates(gates: GateCommandConfig[]): GateCommandConfig[] {
   return gates;
 }
 
+const ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function validateWorkerAdapter(name: string, raw: WorkerAdapterConfig): WorkerAdapterConfig {
+  const a = { ...raw, name };
+  const prefix = `workers.adapters.${name}`;
+  if (typeof a.command !== 'string') {
+    throw new Error(`Config validation error: ${prefix}.command must be a string`);
+  }
+  // Empty command allowed only for a disabled adapter (operator-provided placeholder).
+  if (a.command === '') {
+    if (a.enabled) {
+      throw new Error(`Config validation error: ${prefix}.command must be set when the adapter is enabled`);
+    }
+  } else if (/\s/.test(a.command)) {
+    throw new Error(
+      `Config validation error: ${prefix}.command must be an executable with no embedded arguments — put arguments in args`
+    );
+  }
+  if (!Array.isArray(a.args)) {
+    throw new Error(`Config validation error: ${prefix}.args must be an array`);
+  }
+  if (a.prompt_via !== 'arg' && a.prompt_via !== 'stdin' && a.prompt_via !== 'file') {
+    throw new Error(`Config validation error: ${prefix}.prompt_via must be one of arg|stdin|file`);
+  }
+  if (!Number.isInteger(a.timeout_seconds) || a.timeout_seconds <= 0) {
+    throw new Error(`Config validation error: ${prefix}.timeout_seconds must be a positive integer`);
+  }
+  if (!Array.isArray(a.env_allowlist) || !a.env_allowlist.every((e) => typeof e === 'string' && ENV_VAR_NAME.test(e))) {
+    throw new Error(`Config validation error: ${prefix}.env_allowlist must be an array of valid env var names`);
+  }
+  return a;
+}
+
+function validateWorkers(workers: WorkersConfig): WorkersConfig {
+  // merge.require_approval and security.boundary_audit are unconditional invariants.
+  if (workers.merge.require_approval !== true) {
+    throw new Error('Config validation error: workers.merge.require_approval must be true (no auto-merge)');
+  }
+  if (workers.security.boundary_audit !== true) {
+    throw new Error('Config validation error: workers.security.boundary_audit must be true');
+  }
+
+  // Removed review knobs — reject so an operator never believes fail-open review is enabled.
+  const review = workers.review as unknown as Record<string, unknown>;
+  if ('parse_failure_verdict' in review) {
+    throw new Error(
+      'Config validation error: workers.review.parse_failure_verdict was removed — parse failure always rejects (fail-closed)'
+    );
+  }
+  if ('require_cross_model' in review) {
+    throw new Error(
+      'Config validation error: workers.review.require_cross_model was removed — use review.allow_same_model_review'
+    );
+  }
+  if (typeof workers.review.allow_same_model_review !== 'boolean') {
+    throw new Error('Config validation error: workers.review.allow_same_model_review must be a boolean');
+  }
+
+  // base_ref argument-injection guard.
+  if (typeof workers.base_ref !== 'string' || workers.base_ref === '' || workers.base_ref.startsWith('-')) {
+    throw new Error('Config validation error: workers.base_ref must be a non-empty git ref not beginning with "-"');
+  }
+
+  // worktree_dir static safety (relative, no .. / leading slash / reserved segments).
+  const wd = workers.worktree_dir;
+  if (typeof wd !== 'string' || wd === '') {
+    throw new Error('Config validation error: workers.worktree_dir must be a non-empty relative path');
+  }
+  if (isAbsolute(wd) || wd.startsWith('/')) {
+    throw new Error('Config validation error: workers.worktree_dir must be relative (no leading "/")');
+  }
+  const segments = wd.split('/');
+  if (wd === '.' || segments.includes('..') || segments.includes('.git')) {
+    throw new Error('Config validation error: workers.worktree_dir must not be ".", contain "..", or contain a ".git" segment');
+  }
+
+  // workspace_root, when set, must be an existing directory; == worktree_dir guard.
+  let workspaceRoot: string | null = null;
+  if (workers.workspace_root !== null && workers.workspace_root !== undefined) {
+    workspaceRoot = validateExistingDir(String(workers.workspace_root), 'workers.workspace_root');
+    if (join(workspaceRoot, wd) === workspaceRoot) {
+      throw new Error('Config validation error: workers.worktree_dir must not resolve to workspace_root');
+    }
+  }
+
+  if (!Number.isInteger(workers.max_concurrent) || workers.max_concurrent < 1) {
+    throw new Error('Config validation error: workers.max_concurrent must be a positive integer');
+  }
+
+  // Adapters: inject name from key, validate each.
+  if (!workers.adapters || typeof workers.adapters !== 'object') {
+    throw new Error('Config validation error: workers.adapters must be an object');
+  }
+  const adapters: Record<string, WorkerAdapterConfig> = {};
+  for (const [key, raw] of Object.entries(workers.adapters)) {
+    adapters[key] = validateWorkerAdapter(key, raw);
+  }
+  const adapterNames = Object.keys(adapters);
+  const isDefined = (n: string): boolean => adapterNames.includes(n);
+  const isEnabled = (n: string): boolean => adapters[n]?.enabled === true;
+
+  // Routing: referenced adapters must be defined; reviewer/implementer enablement gated on enabled.
+  const routing = workers.routing;
+  if (!isDefined(routing.default_implementer)) {
+    throw new Error(`Config validation error: workers.routing.default_implementer "${routing.default_implementer}" is not a defined adapter`);
+  }
+  if (!isDefined(routing.default_reviewer)) {
+    throw new Error(`Config validation error: workers.routing.default_reviewer "${routing.default_reviewer}" is not a defined adapter`);
+  }
+  for (const [taskType, override] of Object.entries(routing.by_task_type ?? {})) {
+    if (!isDefined(override.implementer)) {
+      throw new Error(`Config validation error: workers.routing.by_task_type.${taskType}.implementer "${override.implementer}" is not a defined adapter`);
+    }
+    if (!isDefined(override.reviewer)) {
+      throw new Error(`Config validation error: workers.routing.by_task_type.${taskType}.reviewer "${override.reviewer}" is not a defined adapter`);
+    }
+  }
+
+  // validation_gates: reuse gate validator + worker-specific cwd-must-be-null rule.
+  validateGates(workers.validation_gates);
+  workers.validation_gates.forEach((g, i) => {
+    if (g.cwd !== null && g.cwd !== undefined) {
+      throw new Error(`Config validation error: workers.validation_gates[${i}].cwd must be null/omitted — worker gates always run against the worktree`);
+    }
+  });
+
+  if (workers.enabled) {
+    if (!adapterNames.some((n) => isEnabled(n))) {
+      throw new Error('Config validation error: workers.enabled requires at least one enabled adapter');
+    }
+    if (!isEnabled(routing.default_implementer)) {
+      throw new Error(`Config validation error: workers.routing.default_implementer "${routing.default_implementer}" must name an enabled adapter`);
+    }
+    for (const [taskType, override] of Object.entries(routing.by_task_type ?? {})) {
+      if (isDefined(override.reviewer) && !isEnabled(override.reviewer)) {
+        throw new Error(`Config validation error: workers.routing.by_task_type.${taskType}.reviewer "${override.reviewer}" names a disabled adapter`);
+      }
+    }
+    if (!workers.validation.allow_no_validation && !workers.validation_gates.some((g) => g.required === true)) {
+      throw new Error(
+        'Config validation error: workers.enabled requires at least one required validation gate (or set workers.validation.allow_no_validation: true)'
+      );
+    }
+  }
+
+  return { ...workers, workspace_root: workspaceRoot, worktree_dir: wd, adapters };
+}
+
 function mergeDeep<T extends object>(target: T, source: Partial<T>): T {
   const result = { ...target };
   for (const key of Object.keys(source) as (keyof T)[]) {
@@ -193,6 +341,7 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     throw new Error('Config validation error: recovery.exhausted_poll_interval_s must be a positive integer');
   }
   validateGates(merged.gates.gates);
+  const workers = validateWorkers(merged.workers);
 
   if (merged.slack.enabled) {
     if (!merged.slack.bot_token_env || !merged.slack.app_token_env) {
@@ -218,6 +367,7 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     daemon: merged.daemon,
     statusline: { ...merged.statusline, directory: statuslineDirectory },
     journal: { path: journalPath },
+    workers,
   };
 }
 

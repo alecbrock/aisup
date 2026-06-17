@@ -8,6 +8,7 @@ coverage/
 *.log
 .DS_Store
 .aisup/
+.aisup-workers/
 diagnostics/
 *.tmp
 *.swp

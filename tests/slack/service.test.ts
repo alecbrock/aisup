@@ -622,4 +622,89 @@ describe('SlackService', () => {
     await svc.stop();
     vi.useRealTimers();
   });
+
+  // ---- Worker subcommands (Phase 3, MD-001) --------------------------------
+  async function dispatch(svc: SlackService, text: string): Promise<ReturnType<typeof vi.fn>> {
+    await svc.start();
+    const say = vi.fn();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    await messageHandler?.({ message: { text, user: 'U123', channel: 'C123' }, say });
+    return say;
+  }
+
+  // Bind a started service so multiple messages share one ConfirmationStore (request → !confirm).
+  async function bind(svc: SlackService): Promise<(text: string, say: ReturnType<typeof vi.fn>) => Promise<void>> {
+    await svc.start();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results.at(-1)?.value;
+    const messageHandler = appInstance.message.mock.calls[0]?.[0];
+    return async (text, say) => {
+      await messageHandler?.({ message: { text, user: 'U123', channel: 'C123' }, say });
+    };
+  }
+
+  it('!worker approve <id> requires !confirm before invoking onWorkerApprove (ConfirmationStore)', async () => {
+    const onWorkerApprove = vi.fn().mockResolvedValue({ ok: true });
+    const svc = new SlackService({
+      config: makeConfig(), sessionManager: sessionManager as never, tmuxSocket: 'aisup-test',
+      journal: journal as never, channelMapPath, onWorkerApprove,
+    });
+    const send = await bind(svc);
+
+    const say1 = vi.fn();
+    await send('!worker approve abc-123', say1);
+    expect(onWorkerApprove).not.toHaveBeenCalled(); // no merge without confirmation
+    expect(say1).toHaveBeenCalledWith(expect.stringMatching(/!confirm/i));
+
+    const say2 = vi.fn();
+    await send('!confirm', say2);
+    expect(onWorkerApprove).toHaveBeenCalledWith('abc-123');
+    expect(say2).toHaveBeenCalledWith(expect.stringMatching(/approve ok/i));
+  });
+
+  it('!worker deny <id> requires !confirm, then reports no-op when the action did not apply', async () => {
+    const onWorkerDeny = vi.fn().mockResolvedValue({ ok: false, reason: 'not_awaiting_approval' });
+    const svc = new SlackService({
+      config: makeConfig(), sessionManager: sessionManager as never, tmuxSocket: 'aisup-test',
+      journal: journal as never, channelMapPath, onWorkerDeny,
+    });
+    const send = await bind(svc);
+
+    const say1 = vi.fn();
+    await send('!worker deny abc-123', say1);
+    expect(onWorkerDeny).not.toHaveBeenCalled();
+    expect(say1).toHaveBeenCalledWith(expect.stringMatching(/!confirm/i));
+
+    const say2 = vi.fn();
+    await send('!confirm', say2);
+    expect(onWorkerDeny).toHaveBeenCalledWith('abc-123');
+    expect(say2).toHaveBeenCalledWith(expect.stringMatching(/did not apply/i));
+  });
+
+  it('bare !deny still routes to the permission-denial command, not the worker surface (MD-001)', async () => {
+    const onPermissionDeny = vi.fn().mockResolvedValue(true);
+    const onWorkerDeny = vi.fn().mockResolvedValue({ ok: true });
+    const svc = new SlackService({
+      config: makeConfig(), sessionManager: sessionManager as never, tmuxSocket: 'aisup-test',
+      journal: journal as never, channelMapPath, onPermissionDeny, onWorkerDeny,
+    });
+    const say = await dispatch(svc, '!deny');
+    expect(onPermissionDeny).toHaveBeenCalledWith('sess-001');
+    expect(onWorkerDeny).not.toHaveBeenCalled(); // worker surface untouched
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/permission denied/i));
+  });
+
+  it('!worker status reports current worker states', async () => {
+    const getWorkerStatus = vi.fn().mockReturnValue([
+      { task: { id: 'w-1', title: 'do x' }, status: 'AWAITING_APPROVAL' },
+    ]);
+    const svc = new SlackService({
+      config: makeConfig(), sessionManager: sessionManager as never, tmuxSocket: 'aisup-test',
+      journal: journal as never, channelMapPath, getWorkerStatus,
+    });
+    const say = await dispatch(svc, '!worker status');
+    expect(say).toHaveBeenCalledWith(expect.stringMatching(/w-1.*AWAITING_APPROVAL/s));
+  });
 });

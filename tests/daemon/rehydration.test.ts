@@ -461,3 +461,114 @@ describe('rehydrateSessions', () => {
     expect(appendCalls).toContain('session.destroyed_externally');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Worker rehydration (Task 10): subprocess phases fail; MERGING reconciles
+// against the patch (HI-003); QUEUED/AWAITING_APPROVAL are preserved.
+// ---------------------------------------------------------------------------
+import { WorkerOrchestrator, type WorktreeOps } from '../../src/workers/orchestrator.js';
+import { WorkerStore } from '../../src/workers/store.js';
+import { CONFIG_DEFAULTS } from '../../src/config/defaults.js';
+import type { WorkersConfig } from '../../src/config/schema.js';
+import type { WorkerState, WorkerStatus, WorkerOutput } from '../../src/workers/types.js';
+import type { JournalEvent } from '../../src/journal/types.js';
+import { randomUUID } from 'node:crypto';
+
+function workerCfg(): WorkersConfig {
+  const c = JSON.parse(JSON.stringify(CONFIG_DEFAULTS.workers)) as WorkersConfig;
+  c.enabled = true;
+  c.adapters.codex.enabled = true;
+  c.adapters.gemini.enabled = true;
+  return c;
+}
+
+function seedWorker(store: WorkerStore, status: WorkerStatus, output: WorkerOutput | null, granted = false): string {
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  store.create({
+    id, task_type: 'implement', title: 't', prompt: 'p', base_ref: 'HEAD', base_sha: 'sha',
+    implementer: 'codex', reviewer: 'gemini', workspace_root: '/repo', created_at: now, updated_at: now,
+  });
+  const patch: Partial<WorkerState> = { status, output };
+  if (granted) patch.approval = { decided: true, granted: true, by: 'u', at: now };
+  store.patch(id, patch);
+  return id;
+}
+
+function mkOutput(): WorkerOutput {
+  return {
+    exit_code: 0, timed_out: false, stdout_tail: '', stderr_tail: '',
+    patch: 'p', patch_path: '/repo/.aisup-workers/x/patch.diff', patch_sha256: 'h', patch_bytes: 1,
+    changed_files: ['x.ts'], boundary_ok: true,
+  };
+}
+
+function rehydrationHarness(stateDir: string, applyReverse: boolean, applyOk: boolean): { orch: WorkerOrchestrator; store: WorkerStore; events: JournalEvent[] } {
+  const events: JournalEvent[] = [];
+  const store = new WorkerStore(stateDir);
+  const wt: WorktreeOps = {
+    resolveBaseSha: async () => 'sha', createWorktree: async () => '/wt', captureDiff: async () => ({ patch: '', changedFiles: [] }),
+    snapshotMainTree: async () => ({ status: '', forbidden: {} }), auditBoundary: async () => true,
+    sanitizePatch: () => ({ ok: true, violations: [] }), patchSha256: () => 'h', removeWorktree: async () => {},
+    isGitRepo: async () => true, applyCheck: async () => applyOk, applyReverseCheck: async () => applyReverse,
+  };
+  const orch = new WorkerOrchestrator({
+    store, config: workerCfg(), journal: { append: async (e) => { events.push(e); } }, worktreeOps: wt,
+    runImplementer: async () => ({ code: 0, stdout: '', stderr: '', timedOut: false }),
+    validateOutput: async () => ({ passed: true, failed_gates: [] }),
+    reviewOutput: async () => ({ reviewer: 'gemini', verdict: 'approve', degraded: false, findings: [], raw_output_tail: '' }),
+    mergeOutput: async () => ({ merged: true, reason: null, resetApproval: false }),
+    resolveActiveSessionCwd: () => '/repo',
+  });
+  return { orch, store, events };
+}
+
+describe('worker rehydration (HI-003)', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'aisup-wreh-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('fails in-flight subprocess phases and preserves QUEUED / AWAITING_APPROVAL', async () => {
+    const h = rehydrationHarness(dir, false, true);
+    const running = seedWorker(h.store, 'RUNNING', null);
+    const validating = seedWorker(h.store, 'VALIDATING', null);
+    const reviewing = seedWorker(h.store, 'REVIEWING', mkOutput());
+    const queued = seedWorker(h.store, 'QUEUED', null);
+    const awaiting = seedWorker(h.store, 'AWAITING_APPROVAL', mkOutput());
+
+    await h.orch.rehydrateWorkers();
+
+    expect(h.store.read(running)!.status).toBe('FAILED');
+    expect(h.store.read(validating)!.status).toBe('FAILED');
+    expect(h.store.read(reviewing)!.status).toBe('FAILED');
+    expect(h.store.read(queued)!.status).toBe('QUEUED');
+    expect(h.store.read(awaiting)!.status).toBe('AWAITING_APPROVAL');
+    expect(h.events.filter((e) => e.event_type === 'worker.rehydrated_failed').length).toBe(3);
+  });
+
+  it('reconciles a MERGING worker whose patch is already applied → MERGED + worker.rehydrated_merged', async () => {
+    const h = rehydrationHarness(dir, true, false); // reverse-check passes → already applied
+    const id = seedWorker(h.store, 'MERGING', mkOutput(), true);
+    await h.orch.rehydrateWorkers();
+    expect(h.store.read(id)!.status).toBe('MERGED');
+    expect(h.events.some((e) => e.event_type === 'worker.rehydrated_merged')).toBe(true);
+  });
+
+  it('reconciles a MERGING worker interrupted before apply → AWAITING_APPROVAL with approval reset (HI-006)', async () => {
+    const h = rehydrationHarness(dir, false, true); // reverse fails, apply --check passes → no apply happened
+    const id = seedWorker(h.store, 'MERGING', mkOutput(), true);
+    await h.orch.rehydrateWorkers();
+    const s = h.store.read(id)!;
+    expect(s.status).toBe('AWAITING_APPROVAL');
+    expect(s.approval.granted).toBe(false); // fresh approval required for any retry
+    expect(h.events.find((e) => e.event_type === 'worker.merge_failed')?.details.reason).toBe('merge_interrupted_before_apply');
+  });
+
+  it('reconciles a MERGING worker whose patch no longer applies → AWAITING_APPROVAL + apply_conflict', async () => {
+    const h = rehydrationHarness(dir, false, false); // neither reverse nor apply --check passes
+    const id = seedWorker(h.store, 'MERGING', mkOutput(), true);
+    await h.orch.rehydrateWorkers();
+    expect(h.store.read(id)!.status).toBe('AWAITING_APPROVAL');
+    expect(h.events.find((e) => e.event_type === 'worker.merge_failed')?.details.reason).toBe('apply_conflict');
+  });
+});

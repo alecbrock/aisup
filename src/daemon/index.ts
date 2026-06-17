@@ -21,6 +21,24 @@ import { PermissionDetector } from '../permissions/detector.js';
 import { PermissionBroker } from '../permissions/broker.js';
 import { runGates } from '../gates/engine.js';
 import type { GateRunResult } from '../gates/types.js';
+import { WorkerOrchestrator } from '../workers/orchestrator.js';
+import { WorkerStore } from '../workers/store.js';
+import { validateWorkerOutput } from '../workers/validation.js';
+import { reviewWorkerOutput } from '../workers/review.js';
+import { mergeWorkerOutput } from '../workers/merge.js';
+import {
+  resolveBaseSha,
+  createWorktree,
+  captureDiff,
+  snapshotMainTree,
+  auditBoundary,
+  sanitizePatch,
+  patchSha256,
+  removeWorktree,
+  isGitRepo,
+  applyCheck,
+  applyReverseCheck,
+} from '../workers/worktree.js';
 import { SwitchReason } from '../failover/types.js';
 import type { SwitchSnapshot } from '../failover/types.js';
 import type { LaunchMode } from '../failover/switcher.js';
@@ -75,6 +93,35 @@ async function main(): Promise<void> {
     outputLogRetentionDays: config.session.output_log_retention_days,
   });
 
+  // Multi-LLM worker orchestrator (Phase 3) — gated by config.workers.enabled. Constructed before
+  // the server so its handlers can be injected; rehydrated/started after session rehydration.
+  let workerOrchestrator: WorkerOrchestrator | undefined;
+  if (config.workers.enabled) {
+    const workerStore = new WorkerStore(join(AISUP_DIR, 'workers'));
+    workerOrchestrator = new WorkerOrchestrator({
+      store: workerStore,
+      config: config.workers,
+      journal,
+      worktreeOps: {
+        resolveBaseSha,
+        createWorktree,
+        captureDiff,
+        snapshotMainTree,
+        auditBoundary,
+        sanitizePatch,
+        patchSha256,
+        removeWorktree,
+        isGitRepo,
+        applyCheck,
+        applyReverseCheck,
+      },
+      validateOutput: validateWorkerOutput,
+      reviewOutput: reviewWorkerOutput,
+      mergeOutput: mergeWorkerOutput,
+      resolveActiveSessionCwd: () => sessionManager.getActiveSession()?.cwd ?? null,
+    });
+  }
+
   // Validation gates: run the configured executable/arg-array gates (manual via API/Slack/CLI,
   // automatic via the idle+skill trigger). The latest run is cached for GET /api/gates.
   let latestGateRun: GateRunResult | null = null;
@@ -99,6 +146,9 @@ async function main(): Promise<void> {
       onPermissionDeny: (sessionId) => permissionBrokerRef?.resolveFromSlack(sessionId, 'deny') ?? Promise.resolve(false),
       onGateRun: runConfiguredGates,
       getLatestGateRun: () => latestGateRun,
+      onWorkerApprove: workerOrchestrator ? (id) => workerOrchestrator!.approve(id, 'slack') : undefined,
+      onWorkerDeny: workerOrchestrator ? (id) => workerOrchestrator!.deny(id, 'slack') : undefined,
+      getWorkerStatus: workerOrchestrator ? () => workerOrchestrator!.list() : undefined,
     });
   }
 
@@ -113,6 +163,12 @@ async function main(): Promise<void> {
     runner: config.runner,
     runGates: runConfiguredGates,
     getLatestGateRun: () => latestGateRun,
+    dispatchWorker: workerOrchestrator ? (input) => workerOrchestrator!.dispatch(input) : undefined,
+    listWorkers: workerOrchestrator ? () => workerOrchestrator!.list() : undefined,
+    getWorker: workerOrchestrator ? (id) => workerOrchestrator!.get(id) : undefined,
+    approveWorker: workerOrchestrator ? (id, by) => workerOrchestrator!.approve(id, by) : undefined,
+    denyWorker: workerOrchestrator ? (id, by) => workerOrchestrator!.deny(id, by) : undefined,
+    cancelWorker: workerOrchestrator ? (id) => workerOrchestrator!.cancel(id) : undefined,
     onSessionStart: (session) => slackService?.onSessionStart(session),
     onSessionStop: (session) => {
       // R13: a stopped session ends the recovery cycle — clear its restart + network windows.
@@ -318,6 +374,10 @@ async function main(): Promise<void> {
   // R8/Task 7 handoff: re-arm the exhausted poller for sessions rehydrated as EXHAUSTED.
   // start() is a no-op when auto_resume_exhausted is disabled.
   for (const sessionId of exhaustedSessionIds) exhaustedRecovery.start(sessionId);
+
+  // Worker rehydration: reconcile interrupted workers (in-flight → FAILED, MERGING reconciled
+  // against the patch) and pump any QUEUED workers (Phase 3, HI-003).
+  if (workerOrchestrator) await workerOrchestrator.start();
 
   // Register tmux timeout handler — emits tmux.command_timeout journal events
   setTmuxTimeoutHandler((event) => {

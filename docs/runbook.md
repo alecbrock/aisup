@@ -161,6 +161,133 @@ lsof -i :<port>
 
 ---
 
+## Multi-LLM Workers (Phase 3)
+
+A **worker** runs a bounded coding task with an LLM CLI (Codex / Gemini / local) inside an isolated
+detached git worktree, validates the output diff with the gate engine, has a **different** model
+review it, and — only after **explicit user approval** — applies the diff to the main workspace as a
+working-tree patch. aisup never auto-commits and never auto-merges.
+
+### Enabling workers
+
+Workers are **off by default**. Add a `workers` section to `~/.aisup/config.yaml`:
+
+```yaml
+workers:
+  enabled: true
+  workspace_root: null            # null ⇒ resolved at dispatch: --workspace > this > active lead session cwd
+  worktree_dir: ".aisup-workers"  # relative to workspace_root; MUST be gitignored
+  max_concurrent: 2
+  retention:
+    keep_merged: false            # remove worktree after merge
+    keep_rejected: true           # keep rejected/failed worktrees for inspection
+    max_age_hours: 168
+  security:
+    env_allowlist: ["PATH", "HOME", "LANG"]   # effective allowlist = union(this, adapter.env_allowlist)
+    boundary_audit: true          # MUST be true
+    forbidden_path_globs:
+      - "**/.claude/settings.local.json"
+      - "**/.claude/transcripts/**"
+      - "**/*.jsonl"
+      - "**/*.tmux-capture"
+      - "**/*.pem"
+      - "**/.env"
+      - "**/.env.*"
+  adapters:
+    codex:  { command: "codex",  args: [], prompt_via: "arg",   enabled: false }
+    gemini: { command: "gemini", args: [], prompt_via: "arg",   enabled: false }
+    local:  { command: "",       args: [], prompt_via: "stdin", enabled: false }
+  routing:
+    default_implementer: "codex"
+    default_reviewer: "gemini"
+    by_task_type: {}              # e.g. { bugfix: { implementer: codex, reviewer: gemini } }
+  review:
+    allow_same_model_review: false  # the ONLY review knob; parse failure ALWAYS rejects (fail-closed)
+  validation_gates:               # GateCommandConfig[] run with cwd=worktree; each gate's cwd MUST be null
+    - { name: typecheck, command: "npm", args: ["run", "typecheck"], timeout_seconds: 120, required: true, cwd: null }
+  validation:
+    allow_no_validation: false    # fail-CLOSED: with no REQUIRED gate, validation FAILS (no zero-check merge)
+  merge:
+    require_approval: true        # MUST be true — no auto-merge
+    apply_check_required: true
+```
+
+- The adapter `codex`/`gemini`/`local` presets ship **disabled** with conservative defaults and
+  **no invented CLI flags** — set `command`/`args`/`prompt_via` to match your installed CLI version.
+- `.aisup-workers/` must be gitignored (it is in this repo's `.gitignore`); the loader warns if not.
+- With `workers.enabled: true` you must have ≥1 enabled adapter, a `default_implementer` that resolves
+  to an **enabled** adapter, and (unless `validation.allow_no_validation: true`) ≥1 `required`
+  validation gate — otherwise the config is rejected.
+
+### Operating workers
+
+Worker execution lives in the daemon; the CLI talks to it over the localhost API.
+
+```bash
+aisup worker dispatch --task-type implement --prompt "add a retry to fetchUser" --workspace ~/proj
+aisup worker dispatch --prompt @task.md            # load the prompt from a file
+aisup worker list
+aisup worker status <id>                            # status, changed files, gates, review, approval
+aisup worker review <id>                            # cross-model review verdict (read-only)
+aisup worker logs <id>                              # sanitized stdout/stderr tails + artifact paths
+aisup worker approve <id>                           # apply the patch to the main workspace
+aisup worker deny <id>
+aisup worker cancel <id>
+```
+
+`dispatch` returns immediately (`202`/`QUEUED`); the pipeline runs in the background and pauses at
+`AWAITING_APPROVAL`. Lifecycle:
+`QUEUED → RUNNING → IMPLEMENTED → VALIDATING → REVIEWING → AWAITING_APPROVAL → MERGING → MERGED`
+(terminal: `MERGED`/`FAILED`/`REJECTED`/`CANCELLED`).
+
+**Where approval lives:** worker approval is available via the CLI (`aisup worker approve <id>`) and
+the daemon HTTP API (localhost, `config.daemon.port`, default `7394`). Slack offers the same actions
+as **subcommands**: `!worker status`, `!worker approve <id>`, `!worker deny <id>` (bare `!deny`
+remains the permission-denial command — it is not overloaded). Because approving applies a patch to
+the workspace, `!worker approve <id>`/`!worker deny <id>` are **two-step**: the request is staged and
+you must reply `!confirm` within 60s (same `ConfirmationStore` gate as `!stop`).
+
+### Security boundary (state precisely)
+
+The enforceable guarantees are:
+1. **Only the worktree git diff is ever a merge candidate** — a write anywhere else can never reach
+   the main workspace through merge (structural diff-scoping).
+2. **Main-workspace and configured forbidden-path changes are detected** by the boundary audit —
+   ignored-aware `git status --porcelain --ignored` plus a content-hash snapshot that also catches
+   **content changes to pre-existing ignored files** (e.g. an existing `.env`).
+3. **Trusted-CLI `$HOME` writes are redirected** into a per-task throwaway `HOME` inside the worktree
+   (`.home/`), which is excluded from the diff.
+
+**Accepted residual:** an arbitrary absolute-path write **outside `workspace_root` and outside the
+temp HOME** (e.g. `/tmp`, `/etc`) is **neither prevented nor detected** in Phase 3 — the audit only
+snapshots the workspace tree and the configured forbidden-path set. The structural diff-scoping still
+guarantees such writes never reach the merge candidate. OS sandboxing (`sandbox-exec`) is the named
+deferred hardening. Threat model: accidental escape by a CLI the operator already trusts — not an
+adversarial binary.
+
+Merge applies a **working-tree patch only** (`git apply` after `git apply --check`); aisup never runs
+`add`/`commit`/`push`/`reset`/`clean`/`branch` against the main workspace. The sole automatic
+`git add` is the worktree-local `add -A -N` intent-to-add (isolated worktree only). Approval is
+required for **every** merge — after an apply conflict or a patch-artifact hash mismatch, approval is
+reset and a fresh approval is required before any retry.
+
+### Operability notes
+
+- **Fresh-worktree deps:** validation gates run in a clean nested worktree with no installed deps.
+  Node gates resolve the parent repo's `node_modules` via upward lookup (the worktree is nested under
+  `workspace_root`); other ecosystems (pnpm/Yarn-PnP, Python venv, Go) must self-provision in the
+  gate command.
+- **Large patches:** reviewer adapters should prefer `prompt_via: stdin` or `file` over a positional
+  `arg` so a large diff cannot exceed `ARG_MAX`/`E2BIG`.
+- **Committed base:** workers branch from the committed `base_ref` (default `HEAD`) resolved to an
+  immutable `base_sha`, so uncommitted main-tree edits are not seen by the worker and advancing the
+  source branch after dispatch does not change the applied result.
+- **Host-gated tests:** real provider CLIs are exercised only behind host gates
+  (`AISUP_TEST_CODEX=1` / `AISUP_TEST_GEMINI=1` / `AISUP_TEST_LOCAL_LLM=1`); the always-run
+  deterministic suite uses fake `node -e` adapters. See `tests/integration/WORKER_HOST_GATES.md`.
+
+---
+
 ## Live Gate Execution Checklist
 
 Operator checklist for full MVP validation (run after automated tests pass):

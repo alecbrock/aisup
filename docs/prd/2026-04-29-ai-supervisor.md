@@ -121,12 +121,20 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 > - **Phase 1 implemented:** the Supervisor Daemon, Smart Account Selection, Proactive
 >   Failover, core Reactive Recovery, Slack Remote Control (E), Workflow Skill Propagation,
 >   and the Event Journal + Status CLI (I) are implemented and verified.
-> - **Phase 2 scope (in progress):** D₂ auth/network/exhausted recovery, the Permission
+> - **Phase 2 implemented and verified:** D₂ auth/network/exhausted recovery, the Permission
 >   Fallback Broker (F), Slack approval routing, the supervisor Validation Gate Engine (H₁),
->   and Cost/Token Tracking (K). **Remote-control reconnect after an account switch is
->   explicitly deferred** pending investigation of Claude Code remote-control behavior; the
->   existing `runner.remote_control_prefix` remains supported but no reconnect orchestration
->   ships in Phase 2.
+>   and Cost/Token Tracking (K) are complete and verified (see
+>   `docs/plans/2026-05-11-phase2-aisup-supervisor-daemon.md` — `Status: VERIFIED`; the Round 3
+>   compliance audit in `docs/reviews/2026-06-02-phase2-spec-verify-findings.md` is CLEAN).
+>   **Remote-control reconnect after an account switch is explicitly deferred** pending
+>   investigation of Claude Code remote-control behavior; the existing
+>   `runner.remote_control_prefix` remains supported but no reconnect orchestration ships in
+>   Phase 2.
+> - **Phase 3 implemented:** Multi-LLM Worker Orchestration (G) and the worker Validation Gate
+>   Engine (H₂) — bounded LLM workers in isolated git worktrees, cross-model review, and
+>   approval-gated working-tree merge. Includes the CLI (`aisup worker …`), the localhost worker
+>   API, and Slack `!worker` subcommands (`status`/`approve`/`deny`). Real provider CLIs are
+>   exercised behind host gates; the always-run suite uses fake adapters.
 > - **Cost windows:** `aisup cost` reports rolling `today`, `last_7d`, and `last_30d` windows
 >   as the Phase 2 implementation of daily/weekly visibility; itemized calendar summaries
 >   remain deferred.
@@ -270,15 +278,15 @@ To stop using Pilot Shell: change `command` to `claude`, adjust `args` as needed
 | B | Smart Account Selection (registry, scoring, best-account pick) | MVP | Implemented (Phase 1) |
 | C | Proactive Rate-Limit Failover (85%/95% thresholds, full switch sequence) | MVP | Implemented (Phase 1) |
 | D₁ | Reactive Recovery — core (429 regex, crash restart, circuit breaker) | MVP | Implemented (Phase 1) |
-| D₂ | Reactive Recovery — full (auth failure, exhausted, network; RC reconnect deferred) | Phase 2 | In progress |
+| D₂ | Reactive Recovery — full (auth failure, exhausted, network; RC reconnect deferred) | Phase 2 | Implemented (Phase 2) |
 | E | Slack Remote Control (channel per session, bidirectional relay, control cmds) | MVP | Implemented (Phase 1) |
-| F | Permission Fallback Broker (observability, one-time grant, policy allowlist) | Phase 2 | In progress |
-| G | Multi-LLM Worker Orchestration (Codex, Gemini, local; worktrees; review gate) | Phase 3 | Approved |
-| H₁ | Validation Gate Engine — supervisor (test/lint/type-check after completion) | Phase 2 | In progress |
-| H₂ | Validation Gate Engine — workers (gates on worker output before merge) | Phase 3 | Approved |
+| F | Permission Fallback Broker (observability, one-time grant, policy allowlist) | Phase 2 | Implemented (Phase 2) |
+| G | Multi-LLM Worker Orchestration (Codex, Gemini, local; worktrees; review gate) | Phase 3 | Implemented (Phase 3) |
+| H₁ | Validation Gate Engine — supervisor (test/lint/type-check after completion) | Phase 2 | Implemented (Phase 2) |
+| H₂ | Validation Gate Engine — workers (gates on worker output before merge) | Phase 3 | Implemented (Phase 3) |
 | I | Event Journal + Status CLI (JSONL, start/status/log/accounts/stop/attach) | MVP | Implemented (Phase 1) |
 | J | Workflow Skill Propagation (detect active skill, propagate on resume) | MVP | Implemented (Phase 1) |
-| K | Cost/Token Tracking (aggregation, `aisup cost` CLI, rolling windows) | Phase 2 | In progress |
+| K | Cost/Token Tracking (aggregation, `aisup cost` CLI, rolling windows) | Phase 2 | Implemented (Phase 2) |
 | L | Mobile Status Dashboard (HTTP endpoint, auto-refresh, token auth) | Phase 4 | Approved |
 
 ## State Model

@@ -105,6 +105,70 @@ export interface JournalConfig {
   path: string;
 }
 
+export interface WorkerAdapterConfig {
+  name: string;
+  command: string;
+  args: string[];
+  prompt_via: 'arg' | 'stdin' | 'file';
+  prompt_arg_flag: string | null;
+  prompt_file_flag: string | null;
+  env_allowlist: string[];
+  timeout_seconds: number;
+  enabled: boolean;
+}
+
+export interface WorkerRouteOverride {
+  implementer: string;
+  reviewer: string;
+}
+
+export interface WorkerRoutingConfig {
+  default_implementer: string;
+  default_reviewer: string;
+  by_task_type: Record<string, WorkerRouteOverride>;
+}
+
+export interface WorkerReviewConfig {
+  allow_same_model_review: boolean;
+}
+
+export interface WorkerValidationConfig {
+  allow_no_validation: boolean;
+}
+
+export interface WorkerRetentionConfig {
+  keep_merged: boolean;
+  keep_rejected: boolean;
+  max_age_hours: number;
+}
+
+export interface WorkerSecurityConfig {
+  env_allowlist: string[];
+  boundary_audit: boolean;
+  forbidden_path_globs: string[];
+}
+
+export interface WorkerMergeConfig {
+  require_approval: boolean;
+  apply_check_required: boolean;
+}
+
+export interface WorkersConfig {
+  enabled: boolean;
+  workspace_root: string | null;
+  worktree_dir: string;
+  base_ref: string;
+  max_concurrent: number;
+  retention: WorkerRetentionConfig;
+  security: WorkerSecurityConfig;
+  adapters: Record<string, WorkerAdapterConfig>;
+  routing: WorkerRoutingConfig;
+  review: WorkerReviewConfig;
+  validation_gates: GateCommandConfig[];
+  validation: WorkerValidationConfig;
+  merge: WorkerMergeConfig;
+}
+
 export interface AisupConfig {
   accounts: AccountConfig[];
   runner: RunnerConfig;
@@ -120,4 +184,5 @@ export interface AisupConfig {
   daemon: DaemonConfig;
   statusline: StatuslineConfig;
   journal: JournalConfig;
+  workers: WorkersConfig;
 }

@@ -443,4 +443,75 @@ describe('daemon HTTP server', () => {
     expect(body.events).toHaveLength(2);
     expect(body.events.every((e) => e.event_type === 'cost.snapshot')).toBe(true);
   });
+
+  // ---- Worker routes (Phase 3) ---------------------------------------------
+  const auth = (): Record<string, string> => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
+
+  it('POST /api/workers returns 202 {id,status:QUEUED} without awaiting the pipeline (MD-002)', async () => {
+    let dispatched: unknown = null;
+    app = await createDaemonServer({
+      tokenPath, host: '127.0.0.1', port: 0,
+      dispatchWorker: async (input) => { dispatched = input; return 'worker-id-1'; },
+    });
+    app.setReady();
+    const res = await app.inject({
+      method: 'POST', url: '/api/workers', headers: auth(),
+      body: JSON.stringify({ task_type: 'implement', prompt: 'do it' }),
+    });
+    expect(res.statusCode).toBe(202);
+    const body = res.json<{ id: string; status: string }>();
+    expect(body).toEqual({ id: 'worker-id-1', status: 'QUEUED' });
+    expect(dispatched).toMatchObject({ task_type: 'implement', prompt: 'do it' });
+  });
+
+  it('POST /api/workers returns 400 when task_type/prompt missing', async () => {
+    app = await createDaemonServer({ tokenPath, host: '127.0.0.1', port: 0, dispatchWorker: async () => 'x' });
+    app.setReady();
+    const res = await app.inject({ method: 'POST', url: '/api/workers', headers: auth(), body: JSON.stringify({ prompt: 'p' }) });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('worker routes return 503 when workers are not enabled', async () => {
+    app = await createDaemonServer({ tokenPath, host: '127.0.0.1', port: 0 }); // no worker handlers
+    app.setReady();
+    const post = await app.inject({ method: 'POST', url: '/api/workers', headers: auth(), body: JSON.stringify({ task_type: 't', prompt: 'p' }) });
+    expect(post.statusCode).toBe(503);
+    const list = await app.inject({ method: 'GET', url: '/api/workers', headers: auth() });
+    expect(list.statusCode).toBe(503);
+  });
+
+  it('GET /api/workers and /:id return state; approve/deny/cancel reach the injected handlers', async () => {
+    const fakeWorker = { task: { id: 'w1' }, status: 'AWAITING_APPROVAL' };
+    const calls: string[] = [];
+    app = await createDaemonServer({
+      tokenPath, host: '127.0.0.1', port: 0,
+      listWorkers: () => [fakeWorker as never],
+      getWorker: (id) => (id === 'w1' ? (fakeWorker as never) : null),
+      approveWorker: async (id) => { calls.push(`approve:${id}`); return { ok: true }; },
+      denyWorker: async (id) => { calls.push(`deny:${id}`); return { ok: true }; },
+      cancelWorker: async (id) => { calls.push(`cancel:${id}`); return { ok: false, reason: 'terminal' }; },
+    });
+    app.setReady();
+
+    const list = await app.inject({ method: 'GET', url: '/api/workers', headers: auth() });
+    expect(list.json<{ workers: unknown[] }>().workers).toHaveLength(1);
+
+    const get = await app.inject({ method: 'GET', url: '/api/workers/w1', headers: auth() });
+    expect(get.statusCode).toBe(200);
+    const missing = await app.inject({ method: 'GET', url: '/api/workers/nope', headers: auth() });
+    expect(missing.statusCode).toBe(404);
+
+    const approve = await app.inject({ method: 'POST', url: '/api/workers/w1/approve', headers: auth(), body: JSON.stringify({ by: 'tester' }) });
+    expect(approve.statusCode).toBe(200);
+    const cancel = await app.inject({ method: 'POST', url: '/api/workers/w1/cancel', headers: auth(), body: '{}' });
+    expect(cancel.statusCode).toBe(409); // ok:false → 409
+    expect(calls).toEqual(['approve:w1', 'cancel:w1']);
+  });
+
+  it('worker routes require the bearer token (401 without it)', async () => {
+    app = await createDaemonServer({ tokenPath, host: '127.0.0.1', port: 0, listWorkers: () => [] });
+    app.setReady();
+    const res = await app.inject({ method: 'GET', url: '/api/workers' });
+    expect(res.statusCode).toBe(401);
+  });
 });

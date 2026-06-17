@@ -17,6 +17,13 @@ import { readEvents } from '../journal/reader.js';
 import { aggregateCosts } from '../cost/aggregator.js';
 import type { GateRunResult } from '../gates/types.js';
 import { readTelemetryForAccount } from '../statusline/store.js';
+import type { WorkerState } from '../workers/types.js';
+import type { DispatchInput } from '../workers/orchestrator.js';
+
+export interface WorkerActionResult {
+  ok: boolean;
+  reason?: string;
+}
 
 export interface DaemonServerOptions {
   tokenPath: string;
@@ -43,6 +50,13 @@ export interface DaemonServerOptions {
   runGates?: () => Promise<GateRunResult>;
   /** Latest gate run for GET /api/gates. */
   getLatestGateRun?: () => GateRunResult | null;
+  /** Worker orchestrator handlers (injected when workers.enabled); absent ⇒ 503 from /api/workers. */
+  dispatchWorker?: (input: DispatchInput) => Promise<string>;
+  listWorkers?: () => WorkerState[];
+  getWorker?: (id: string) => WorkerState | null;
+  approveWorker?: (id: string, by: string) => Promise<WorkerActionResult>;
+  denyWorker?: (id: string, by: string) => Promise<WorkerActionResult>;
+  cancelWorker?: (id: string) => Promise<WorkerActionResult>;
 }
 
 declare module 'fastify' {
@@ -237,6 +251,62 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     const result = await opts.runGates();
     return reply.send(result);
   });
+
+  // ---- Multi-LLM workers (Phase 3) -----------------------------------------
+  // POST returns immediately with 202/QUEUED — the pipeline runs in the background (MD-002).
+  app.post('/api/workers', async (req, reply) => {
+    if (!opts.dispatchWorker) return reply.code(503).send({ error: 'workers not enabled' });
+    const body = (req.body ?? {}) as Partial<DispatchInput>;
+    if (!body.task_type || !body.prompt) {
+      return reply.status(400).send({ error: 'task_type and prompt are required' });
+    }
+    try {
+      const id = await opts.dispatchWorker({
+        task_type: body.task_type,
+        prompt: body.prompt,
+        title: body.title,
+        implementer: body.implementer,
+        reviewer: body.reviewer,
+        base_ref: body.base_ref,
+        workspace: body.workspace,
+      });
+      return reply.status(202).send({ id, status: 'QUEUED' });
+    } catch (err) {
+      return reply.status(400).send({ error: String(err instanceof Error ? err.message : err) });
+    }
+  });
+
+  app.get('/api/workers', async (_req, reply) => {
+    if (!opts.listWorkers) return reply.code(503).send({ error: 'workers not enabled' });
+    return reply.send({ workers: opts.listWorkers() });
+  });
+
+  app.get('/api/workers/:id', async (req, reply) => {
+    if (!opts.getWorker) return reply.code(503).send({ error: 'workers not enabled' });
+    const { id } = req.params as { id: string };
+    const worker = opts.getWorker(id);
+    if (!worker) return reply.status(404).send({ error: 'worker not found' });
+    return reply.send({ worker });
+  });
+
+  const workerAction = async (
+    handler: ((id: string, by: string) => Promise<WorkerActionResult>) | undefined,
+    req: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<FastifyReply> => {
+    if (!handler) return reply.code(503).send({ error: 'workers not enabled' });
+    const { id } = req.params as { id: string };
+    const by = ((req.body ?? {}) as { by?: string }).by ?? 'api';
+    const result = await handler(id, by);
+    if (result.ok) return reply.send({ ok: true });
+    return reply.status(409).send({ ok: false, error: result.reason ?? 'failed' });
+  };
+
+  app.post('/api/workers/:id/approve', (req, reply) => workerAction(opts.approveWorker, req, reply));
+  app.post('/api/workers/:id/deny', (req, reply) => workerAction(opts.denyWorker, req, reply));
+  app.post('/api/workers/:id/cancel', (req, reply) =>
+    workerAction(opts.cancelWorker ? (id) => opts.cancelWorker!(id) : undefined, req, reply)
+  );
 
   app.get('/api/accounts', async (_req, reply) => {
     if (!opts.accountRegistry) {

@@ -86,7 +86,30 @@ export type EventType =
   | 'tmux.command_timeout'
   // Output log
   | 'output_log.rotated'
-  | 'output_log.cursor_reset';
+  | 'output_log.cursor_reset'
+  // Workers
+  | 'worker.queued'
+  | 'worker.dispatched'
+  | 'worker.completed'
+  | 'worker.failed'
+  | 'worker.validated'
+  | 'worker.validation_failed'
+  | 'worker.review_started'
+  | 'worker.review_passed'
+  | 'worker.review_failed'
+  | 'worker.review_degraded'
+  | 'worker.awaiting_approval'
+  | 'worker.approved'
+  | 'worker.denied'
+  | 'worker.merge_started'
+  | 'worker.merged'
+  | 'worker.merge_failed'
+  | 'worker.boundary_violation'
+  | 'worker.security_denied'
+  | 'worker.cancelled'
+  | 'worker.cleanup'
+  | 'worker.rehydrated_failed'
+  | 'worker.rehydrated_merged';
 
 export interface JournalEvent {
   ts: string;
