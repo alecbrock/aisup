@@ -10,6 +10,7 @@ import { listSessions } from '../../session/tmux.js';
 import { AccountRegistry } from '../../accounts/registry.js';
 import { CircuitBreaker } from '../../accounts/circuit-breaker.js';
 import { refreshAccountScores } from '../../accounts/refresh.js';
+import { UsageLedger } from '../../accounts/usage-ledger.js';
 import { selectSwitchTarget } from '../../failover/switcher.js';
 import type { AisupConfig } from '../../config/schema.js';
 import type { AccountInfo } from '../../accounts/types.js';
@@ -37,6 +38,7 @@ export function selectDryRunAccount(config: AisupConfig, circuitBreakerStatePath
     softPct: config.thresholds.soft_pct,
     hardPct: config.thresholds.hard_pct,
     circuitBreaker,
+    ledger: new UsageLedger(join(homedir(), '.aisup', 'usage-ledger.json'), config.statusline.freshness_window_s * 1000),
   });
   return selectSwitchTarget(registry.getAll(), '', []);
 }

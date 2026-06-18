@@ -11,6 +11,7 @@ import { SessionManager } from '../session/manager.js';
 import { AccountRegistry } from '../accounts/registry.js';
 import { CircuitBreaker } from '../accounts/circuit-breaker.js';
 import { refreshAccountScores } from '../accounts/refresh.js';
+import { UsageLedger } from '../accounts/usage-ledger.js';
 import { buildLaunchCommand, buildResumeCommand, validateRunner } from '../runner/builder.js';
 import { rehydrateSessions } from './rehydration.js';
 import { setTmuxTimeoutHandler, sendText, sendEnter, captureOutput } from '../session/tmux.js';
@@ -74,8 +75,15 @@ async function main(): Promise<void> {
   });
   const tmuxSocket = config.session.tmux_socket;
 
-  // Refresh account scores/state from telemetry + circuit breaker before any automatic
-  // selection decision (start admission, soft/hard failover). Without this, scores stay
+  // Persistent per-account usage ledger: captures live usage while a session is active and decays
+  // idle windows to 0% once their reset passes, so scoring/selection never trusts stale telemetry.
+  const usageLedger = new UsageLedger(
+    join(AISUP_DIR, 'usage-ledger.json'),
+    config.statusline.freshness_window_s * 1000,
+  );
+
+  // Refresh account scores/state from telemetry (via the ledger) + circuit breaker before any
+  // automatic selection decision (start admission, soft/hard failover). Without this, scores stay
   // null and the canonical selector falls back to priority order, ignoring scoring.
   const refreshAccounts = (): void => refreshAccountScores({
     registry: accountRegistry,
@@ -84,6 +92,7 @@ async function main(): Promise<void> {
     softPct: config.thresholds.soft_pct,
     hardPct: config.thresholds.hard_pct,
     circuitBreaker,
+    ledger: usageLedger,
   });
 
   const sessionManager = new SessionManager({
@@ -180,6 +189,7 @@ async function main(): Promise<void> {
     refreshAccounts,
     statuslineDir: config.statusline.directory,
     statuslineFreshnessWindowS: config.statusline.freshness_window_s,
+    usageLedger,
     // Lifecycle cost snapshots: stop/manual-failover live in server.ts, so the snapshot/cleanup
     // are injected from the loop manager (late-bound; no-op until it exists).
     captureCostSnapshot: (id, trigger) => loopManagerRef?.captureFinalCostSnapshot(id, trigger),
@@ -476,6 +486,7 @@ async function main(): Promise<void> {
       idleBoundarySeconds: config.thresholds.idle_boundary_seconds,
       statuslineDir: config.statusline.directory,
       statuslineFreshnessWindowS: config.statusline.freshness_window_s,
+      usageLedger,
       tmuxSocket,
       networkErrorThreshold: config.recovery.network_error_threshold,
       journal,

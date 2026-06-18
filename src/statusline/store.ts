@@ -110,6 +110,26 @@ export function readTelemetryForAccount(
   return null;
 }
 
+/**
+ * Like readTelemetryForAccount but also returns the file mtime (epoch ms) — the moment the data was
+ * true — so the usage ledger can tag entries live/aged accurately rather than assuming "now".
+ */
+export function readTelemetryWithMtimeForAccount(
+  configDir: string,
+  statuslineDir: string,
+  freshnessWindowS: number
+): { telemetry: StatuslineTelemetry; mtimeMs: number } | null {
+  const files = listTelemetryFiles(statuslineDir, freshnessWindowS);
+  for (const { path, mtime } of files) {
+    const t = parseTelemetry(path);
+    if (!t) continue;
+    if (!t.transcript_path) continue;
+    if (!transcriptMatchesAccount(t.transcript_path, configDir)) continue;
+    return { telemetry: t, mtimeMs: mtime.getTime() };
+  }
+  return null;
+}
+
 export interface SessionTelemetryResult {
   telemetry: StatuslineTelemetry | null;
   mismatch: string | null;

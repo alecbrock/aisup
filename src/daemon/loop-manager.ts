@@ -9,6 +9,7 @@ import { isProcessDead, hasSession } from '../session/tmux.js';
 import { readTelemetryForActiveSession } from '../statusline/store.js';
 import { selectSwitchTarget } from '../failover/switcher.js';
 import { refreshAccountScores } from '../accounts/refresh.js';
+import type { UsageLedger } from '../accounts/usage-ledger.js';
 import { SwitchReason } from '../failover/types.js';
 import { detectSkill } from '../skills/detector.js';
 import type { SessionManager } from '../session/manager.js';
@@ -47,6 +48,8 @@ export interface LoopManagerDeps {
   idleBoundarySeconds: number;
   statuslineDir: string;
   statuslineFreshnessWindowS: number;
+  /** Shared usage ledger so failover-time refresh uses decayed estimates, not stale telemetry. */
+  usageLedger?: UsageLedger;
   tmuxSocket: string;
   /** Consecutive network errors required before escalating to a same-account restart. */
   networkErrorThreshold: number;
@@ -653,6 +656,7 @@ export class LoopManager {
       softPct: d.softPct,
       hardPct: d.hardPct,
       circuitBreaker: d.circuitBreaker,
+      ledger: d.usageLedger,
     });
   }
 

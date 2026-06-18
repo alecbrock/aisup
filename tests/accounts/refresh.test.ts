@@ -6,6 +6,7 @@ import { AccountRegistry } from '../../src/accounts/registry.js';
 import { CircuitBreaker } from '../../src/accounts/circuit-breaker.js';
 import { refreshAccountScores } from '../../src/accounts/refresh.js';
 import { selectSwitchTarget } from '../../src/failover/switcher.js';
+import { UsageLedger } from '../../src/accounts/usage-ledger.js';
 import type { AisupConfig } from '../../src/config/schema.js';
 
 const NOW_EPOCH = Math.floor(Date.now() / 1000);
@@ -148,5 +149,30 @@ describe('refreshAccountScores', () => {
     registry.setScore('primary', 42); // stale score from a prior refresh
     refreshAccountScores({ registry, statuslineDir, freshnessWindowS: 300, softPct: 85, hardPct: 95 });
     expect(registry.get('primary')?.score).toBeNull();
+  });
+
+  it('with a ledger, decays a window whose reset has passed so a stale-high account scores as fresh', () => {
+    const dir = accountDir('primary');
+    const PAST = NOW_EPOCH - 3600; // both windows already reset
+    writeTelemetry(dir, 90, 80, PAST); // raw 90%/80% but reset is in the past → decays to 0%
+    const registry = makeRegistry([{ name: 'primary', dir, priority: 1 }]);
+    const ledger = new UsageLedger(join(tmpDir, 'ledger.json'), 5 * 60 * 1000);
+
+    refreshAccountScores({ registry, statuslineDir, freshnessWindowS: 300, softPct: 85, hardPct: 95, ledger });
+
+    const acct = registry.get('primary')!;
+    expect(acct.state).toBe('HEALTHY'); // decayed 0% → not degraded despite raw 90%
+    expect(acct.score!).toBeGreaterThan(95); // computeScore(0,0) = 100
+  });
+
+  it('with a ledger, a not-yet-reset high-usage account still drives DEGRADED', () => {
+    const dir = accountDir('primary');
+    writeTelemetry(dir, 88, 20, FUTURE_EPOCH); // reset in the future → value held (not decayed)
+    const registry = makeRegistry([{ name: 'primary', dir, priority: 1 }]);
+    const ledger = new UsageLedger(join(tmpDir, 'ledger.json'), 5 * 60 * 1000);
+
+    refreshAccountScores({ registry, statuslineDir, freshnessWindowS: 300, softPct: 85, hardPct: 95, ledger });
+
+    expect(registry.get('primary')?.state).toBe('DEGRADED');
   });
 });

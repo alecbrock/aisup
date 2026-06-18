@@ -33,7 +33,7 @@ function listStatuslineFiles(dir: string): { path: string; mtime: Date }[] {
   }
 }
 
-function computeScore(five: number, seven: number): number {
+export function computeScore(five: number, seven: number): number {
   return (100 - five) * 0.7 + (100 - seven) * 0.3;
 }
 

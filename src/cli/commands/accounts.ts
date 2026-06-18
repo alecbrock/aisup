@@ -32,12 +32,15 @@ export async function showAccounts(): Promise<void> {
       accounts: Array<{
         name: string; state: string; score: number | null; enabled?: boolean;
         five_hour_pct?: number | null; seven_day_pct?: number | null; model?: string | null; cooldown_until?: string | null;
+        five_hour_basis?: string | null; seven_day_basis?: string | null;
       }>;
     };
     for (const acct of body.accounts) {
       const score = acct.score !== null ? `${acct.score.toFixed(0)}%` : 'no data';
+      const fb = acct.five_hour_basis ? ` (${acct.five_hour_basis})` : '';
+      const sb = acct.seven_day_basis ? ` (${acct.seven_day_basis})` : '';
       const usage = typeof acct.five_hour_pct === 'number' && typeof acct.seven_day_pct === 'number'
-        ? `5h ${acct.five_hour_pct.toFixed(0)}%, 7d ${acct.seven_day_pct.toFixed(0)}%`
+        ? `5h ${acct.five_hour_pct.toFixed(0)}%${fb}, 7d ${acct.seven_day_pct.toFixed(0)}%${sb}`
         : 'no data';
       const model = acct.model ?? '—';
       const cooldown = acct.cooldown_until ?? '—';
@@ -55,8 +58,6 @@ async function showAccountsOffline(): Promise<void> {
     const config = await loadConfig();
     for (const acct of config.accounts) {
       const telemetry = readTelemetryForAccount(acct.config_dir, config.statusline.directory, config.statusline.freshness_window_s);
-      const five = telemetry?.rate_limits?.five_hour?.used_percentage;
-      const seven = telemetry?.rate_limits?.seven_day?.used_percentage;
       const model = telemetry?.model?.id ?? '—';
       const cooldown = telemetry?.rate_limits
         ? new Date(Math.max(
@@ -64,9 +65,16 @@ async function showAccountsOffline(): Promise<void> {
           telemetry.rate_limits.seven_day?.resets_at ?? 0
         ) * 1000).toISOString()
         : '—';
-      const usage = typeof five === 'number' && typeof seven === 'number'
-        ? `5h ${five.toFixed(0)}%, 7d ${seven.toFixed(0)}%`
-        : 'no data';
+      // Apply the same decay as the ledger: a window past its reset reads 0% (provably reset).
+      const nowSec = Date.now() / 1000;
+      const decay = (w?: { used_percentage?: number; resets_at?: number }): string | null => {
+        if (typeof w?.used_percentage !== 'number') return null;
+        if (typeof w.resets_at === 'number' && nowSec >= w.resets_at) return '0% (reset)';
+        return `${w.used_percentage.toFixed(0)}% (stale)`;
+      };
+      const five = decay(telemetry?.rate_limits?.five_hour);
+      const seven = decay(telemetry?.rate_limits?.seven_day);
+      const usage = five !== null && seven !== null ? `5h ${five}, 7d ${seven}` : 'no data';
       console.log(`  ${acct.name}: ${acct.enabled ? 'enabled' : 'disabled'} (${usage}, model: ${model}, cooldown: ${cooldown})`);
     }
   } catch (err) {

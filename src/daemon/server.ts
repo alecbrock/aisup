@@ -17,6 +17,7 @@ import { readEvents } from '../journal/reader.js';
 import { aggregateCosts } from '../cost/aggregator.js';
 import type { GateRunResult } from '../gates/types.js';
 import { readTelemetryForAccount } from '../statusline/store.js';
+import type { UsageLedger } from '../accounts/usage-ledger.js';
 import type { WorkerState } from '../workers/types.js';
 import type { DispatchInput } from '../workers/orchestrator.js';
 
@@ -42,6 +43,8 @@ export interface DaemonServerOptions {
   /** Statusline telemetry source for /api/accounts usage/model parity with offline `aisup accounts`. */
   statuslineDir?: string;
   statuslineFreshnessWindowS?: number;
+  /** Usage ledger: /api/accounts reports decayed best-estimate usage + freshness basis from it. */
+  usageLedger?: UsageLedger;
   /** Emit a final cost snapshot at a lifecycle boundary (pre-stop / pre-manual-failover). */
   captureCostSnapshot?: (sessionId: string, trigger: string) => void;
   /** Drop a session's cost tracking on terminal stop. */
@@ -312,18 +315,24 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     if (!opts.accountRegistry) {
       return reply.send({ accounts: [] });
     }
+    // Refresh first so scores/state + the ledger reflect the latest live telemetry and decay.
+    await opts.refreshAccounts?.();
     const slDir = opts.statuslineDir;
     const freshness = opts.statuslineFreshnessWindowS ?? 300;
+    const nowMs = Date.now();
     const accounts = opts.accountRegistry.getAll().map((a) => {
-      // Read telemetry so online /api/accounts matches offline `aisup accounts` (usage + model).
+      // model still comes from telemetry; usage comes from the ledger's decayed estimate.
       const telemetry = slDir ? readTelemetryForAccount(a.configDir, slDir, freshness) : null;
-      const five = telemetry?.rate_limits?.five_hour?.used_percentage;
-      const seven = telemetry?.rate_limits?.seven_day?.used_percentage;
+      const est = opts.usageLedger?.estimate(a.name, nowMs);
+      const five = est ? est.five_hour.used_pct : (telemetry?.rate_limits?.five_hour?.used_percentage ?? null);
+      const seven = est ? est.seven_day.used_pct : (telemetry?.rate_limits?.seven_day?.used_percentage ?? null);
       return {
         name: a.name, state: a.state, priority: a.priority, enabled: a.enabled, score: a.score,
         cooldown_until: a.cooldownUntil ? a.cooldownUntil.toISOString() : null,
         five_hour_pct: typeof five === 'number' ? five : null,
         seven_day_pct: typeof seven === 'number' ? seven : null,
+        five_hour_basis: est?.five_hour.basis ?? null,
+        seven_day_basis: est?.seven_day.basis ?? null,
         model: telemetry?.model?.id ?? null,
       };
     });
