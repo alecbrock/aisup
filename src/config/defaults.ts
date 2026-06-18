@@ -2,7 +2,10 @@ import type { AisupConfig } from './schema.js';
 
 export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts'> = {
   runner: {
-    command: 'pilot',
+    // Modern Pilot Shell is hook-integrated into Claude Code (running `pilot` alone just prints a
+    // banner and exits), so the runner that actually launches a session is `claude` — Pilot's hooks,
+    // skills, and rules load automatically. Set to another CLI to detach.
+    command: 'claude',
     args: [],
     resume_flag: '--resume',
     config_dir_env: 'CLAUDE_CONFIG_DIR',

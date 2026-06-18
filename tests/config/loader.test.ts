@@ -69,7 +69,7 @@ accounts:
 
     const config = await loadConfig(join(configDir, 'config.yaml'));
 
-    expect(config.runner.command).toBe('pilot');
+    expect(config.runner.command).toBe('claude');
     expect(config.runner.resume_flag).toBe('--resume');
     expect(config.runner.config_dir_env).toBe('CLAUDE_CONFIG_DIR');
     expect(config.thresholds.soft_pct).toBe(85);
@@ -217,7 +217,7 @@ accounts:
     expect(config.accounts.length).toBeGreaterThan(0);
     expect(config.accounts[0].name).toBe('primary');
     // Default runner/threshold values applied
-    expect(config.runner.command).toBe('pilot');
+    expect(config.runner.command).toBe('claude');
     expect(config.thresholds.soft_pct).toBe(85);
     // File is written to disk
     const { existsSync } = await import('node:fs');

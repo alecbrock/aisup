@@ -430,6 +430,10 @@ export class LoopManager {
     const paneDead = isProcessDead(d.tmuxSocket, session.tmux_name);
 
     if (!paneDead) {
+      // Pane is alive → any prior crash is resolved; clear the crash-restart counter (this is how
+      // genuine recovery is confirmed — NOT merely onRestart() returning true, which a launch-then-
+      // exit runner also does while flapping). networkErrors has its own lifecycle, not cleared here.
+      this.restartAttempts.delete(session.aisup_session_id);
       // Pane alive — scan new output before advancing cursor.
       let cursor = this.recoveryHandler.getCursor(session.aisup_session_id);
       if (!cursor) {
@@ -611,33 +615,38 @@ export class LoopManager {
       return;
     }
 
-    // No 429 — attempt a same-account restart and track FAILED restarts in a rolling window.
-    const restarted = await d.onRestart(session.aisup_session_id);
-    if (restarted) {
-      // A successful restart resolves the incident and clears the failure windows.
-      this.restartAttempts.delete(session.aisup_session_id);
-      this.networkErrors.delete(session.aisup_session_id);
-      return;
-    }
-
+    // No 429 — same-account restart, bounded by a rolling window. Count EVERY crash pass, not only
+    // outright restart failures: a runner that launches then immediately exits makes onRestart()
+    // return true (a pane was spawned) yet re-enters here next tick, which previously cleared the
+    // counter and looped forever. Genuine recovery is instead confirmed by the pane being alive on a
+    // later tick (which clears the counter above).
     const now = Date.now();
     const attempts = this.restartAttempts.get(session.aisup_session_id);
     if (!attempts || (now - attempts.firstAt) >= RESTART_FAILURE_WINDOW_MS) {
-      // First failure, or the previous window has rolled over — start a fresh window.
+      // First crash, or the previous window has rolled over — start a fresh window.
       this.restartAttempts.set(session.aisup_session_id, { count: 1, firstAt: now });
     } else {
       attempts.count += 1;
     }
+    const count = this.restartAttempts.get(session.aisup_session_id)?.count ?? 0;
 
-    if ((this.restartAttempts.get(session.aisup_session_id)?.count ?? 0) >= MAX_RESTARTS_BEFORE_SWITCH) {
-      // Third failed restart inside the window — escalate to an account switch.
-      this.restartAttempts.delete(session.aisup_session_id);
-      if (this.failoverInProgress) return;
-      this.failoverInProgress = true;
-      await d.onSwitch(session.aisup_session_id, SwitchReason.RestartFailures).finally(() => {
-        this.failoverInProgress = false;
-      });
+    // Attempt a same-account restart on each pass up to the cap.
+    const restarted = await d.onRestart(session.aisup_session_id);
+    if (count < MAX_RESTARTS_BEFORE_SWITCH) {
+      if (restarted) this.networkErrors.delete(session.aisup_session_id);
+      return; // under the cap — if the restart holds, the next alive tick clears the counter
     }
+
+    // count >= cap within the window: a failing OR flapping (launch-then-exit) runner. Stop
+    // same-account restarts, record a circuit-breaker failure (trips → COOLDOWN + Slack alert via
+    // the exhausted/no-target path when no account remains), and escalate to a switch.
+    this.restartAttempts.delete(session.aisup_session_id);
+    this.recordRateLimitFailure(d, session.account, session.aisup_session_id, 'restart_failures');
+    if (this.failoverInProgress) return;
+    this.failoverInProgress = true;
+    await d.onSwitch(session.aisup_session_id, SwitchReason.RestartFailures).finally(() => {
+      this.failoverInProgress = false;
+    });
   }
 
   /** Clear a session's recovery counters (restart-failure window + network-error window)

@@ -76,7 +76,7 @@ thresholds:
   soft_pct: 85    # switch at idle when usage reaches this
   hard_pct: 95    # interrupt and switch immediately
 runner:
-  command: pilot  # or claude
+  command: claude  # launches Claude Code (Pilot Shell hooks load automatically); set to another CLI to detach
   resume_flag: --resume
 slack:
   enabled: false  # set true and configure tokens to enable

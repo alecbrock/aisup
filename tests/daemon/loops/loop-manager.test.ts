@@ -670,25 +670,47 @@ describe('LoopManager with deps', () => {
     expect(deps.onSwitch).toHaveBeenCalledWith(sessionId, SwitchReason.RestartFailures);
   });
 
-  it('clears the restart failure counter after a successful restart', async () => {
+  it('clears the restart counter when the pane recovers (alive) — genuine recovery', async () => {
     const { tmpDir, deps, sessionId } = makeFakeDeps();
     cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
-    deps.onRestart = vi.fn()
-      .mockResolvedValueOnce(false) // fail 1
-      .mockResolvedValueOnce(false) // fail 2
-      .mockResolvedValueOnce(true)  // success → counter cleared
-      .mockResolvedValue(false);    // subsequent failures start a fresh window
+    deps.onRestart = vi.fn().mockResolvedValue(true);
     const lm = deadPaneLoop(deps, sessionId);
     const tick = () => (lm as unknown as { recoveryTick(d: LoopManagerDeps): Promise<void> }).recoveryTick(deps as unknown as LoopManagerDeps);
 
-    await tick(); // fail 1
-    await tick(); // fail 2
-    await tick(); // success → clears
-    await tick(); // fail (count restarts at 1)
-    await tick(); // fail (count 2)
+    await tick(); // crash 1 (pane dead)
+    await tick(); // crash 2 (pane dead)
+    tmuxMocks.isProcessDead.mockReturnValue(false); // pane recovers → counter cleared on this tick
+    await tick(); // alive tick clears the crash counter (genuine recovery)
+    tmuxMocks.isProcessDead.mockReturnValue(true);  // dies again → fresh window
+    await tick(); // crash 1 (fresh window)
+    await tick(); // crash 2 (fresh window)
 
-    // Never reached three consecutive failures, so no escalation.
+    // Never three crashes within one window → no escalation (recovery reset the counter).
     expect(deps.onSwitch).not.toHaveBeenCalled();
+  });
+
+  it('bounds a flapping launch-then-exit runner: escalates + records a breaker failure (F2)', async () => {
+    const { tmpDir, deps, sessionId } = makeFakeDeps();
+    cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
+    // onRestart "succeeds" (a pane is spawned) every time, but the pane keeps dying → flapping.
+    // Previously this cleared the counter each tick and looped forever; now it must be bounded.
+    deps.onRestart = vi.fn().mockResolvedValue(true);
+    const recordFailure = vi.fn();
+    (deps as unknown as { circuitBreaker: unknown }).circuitBreaker = {
+      getState: vi.fn().mockReturnValue('CLOSED'),
+      recordFailure,
+      getCooldownEta: vi.fn().mockReturnValue(null),
+    };
+    const lm = deadPaneLoop(deps, sessionId); // pane stays dead each tick (flapping)
+    const tick = () => (lm as unknown as { recoveryTick(d: LoopManagerDeps): Promise<void> }).recoveryTick(deps as unknown as LoopManagerDeps);
+
+    await tick(); // crash 1, onRestart→true
+    await tick(); // crash 2, onRestart→true
+    expect(deps.onSwitch).not.toHaveBeenCalled(); // not looping forever on the same account
+    await tick(); // crash 3 → bounded → escalate
+
+    expect(deps.onSwitch).toHaveBeenCalledWith(sessionId, SwitchReason.RestartFailures);
+    expect(recordFailure).toHaveBeenCalledWith('primary'); // circuit-breaker failure recorded
   });
 
   it('does not escalate when failed restarts fall outside the five-minute window', async () => {
