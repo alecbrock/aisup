@@ -29,6 +29,22 @@ describe('detect429InOutput', () => {
     expect(detect429InOutput('Task 3 completed successfully')).toBe(false);
   });
 
+  // Innocent text that merely mentions rate limits must NOT trigger a failover. Regression for the
+  // 2026-06-18 spurious 429: the /spec autocomplete example "add rate limiting to the login endpoint"
+  // matched the old bare /rate limit/i and forced an account switch.
+  it('should NOT detect a feature description that mentions rate limiting', () => {
+    expect(detect429InOutput('/spec add rate limiting to the login endpoint')).toBe(false);
+    expect(detect429InOutput('implement rate limiting middleware for the API')).toBe(false);
+  });
+
+  it('should NOT detect an unrelated "wait N minutes" with no retry context', () => {
+    expect(detect429InOutput('wait 5 minutes for the build to finish')).toBe(false);
+  });
+
+  it('should NOT detect a "usage cap" feature mention without an error verb', () => {
+    expect(detect429InOutput('we should add a usage cap to the billing tier')).toBe(false);
+  });
+
   it('should strip ANSI escape codes before matching', () => {
     // ANSI color code wrapping "rate limit" text
     const ansiWrapped = '\x1b[31mrate limit exceeded\x1b[0m';

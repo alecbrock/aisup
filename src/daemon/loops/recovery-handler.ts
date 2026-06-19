@@ -1,12 +1,17 @@
 import { openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import stripAnsi from 'strip-ansi';
 
+// Real rate-limit/quota errors only. Each pattern requires error/quota context so innocent prose
+// ("add rate limiting to the endpoint", "wait 5 minutes for the build") never forces a failover —
+// the bare /rate limit/i and /wait.*minutes/i caused exactly that (spurious 429, 2026-06-18).
 const RATE_LIMIT_PATTERNS = [
-  /rate limit/i,
+  /\b429\b/,
   /too many requests/i,
-  /429/,
-  /usage cap/i,
-  /wait.*minutes/i,
+  /rate_limit_error/i,
+  /\b(?:hit|exceeded|reached)\b[^.\n]{0,25}\brate[ _-]?limit/i,                  // "hit/exceeded/reached … rate limit"
+  /\brate[ _-]?limit(?:ed|ing)?\b[^.\n]{0,25}\b(?:error|exceeded|reached|reset)/i, // "rate limit exceeded/reached/reset"
+  /\b(?:reached|hit|exceeded)\b[^.\n]{0,25}usage (?:cap|limit)/i,                // "reached your usage cap/limit"
+  /wait[^.\n]{0,30}(?:minutes?|hours?)[^.\n]{0,20}(?:retry|retrying)/i,          // "wait N minutes … retry"
 ];
 
 export function detect429InOutput(text: string): boolean {
