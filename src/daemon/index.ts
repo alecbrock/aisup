@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { RotatingLog } from '../util/rotating-log.js';
 import { loadConfig } from '../config/loader.js';
 import { createJournalWriter } from '../journal/writer.js';
@@ -20,6 +20,12 @@ import { RecoveryHandler } from './loops/recovery-handler.js';
 import { ExhaustedRecovery, resumeExhaustedSession } from '../recovery/exhausted.js';
 import { PermissionDetector } from '../permissions/detector.js';
 import { PermissionBroker } from '../permissions/broker.js';
+import { evaluatePermission } from '../permissions/policy.js';
+import type { PermissionRequest } from '../permissions/types.js';
+import type { PermissionHookRequest } from './server.js';
+import { writeHookSettings } from '../hooks/claude-hooks.js';
+import { resolveSkillFromCommandName } from '../skills/detector.js';
+import { buildContinuationPrompt } from '../skills/continuation.js';
 import { runGates } from '../gates/engine.js';
 import type { GateRunResult } from '../gates/types.js';
 import { WorkerOrchestrator } from '../workers/orchestrator.js';
@@ -50,6 +56,25 @@ const AISUP_DIR = join(homedir(), '.aisup');
 const PID_PATH = join(AISUP_DIR, 'daemon.pid');
 const TOKEN_PATH = join(AISUP_DIR, 'api-token');
 const LOG_PATH = join(AISUP_DIR, 'daemon.log');
+// The PermissionRequest hook is non-blocking (it posts to Slack and defers to Claude's dialog), so
+// it returns in milliseconds — a short timeout is plenty. The human decision has no time limit: it
+// arrives later as a keystroke to the persistent dialog, independent of any hook timeout.
+const PERMISSION_HOOK_TIMEOUT_S = 30;
+
+/** Human-readable summary of a tool's input for the Slack permission prompt (command/path/url first). */
+function summarizeToolInput(toolInput: unknown): string {
+  if (toolInput && typeof toolInput === 'object') {
+    const o = toolInput as Record<string, unknown>;
+    for (const key of ['command', 'file_path', 'path', 'url', 'pattern'] as const) {
+      if (typeof o[key] === 'string') return o[key] as string;
+    }
+  }
+  try {
+    return JSON.stringify(toolInput) ?? 'unknown';
+  } catch {
+    return String(toolInput);
+  }
+}
 
 async function main(): Promise<void> {
   await mkdir(AISUP_DIR, { recursive: true, mode: 0o700 });
@@ -94,6 +119,27 @@ async function main(): Promise<void> {
     circuitBreaker,
     ledger: usageLedger,
   });
+
+  // Install aisup-managed Claude Code hooks (structured skill + permission detection) into every
+  // supervised session via `claude --settings`, then point launches at it. Additive — no edits to
+  // the user's account or repo settings. The bearer token is embedded (file written 0600).
+  const hooksSettingsPath = join(AISUP_DIR, 'claude-hooks.json');
+  try {
+    const apiToken = (await readFile(TOKEN_PATH, 'utf8')).trim();
+    if (apiToken) {
+      writeHookSettings(hooksSettingsPath, {
+        port: config.daemon.port,
+        token: apiToken,
+        includeSkill: true,
+        includePermission: config.permissions.enabled,
+        // Permissions never auto-deny — the hook waits for a human decision (24h ceiling).
+        permissionTimeoutS: PERMISSION_HOOK_TIMEOUT_S,
+      });
+      config.runner.args = [...config.runner.args, '--settings', hooksSettingsPath];
+    }
+  } catch {
+    // No api-token yet → skip hook install; detection falls back to existing pane-scan behavior.
+  }
 
   const sessionManager = new SessionManager({
     tmuxSocket,
@@ -141,6 +187,33 @@ async function main(): Promise<void> {
     return result;
   };
 
+  // Permission broker via Claude Code's PermissionRequest hook (F). The hook is the reliable
+  // *detector* (structured tool name + input); it does NOT block. It posts to Slack and lets the
+  // terminal dialog appear. `!permit`/`!deny` then resolves by sending a keystroke to that dialog —
+  // which never times out — so a human can decide minutes or hours later. Pending requests keyed by
+  // aisup session id (the dialog persists; the keystroke confirms whichever option the config names).
+  const hookPermissions = new Map<string, PermissionRequest>();
+  const sendPermissionKey = (aisupSessionId: string, approve: boolean): boolean => {
+    const s = sessionManager.readState(aisupSessionId);
+    if (!s || (s.status !== 'ACTIVE' && s.status !== 'SWITCH_PENDING_AT_IDLE')) return false;
+    sendText(tmuxSocket, s.tmux_name, approve ? config.permissions.approval_key : config.permissions.denial_key);
+    sendEnter(tmuxSocket, s.tmux_name);
+    return true;
+  };
+  const resolveHookPermissionViaKeystroke = (aisupSessionId: string, approve: boolean): boolean => {
+    const pending = hookPermissions.get(aisupSessionId);
+    if (!pending) return false;
+    hookPermissions.delete(aisupSessionId);
+    const sent = sendPermissionKey(aisupSessionId, approve);
+    void journal.append({
+      ts: new Date().toISOString(),
+      event_type: sent ? (approve ? 'permission.granted' : 'permission.denied') : 'permission.keystroke_unconfirmed',
+      aisup_session_id: aisupSessionId,
+      details: { tool: pending.tool, detail: pending.detail, source: 'hook' },
+    });
+    return sent;
+  };
+
   let slackService: SlackService | null = null;
   if (config.slack.enabled) {
     const channelMapPath = join(AISUP_DIR, 'channel-map.json');
@@ -151,8 +224,12 @@ async function main(): Promise<void> {
       journal,
       channelMapPath,
       permissionsConfig: config.permissions,
-      onPermissionGrant: (sessionId) => permissionBrokerRef?.resolveFromSlack(sessionId, 'grant') ?? Promise.resolve(false),
-      onPermissionDeny: (sessionId) => permissionBrokerRef?.resolveFromSlack(sessionId, 'deny') ?? Promise.resolve(false),
+      // Resolve a hook-routed permission via a keystroke to the persistent dialog; fall back to the
+      // legacy scrape broker if this session has no hook-pending permission.
+      onPermissionGrant: (sessionId) =>
+        resolveHookPermissionViaKeystroke(sessionId, true) ? Promise.resolve(true) : (permissionBrokerRef?.resolveFromSlack(sessionId, 'grant') ?? Promise.resolve(false)),
+      onPermissionDeny: (sessionId) =>
+        resolveHookPermissionViaKeystroke(sessionId, false) ? Promise.resolve(true) : (permissionBrokerRef?.resolveFromSlack(sessionId, 'deny') ?? Promise.resolve(false)),
       onGateRun: runConfiguredGates,
       getLatestGateRun: () => latestGateRun,
       onWorkerApprove: workerOrchestrator ? (id) => workerOrchestrator!.approve(id, 'slack') : undefined,
@@ -160,6 +237,51 @@ async function main(): Promise<void> {
       getWorkerStatus: workerOrchestrator ? () => workerOrchestrator!.list() : undefined,
     });
   }
+
+  // PermissionRequest hook handler (F): evaluate policy, then auto-decide or block on a Slack decision.
+  // PermissionRequest hook (F) — NON-BLOCKING detector. Returns 'deny' to hard-deny (denylist / no
+  // session), 'allow' for an allowlisted tool, or null to DEFER to Claude's terminal dialog (which
+  // never times out). The 'ask' path posts to Slack and registers a pending request; `!permit`/
+  // `!deny` later confirms the dialog with a keystroke. We never block the hook on a human, so
+  // Claude Code's hook-timeout cap is irrelevant and a decision can come minutes or hours later.
+  const onPermissionHook = async (req: PermissionHookRequest): Promise<'allow' | 'deny' | null> => {
+    const active = sessionManager.getActiveSession();
+    if (!active) return 'deny'; // no session to attribute → safe default (hook-deny works)
+    const detail = summarizeToolInput(req.toolInput);
+    const request: PermissionRequest = { tool: req.toolName, detail, raw: `${req.toolName}: ${detail}`.slice(0, 200) };
+
+    const decision = evaluatePermission(request, config.permissions.policy);
+    if (decision === 'grant' || decision === 'deny') {
+      void journal.append({
+        ts: new Date().toISOString(),
+        event_type: decision === 'grant' ? 'permission.auto_granted' : 'permission.auto_denied',
+        aisup_session_id: active.aisup_session_id,
+        details: { tool: request.tool, detail, source: 'hook' },
+      });
+      return decision === 'grant' ? 'allow' : 'deny';
+    }
+
+    // 'ask' but no Slack to ask → fall back to the policy default (no human available).
+    if (!config.permissions.slack_routing || !slackService) {
+      return config.permissions.policy.default_action === 'allow' ? 'allow' : 'deny';
+    }
+    // Register the pending request, post to Slack, and DEFER (null) so the dialog shows and waits.
+    hookPermissions.set(active.aisup_session_id, request);
+    void journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'permission.detected',
+      aisup_session_id: active.aisup_session_id,
+      details: { tool: request.tool, detail, source: 'hook' },
+    });
+    void slackService.notifyPermissionRequest(active.aisup_session_id, request);
+    void journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'permission.routed_to_slack',
+      aisup_session_id: active.aisup_session_id,
+      details: { tool: request.tool, detail },
+    });
+    return null;
+  };
 
   const server = await createDaemonServer({
     tokenPath: TOKEN_PATH,
@@ -170,6 +292,24 @@ async function main(): Promise<void> {
     journal,
     journalPath: config.journal.path,
     runner: config.runner,
+    createSessionForTarget: (target, snapshot, launchMode) => createSessionForTargetRef!(target, snapshot, launchMode),
+    onSkillHook: (commandName, claudeSessionId) => {
+      const skill = resolveSkillFromCommandName(commandName, config.skills.tracked);
+      if (!skill) return;
+      const active = sessionManager.getActiveSession();
+      if (!active) return;
+      // Attribute only to the matching live session (csid may not be bound yet → accept).
+      if (claudeSessionId && active.claude_session_id && active.claude_session_id !== claudeSessionId) return;
+      if (active.active_skill === skill) return;
+      sessionManager.patchState(active.aisup_session_id, { active_skill: skill });
+      void journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'skill.detected',
+        aisup_session_id: active.aisup_session_id,
+        details: { skill, previous_skill: active.active_skill ?? null, source: 'hook' },
+      });
+    },
+    onPermissionHook,
     runGates: runConfiguredGates,
     getLatestGateRun: () => latestGateRun,
     dispatchWorker: workerOrchestrator ? (input) => workerOrchestrator!.dispatch(input) : undefined,
@@ -184,6 +324,8 @@ async function main(): Promise<void> {
       loopManagerRef?.clearRecoveryCounters(session.aisup_session_id);
       // A terminal stop also ends any EXHAUSTED auto-resume polling for the session.
       exhaustedRecoveryRef?.stop(session.aisup_session_id);
+      // Drop any pending hook permission for the stopped session (its dialog/pane is gone).
+      hookPermissions.delete(session.aisup_session_id);
       return slackService?.onSessionStop(session.aisup_session_id);
     },
     refreshAccounts,
@@ -212,6 +354,11 @@ async function main(): Promise<void> {
   let loopManagerRef: LoopManager | undefined;
   let exhaustedRecoveryRef: ExhaustedRecovery | undefined;
   let permissionBrokerRef: PermissionBroker | undefined;
+  // Assigned after createSessionForTarget is defined; lets the server's /api/failover reuse the
+  // daemon's canonical launcher (continuation injection) instead of a divergent inline copy.
+  let createSessionForTargetRef:
+    | ((target: AccountInfo, snapshot: SwitchSnapshot, launchMode: LaunchMode) => Promise<SessionState>)
+    | undefined;
 
   // Shared target-launch callback: resume only when migration produced a valid transcript
   // in the target, else fresh. Used by both automatic failover and EXHAUSTED auto-resume.
@@ -232,7 +379,7 @@ async function main(): Promise<void> {
       });
     }
     const cwd = sessionManager.readState(snapshot.aisupSessionId)?.cwd ?? process.cwd();
-    return sessionManager.createSession({
+    const state = await sessionManager.createSession({
       aisupSessionId: snapshot.aisupSessionId,
       account: acct.name,
       accountConfigDir: acct.configDir,
@@ -242,7 +389,37 @@ async function main(): Promise<void> {
       cwd,
       planPath: snapshot.planFilePath,
     });
+
+    // Continuation prompt (J): nudge the resumed session to pick its skill/plan back up. Gated by
+    // resume_prompt_mode — 'always' = every switch, 'on-failure' = non-manual (failure-driven) only,
+    // 'never' = skip (default, zero added tokens). Best-effort, delayed so the resumed TUI is ready;
+    // never blocks the switch. --resume already restores full context; this is the explicit nudge.
+    const mode = config.session.resume_prompt_mode;
+    const wantContinuation =
+      // Only when an actual transcript was restored — a fresh launch has nothing to "continue".
+      launchMode === 'resumed' &&
+      (mode === 'always' || (mode === 'on-failure' && snapshot.reason !== SwitchReason.Manual));
+    if (wantContinuation && (snapshot.activeSkill || snapshot.planFilePath)) {
+      const prompt = buildContinuationPrompt({ activeSkill: snapshot.activeSkill, planPath: snapshot.planFilePath });
+      setTimeout(() => {
+        try {
+          sendText(tmuxSocket, state.tmux_name, prompt);
+          sendEnter(tmuxSocket, state.tmux_name);
+          void journal.append({
+            ts: new Date().toISOString(),
+            event_type: 'continuation.injected',
+            aisup_session_id: snapshot.aisupSessionId,
+            details: { account: acct.name, skill: snapshot.activeSkill ?? null, plan_path: snapshot.planFilePath ?? null },
+          });
+        } catch { /* best-effort; transcript resume already carries context */ }
+      }, 4000);
+    }
+    return state;
   };
+
+  // Expose the canonical launcher to the server's /api/failover (manual failover now injects the
+  // continuation prompt identically to automatic failover — no divergent inline launch logic).
+  createSessionForTargetRef = createSessionForTarget;
 
   // Daemon-level recovery callbacks. Defined before rehydration so the rehydration pass
   // can drive corrective recovery for interrupted switches and state-without-tmux sessions,

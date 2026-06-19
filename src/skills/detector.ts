@@ -9,6 +9,23 @@ const SKILL_PREFIX_MAP: Record<string, string> = {
 
 const LAUNCH_PATTERN = /Launching skill:\s+(\S+)/g;
 
+/**
+ * Resolve a tracked skill from a Claude Code `UserPromptExpansion` hook's `command_name`
+ * (e.g. `"prd"`, `"spec-plan"`). Structured, version-stable replacement for scraping a
+ * `Launching skill:` marker out of pane output (which Claude Code 2.1.181 no longer emits).
+ * Returns the tracked skill (e.g. `"/spec"`) or null when the command is not a tracked skill.
+ */
+export function resolveSkillFromCommandName(commandName: string, trackedSkills: string[]): string | null {
+  const raw = commandName.trim().replace(/^\//, '');
+  const trackedSet = new Set(trackedSkills);
+  for (const [prefix, skill] of Object.entries(SKILL_PREFIX_MAP)) {
+    if ((raw === prefix || raw.startsWith(`${prefix}-`)) && trackedSet.has(skill)) {
+      return skill;
+    }
+  }
+  return null;
+}
+
 /** Extract the tracked skill from output text, or null if none found. */
 export function detectSkill(output: string, trackedSkills: string[]): string | null {
   const trackedSet = new Set(trackedSkills);

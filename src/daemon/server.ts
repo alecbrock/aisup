@@ -10,7 +10,10 @@ import type { SessionManager } from '../session/manager.js';
 import type { AccountRegistry } from '../accounts/registry.js';
 import type { JournalWriter } from '../journal/types.js';
 import { validateManualFailoverTarget, performSwitch, selectSwitchTarget } from '../failover/switcher.js';
+import type { LaunchMode } from '../failover/switcher.js';
 import { SwitchReason } from '../failover/types.js';
+import type { SwitchSnapshot } from '../failover/types.js';
+import type { AccountInfo } from '../accounts/types.js';
 import { buildLaunchCommand, buildResumeCommand } from '../runner/builder.js';
 import type { RunnerConfig } from '../config/schema.js';
 import { readEvents } from '../journal/reader.js';
@@ -26,6 +29,13 @@ export interface WorkerActionResult {
   reason?: string;
 }
 
+/** A Claude Code PermissionRequest hook payload, normalized for the broker. */
+export interface PermissionHookRequest {
+  toolName: string;
+  toolInput: unknown;
+  claudeSessionId: string | null;
+}
+
 export interface DaemonServerOptions {
   tokenPath: string;
   host: string;
@@ -38,6 +48,9 @@ export interface DaemonServerOptions {
   runner?: RunnerConfig;
   onSessionStart?: (session: SessionState) => Promise<void> | void;
   onSessionStop?: (session: SessionState, force: boolean) => Promise<void> | void;
+  /** Canonical target launcher (resume/fresh + continuation injection). When provided, /api/failover
+   *  uses it so the manual path matches the automatic path exactly (no divergent launch logic). */
+  createSessionForTarget?: (target: AccountInfo, snapshot: SwitchSnapshot, launchMode: LaunchMode) => Promise<SessionState>;
   /** Refresh account scores/state from telemetry + circuit breaker before an automatic selection. */
   refreshAccounts?: () => void | Promise<void>;
   /** Statusline telemetry source for /api/accounts usage/model parity with offline `aisup accounts`. */
@@ -49,6 +62,11 @@ export interface DaemonServerOptions {
   captureCostSnapshot?: (sessionId: string, trigger: string) => void;
   /** Drop a session's cost tracking on terminal stop. */
   clearCostTracking?: (sessionId: string) => void;
+  /** Claude Code UserPromptExpansion hook: a skill/slash-command was invoked in the session. */
+  onSkillHook?: (commandName: string, claudeSessionId: string | null) => void;
+  /** Claude Code PermissionRequest hook: 'allow'/'deny' to decide, or null to defer to the dialog
+   *  (the ask-path posts to Slack and is resolved later by a keystroke — non-blocking). */
+  onPermissionHook?: (req: PermissionHookRequest) => Promise<'allow' | 'deny' | null>;
   /** Run the configured validation gates (manual trigger from API/Slack/CLI). */
   runGates?: () => Promise<GateRunResult>;
   /** Latest gate run for GET /api/gates. */
@@ -255,6 +273,40 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     return reply.send(result);
   });
 
+  // ---- Claude Code hooks (structured detection; replaces pane-output scraping) -------------
+  // UserPromptExpansion → which skill/slash-command was invoked. Fire-and-forget (200).
+  app.post('/api/hooks/skill', async (req, reply) => {
+    const body = (req.body ?? {}) as { command_name?: string; session_id?: string };
+    if (typeof body.command_name === 'string' && body.command_name.length > 0) {
+      opts.onSkillHook?.(body.command_name, body.session_id ?? null);
+    }
+    return reply.send({ ok: true });
+  });
+
+  // PermissionRequest → route to Slack and block until !permit/!deny (or the hook timeout). The
+  // returned JSON tells Claude Code to allow or deny, so no dialog/keystroke handling is needed.
+  app.post('/api/hooks/permission', async (req, reply) => {
+    const body = (req.body ?? {}) as { tool_name?: string; tool_input?: unknown; session_id?: string };
+    if (!opts.onPermissionHook) {
+      // Broker not wired → no decision; Claude Code's own permission flow proceeds.
+      return reply.send({});
+    }
+    const decision = await opts.onPermissionHook({
+      toolName: body.tool_name ?? 'unknown',
+      toolInput: body.tool_input ?? null,
+      claudeSessionId: body.session_id ?? null,
+    });
+    // null → defer to Claude's own dialog (the ask-path resolves later via a keystroke from Slack).
+    if (decision === null) return reply.send({});
+    return reply.send({
+      hookSpecificOutput: {
+        hookEventName: 'PermissionRequest',
+        permissionDecision: decision,
+        permissionDecisionReason: `aisup ${decision}`,
+      },
+    });
+  });
+
   // ---- Multi-LLM workers (Phase 3) -----------------------------------------
   // POST returns immediately with 202/QUEUED — the pipeline runs in the background (MD-002).
   app.post('/api/workers', async (req, reply) => {
@@ -380,7 +432,9 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
       {
         sessionManager: opts.sessionManager,
         journal: opts.journal,
-        createSessionForTarget: async (target, snapshot, launchMode) => {
+        // Prefer the daemon's canonical launcher (continuation injection + identical resume logic) so
+        // a manual `aisup failover` behaves exactly like an automatic one. Fallback is launch-only.
+        createSessionForTarget: opts.createSessionForTarget ?? (async (target, snapshot, launchMode) => {
           const commandForTarget = opts.runner
             ? ((launchMode === 'resumed' && snapshot.claudeSessionId)
               ? buildResumeCommand(opts.runner, target.configDir, snapshot.claudeSessionId)
@@ -396,7 +450,7 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
             cwd: currentState?.cwd ?? process.cwd(),
             planPath: snapshot.planFilePath,
           });
-        },
+        }),
       }
     );
 

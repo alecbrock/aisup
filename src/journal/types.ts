@@ -66,6 +66,7 @@ export type EventType =
   // Skill
   | 'skill.detected'
   | 'skill.transition'
+  | 'continuation.injected'
   // Daemon
   | 'daemon.started'
   | 'daemon.stopped'
