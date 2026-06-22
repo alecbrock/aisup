@@ -2,8 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildWorkerCommand, composeEnvAllowlist, resolveRouting } from './adapter.js';
+import type { WorkerLaunchPlan } from './adapter.js';
+import { buildClaudeWorkerCommand } from './claude-adapter.js';
+import { parseCodexJsonStream, chargeableTokens } from './codex-json.js';
+import { buildReviewPrompt } from './review.js';
+import type { ReviewerPlanOverride } from './review.js';
+import { runCandidateLoop } from './failover.js';
+import type { CandidateLoopHooks } from './failover.js';
 import { runWorker } from './runner.js';
-import type { WorkerExec } from './runner.js';
+import type { WorkerExec, WorkerExecResult } from './runner.js';
 import type { validateWorkerOutput } from './validation.js';
 import type { reviewWorkerOutput } from './review.js';
 import type { mergeWorkerOutput } from './merge.js';
@@ -11,7 +18,18 @@ import type { MainTreeSnapshot } from './worktree.js';
 import { WorkerStore } from './store.js';
 import type { WorkersConfig, WorkerAdapterConfig } from '../config/schema.js';
 import type { JournalWriter } from '../journal/types.js';
-import type { WorkerOutput, WorkerState, WorkerTask } from './types.js';
+import type { ConcreteCandidate } from '../providers/types.js';
+import type { WorkerOutput, WorkerState, WorkerTask, ReviewVerdict } from './types.js';
+
+export type WorkerRole = 'implementer' | 'reviewer';
+
+/** Default timeout for a Claude worker/reviewer candidate (no per-candidate adapter timeout). */
+const CLAUDE_WORKER_TIMEOUT_SECONDS = 1800;
+
+/** Human/journal label for a candidate: `claude:<account>` or the adapter/provider name. */
+function candidateLabel(c: ConcreteCandidate): string {
+  return c.provider === 'claude' ? `claude:${c.account ?? '?'}` : c.provider;
+}
 
 const SECRET_LINE =
   /(token|secret|api[_-]?key|password|authorization|bot_token|app_token|signing_secret)\s*[:=]/i;
@@ -49,6 +67,22 @@ export interface OrchestratorDeps {
   reviewOutput: typeof reviewWorkerOutput;
   mergeOutput: typeof mergeWorkerOutput;
   resolveActiveSessionCwd: () => string | null;
+  /**
+   * Resolve a role's ordered candidate list (account-first → cross-LLM). Required in PRODUCTION (the
+   * daemon injects it); omit ONLY in single-adapter unit tests, where the orchestrator falls back to
+   * the legacy one-candidate path (today's behavior, no failover loop). There is no third state.
+   */
+  selectCandidates?: (role: WorkerRole, task: WorkerTask, nowMs: number) => ConcreteCandidate[];
+  /** Record a codex run's chargeable tokens into the budget meter (called after every codex run). */
+  recordCodexUsage?: (provider: string, tokens: number, nowMs: number) => void;
+  /** Mark a candidate reactively UNAVAILABLE after a failover-worthy failure (reactive backstop). */
+  markCandidateUnavailable?: (candidate: ConcreteCandidate, nowMs: number) => void;
+  /** Resolve a Claude account's on-disk auth (`CLAUDE_CONFIG_DIR`) for a claude candidate. */
+  getClaudeAccountConfigDir?: (account: string) => string | null;
+  /** Resolve a pinned `--implementer/--reviewer claude` to its best available account (scorer-selected, single, no failover). */
+  resolvePinnedClaude?: (nowMs: number) => ConcreteCandidate | null;
+  /** Notify on a CROSS-provider failover (claude↔codex) only — account↔account within Claude is routine. */
+  notifyCrossProviderFailover?: (taskId: string, from: string, to: string) => void;
 }
 
 export interface DispatchInput {
@@ -104,10 +138,22 @@ export class WorkerOrchestrator {
 
     const routed = resolveRouting(input.task_type, this.config.routing, this.config.adapters);
     const implementer = input.implementer ?? routed.implementer;
-    if (!this.config.adapters[implementer]?.enabled) {
+    const reviewer = input.reviewer ?? routed.reviewer;
+
+    // Under roles (selectCandidates injected), an explicit override may be 'claude' or any DEFINED
+    // adapter and pins a single candidate (no failover); without roles, the legacy enabled-adapter rule
+    // applies. An override naming neither 'claude' nor a defined adapter fails fast.
+    if (this.d.selectCandidates) {
+      const validProvider = (p?: string): boolean => p === undefined || p === 'claude' || this.config.adapters[p] !== undefined;
+      if (!validProvider(input.implementer)) {
+        throw new Error(`dispatch validation error: --implementer "${input.implementer}" is not 'claude' or a defined adapter`);
+      }
+      if (!validProvider(input.reviewer)) {
+        throw new Error(`dispatch validation error: --reviewer "${input.reviewer}" is not 'claude' or a defined adapter`);
+      }
+    } else if (!this.config.adapters[implementer]?.enabled) {
       throw new Error(`worker dispatch: implementer "${implementer}" is not an enabled adapter`);
     }
-    const reviewer = input.reviewer ?? routed.reviewer;
 
     const baseRef = input.base_ref ?? this.config.base_ref ?? 'HEAD';
     const baseSha = await this.d.worktreeOps.resolveBaseSha({ workspaceRoot, baseRef });
@@ -123,6 +169,8 @@ export class WorkerOrchestrator {
       base_sha: baseSha,
       implementer,
       reviewer,
+      pinned_implementer: input.implementer ?? null,
+      pinned_reviewer: input.reviewer ?? null,
       workspace_root: workspaceRoot,
       created_at: now,
       updated_at: now,
@@ -171,36 +219,35 @@ export class WorkerOrchestrator {
       this.d.store.patch(id, { status: 'RUNNING' });
       await this.emit('worker.dispatched', id, { task_type: task.task_type, implementer: task.implementer, reviewer: task.reviewer, base_ref: task.base_ref, base_sha: task.base_sha });
 
+      // Baseline the main tree ONCE before the first candidate; the loop audits every candidate
+      // (success, timeout, non-zero, 429) against it — a main-tree mutation is terminal, no failover.
       const before = await this.d.worktreeOps.snapshotMainTree({ workspaceRoot: task.workspace_root, worktreeDir: this.config.worktree_dir, forbiddenPathGlobs: forbidden });
-      const worktree = await this.d.worktreeOps.createWorktree({ workspaceRoot: task.workspace_root, worktreeDir: this.config.worktree_dir, baseSha: task.base_sha, taskId: id });
-      this.d.store.patch(id, { worktree_path: worktree });
-
-      const adapter = this.effectiveAdapter(task.implementer);
       const workerStateDir = this.d.store.dir(id);
-      const plan = buildWorkerCommand(adapter, task, worktree, workerStateDir);
-      const run = await runWorker(plan, { cwd: worktree, timeoutSeconds: adapter.timeout_seconds, exec: this.d.runImplementer });
 
-      if (this.isCancelled(id)) return void (await this.finishCancelled(id));
+      const candidates = this.resolveCandidates('implementer', task);
+      if (candidates.length === 0) {
+        return void (await this.failExhausted(id, []));
+      }
 
-      if (run.timedOut) {
-        return void (await this.fail(id, 'worker.failed', { reason: 'timed_out' }, 'worker timed out'));
+      const outcome = await runCandidateLoop(candidates, this.implementerHooks(id, task, before, workerStateDir));
+      if (outcome.kind === 'cancelled') return void (await this.finishCancelled(id));
+      if (outcome.kind === 'boundary_violation') {
+        this.d.store.patch(id, { worktree_path: outcome.worktree });
+        return void (await this.fail(id, 'worker.boundary_violation', { violations: ['main_tree_modified'], candidate: candidateLabel(outcome.candidate) }, 'workspace boundary violation'));
       }
-      if (run.code === null) {
-        return void (await this.fail(id, 'worker.failed', { reason: 'adapter_unresolved' }, 'worker could not be executed'));
+      if (outcome.kind === 'exhausted') {
+        return void (await this.failExhausted(id, outcome.tried));
       }
+
+      // A winning candidate produced a clean run (its worktree already passed the per-candidate audit).
+      const { worktree, result: run, candidate: winner } = outcome;
+      const boundaryOk = true;
 
       // IMPLEMENTED: capture the diff in memory.
       const { patch, changedFiles } = await this.d.worktreeOps.captureDiff({ worktree, baseSha: task.base_sha });
 
-      // Boundary audit (fail → FAILED, merge blocked).
-      const boundaryOk = await this.d.worktreeOps.auditBoundary({ workspaceRoot: task.workspace_root, worktreeDir: this.config.worktree_dir, before, forbiddenPathGlobs: forbidden });
-
-      // A cancel that raced capture/audit must not be clobbered by the boundary/sanitize terminal write.
+      // A cancel that raced capture must not be clobbered by the sanitize/persist terminal write.
       if (this.isCancelled(id)) return void (await this.finishCancelled(id));
-
-      if (!boundaryOk) {
-        return void (await this.fail(id, 'worker.boundary_violation', { violations: ['main_tree_modified'] }, 'workspace boundary violation'));
-      }
 
       // Sanitize BEFORE persisting any artifact (HI-002).
       const sanitized = this.d.worktreeOps.sanitizePatch(changedFiles, patch, forbidden);
@@ -258,19 +305,10 @@ export class WorkerOrchestrator {
         return;
       }
 
-      // REVIEWING.
+      // REVIEWING — resolve the reviewer candidate (failover: codex unavailable → a Claude account).
       this.d.store.patch(id, { status: 'REVIEWING' });
       const reviewDir = join(workerStateDir, 'review');
-      const reviewerAdapter = this.effectiveAdapter(task.reviewer ?? task.implementer);
-      const verdict = await this.d.reviewOutput({
-        task,
-        output,
-        reviewerAdapter,
-        review: this.config.review,
-        journal: this.d.journal,
-        reviewDir,
-        worktreePath: worktree,
-      });
+      const verdict = await this.runReview(id, task, output, worktree, reviewDir, winner);
       // Discard a cancellation that raced the review — never write the verdict or REJECTED.
       if (this.isCancelled(id)) return void (await this.finishCancelled(id));
       this.d.store.patch(id, { review: verdict });
@@ -287,6 +325,157 @@ export class WorkerOrchestrator {
       if (this.isCancelled(id)) return void (await this.finishCancelled(id));
       await this.fail(id, 'worker.failed', { reason: 'pipeline_error' }, String(err));
     }
+  }
+
+  /**
+   * Resolve a role's ordered candidate list. With `selectCandidates` injected (production), an explicit
+   * pin collapses to a single candidate; otherwise the selector resolves account-first → cross-LLM.
+   * Without it (single-adapter unit tests), the legacy one-candidate path runs — exactly today's behavior.
+   */
+  private resolveCandidates(role: WorkerRole, task: WorkerTask): ConcreteCandidate[] {
+    const pinned = role === 'implementer' ? task.pinned_implementer : task.pinned_reviewer;
+    if (this.d.selectCandidates) {
+      if (pinned) {
+        // A pinned `claude` is "account auto-selected" — resolve its best account (single, no failover).
+        // A pinned adapter is run unconditionally (operator pinned it — no availability filtering).
+        if (pinned === 'claude') {
+          const c = this.d.resolvePinnedClaude?.(Date.now()) ?? null;
+          return c ? [c] : [];
+        }
+        return [{ provider: pinned, model: null, effort: null }];
+      }
+      return this.d.selectCandidates(role, task, Date.now());
+    }
+    const name = role === 'implementer' ? task.implementer : (task.reviewer ?? task.implementer);
+    return [{ provider: name, model: null, effort: null }];
+  }
+
+  /** Build the launch plan for a concrete candidate (claude → claude-adapter; otherwise a worker adapter). */
+  private buildCandidatePlan(candidate: ConcreteCandidate, task: WorkerTask, worktree: string, stateDir: string): WorkerLaunchPlan {
+    if (candidate.provider === 'claude') {
+      const configDir = this.d.getClaudeAccountConfigDir?.(candidate.account ?? '') ?? null;
+      if (!configDir) {
+        throw new Error(`worker: claude candidate has no CLAUDE_CONFIG_DIR for account "${candidate.account ?? ''}"`);
+      }
+      return buildClaudeWorkerCommand({
+        account: { name: candidate.account ?? '', config_dir: configDir },
+        prompt: task.prompt,
+        worktreePath: worktree,
+        envAllowlist: composeEnvAllowlist(this.config.security.env_allowlist, ['PATH']),
+        model: candidate.model ?? null,
+      });
+    }
+    return buildWorkerCommand(this.effectiveAdapter(candidate.provider), task, worktree, stateDir);
+  }
+
+  private candidateTimeout(candidate: ConcreteCandidate): number {
+    if (candidate.provider === 'claude') return CLAUDE_WORKER_TIMEOUT_SECONDS;
+    return this.config.adapters[candidate.provider]?.timeout_seconds ?? CLAUDE_WORKER_TIMEOUT_SECONDS;
+  }
+
+  /** Record a json-mode (codex) candidate's chargeable tokens into the budget meter — success or failure. */
+  private recordCodexIfApplicable(candidate: ConcreteCandidate, run: WorkerExecResult): void {
+    if (candidate.provider === 'claude') return;
+    if (this.config.adapters[candidate.provider]?.output_format !== 'json') return;
+    const parsed = parseCodexJsonStream(run.stdout);
+    if (parsed.usage) this.d.recordCodexUsage?.(candidate.provider, chargeableTokens(parsed.usage), Date.now());
+  }
+
+  /** Hooks the candidate loop calls for the implementer: fresh worktree per candidate, run, audit, cleanup, emit. */
+  private implementerHooks(id: string, task: WorkerTask, before: MainTreeSnapshot, workerStateDir: string): CandidateLoopHooks {
+    const forbidden = this.config.security.forbidden_path_globs;
+    return {
+      createWorktree: async () => {
+        const wt = await this.d.worktreeOps.createWorktree({ workspaceRoot: task.workspace_root, worktreeDir: this.config.worktree_dir, baseSha: task.base_sha, taskId: id });
+        this.d.store.patch(id, { worktree_path: wt });
+        return wt;
+      },
+      runCandidate: async (candidate, worktree) => {
+        const plan = this.buildCandidatePlan(candidate, task, worktree, workerStateDir);
+        const run = await runWorker(plan, { cwd: worktree, timeoutSeconds: this.candidateTimeout(candidate), exec: this.d.runImplementer });
+        this.recordCodexIfApplicable(candidate, run);
+        return run;
+      },
+      auditBoundary: () => this.d.worktreeOps.auditBoundary({ workspaceRoot: task.workspace_root, worktreeDir: this.config.worktree_dir, before, forbiddenPathGlobs: forbidden }),
+      removeWorktree: async (wt) => {
+        await this.d.worktreeOps.removeWorktree({ workspaceRoot: task.workspace_root, worktreeDir: this.config.worktree_dir, path: wt });
+        this.d.store.patch(id, { worktree_path: null });
+      },
+      markUnavailable: (candidate) => this.d.markCandidateUnavailable?.(candidate, Date.now()),
+      isCancelled: () => this.isCancelled(id),
+      onCandidateFailed: (candidate, kind) => this.emit('worker.candidate_failed', id, { candidate: candidateLabel(candidate), reason: kind }),
+      onFailover: (from, to) => {
+        const crossProvider = from.provider !== to.provider;
+        if (crossProvider) this.d.notifyCrossProviderFailover?.(id, candidateLabel(from), candidateLabel(to));
+        return this.emit('worker.failover', id, { from: candidateLabel(from), to: candidateLabel(to), cross_provider: crossProvider });
+      },
+      onCleanupError: (path, error) => this.emit('worker.worktree_cleanup_error', id, { path, error }),
+    };
+  }
+
+  /** Run one reviewer candidate (claude → built plan; adapter → effectiveAdapter), with provider-level degraded. */
+  private runReviewer(cand: ConcreteCandidate, task: WorkerTask, output: WorkerOutput, worktree: string, reviewDir: string, winner: ConcreteCandidate): Promise<ReviewVerdict> {
+    const degraded = cand.provider === winner.provider;
+    if (cand.provider === 'claude') {
+      const configDir = this.d.getClaudeAccountConfigDir?.(cand.account ?? '') ?? null;
+      if (!configDir) {
+        throw new Error(`worker: claude reviewer has no CLAUDE_CONFIG_DIR for account "${cand.account ?? ''}"`);
+      }
+      const plan = buildClaudeWorkerCommand({
+        account: { name: cand.account ?? '', config_dir: configDir },
+        prompt: buildReviewPrompt(task, output.patch),
+        worktreePath: reviewDir,
+        envAllowlist: composeEnvAllowlist(this.config.security.env_allowlist, ['PATH']),
+        model: cand.model ?? null,
+      });
+      const reviewerOverride: ReviewerPlanOverride = { name: candidateLabel(cand), plan, format: 'claude-json', timeoutSeconds: CLAUDE_WORKER_TIMEOUT_SECONDS };
+      return this.d.reviewOutput({ task, output, reviewerOverride, degradedOverride: degraded, review: this.config.review, journal: this.d.journal, reviewDir, worktreePath: worktree });
+    }
+    const reviewerAdapter = this.effectiveAdapter(cand.provider);
+    return this.d.reviewOutput({ task, output, reviewerAdapter, degradedOverride: degraded, review: this.config.review, journal: this.d.journal, reviewDir, worktreePath: worktree });
+  }
+
+  /**
+   * Run the reviewer through a candidate failover loop (mirrors the implementer): a reviewer whose run
+   * fails in a failover-worthy way (429/auth/timeout/unspawnable) is marked unavailable and the next
+   * reviewer candidate (e.g. an open Claude account) is tried; a genuine approve/reject ends the loop.
+   * Fail-closed: no reviewer candidate at all → reject.
+   */
+  private async runReview(id: string, task: WorkerTask, output: WorkerOutput, worktree: string, reviewDir: string, winner: ConcreteCandidate): Promise<ReviewVerdict> {
+    if (!this.d.selectCandidates) {
+      const reviewerAdapter = this.effectiveAdapter(task.reviewer ?? task.implementer);
+      return this.d.reviewOutput({ task, output, reviewerAdapter, review: this.config.review, journal: this.d.journal, reviewDir, worktreePath: worktree });
+    }
+    const candidates = this.resolveCandidates('reviewer', task);
+    if (candidates.length === 0) {
+      await this.emit('worker.review_failed', id, { reason: 'no_reviewer_candidate', verdict: 'reject' });
+      return { reviewer: 'none', verdict: 'reject', degraded: false, findings: [], raw_output_tail: '' };
+    }
+    let last: ReviewVerdict | null = null;
+    for (let i = 0; i < candidates.length; i++) {
+      const cand = candidates[i];
+      const verdict = await this.runReviewer(cand, task, output, worktree, reviewDir, winner);
+      last = verdict;
+      if (verdict.run_failure && verdict.run_failure !== 'task_failed') {
+        this.d.markCandidateUnavailable?.(cand, Date.now());
+        await this.emit('worker.candidate_failed', id, { candidate: candidateLabel(cand), reason: verdict.run_failure, role: 'reviewer' });
+        const next = candidates[i + 1];
+        if (next) {
+          const crossProvider = cand.provider !== next.provider;
+          if (crossProvider) this.d.notifyCrossProviderFailover?.(id, candidateLabel(cand), candidateLabel(next));
+          await this.emit('worker.failover', id, { from: candidateLabel(cand), to: candidateLabel(next), cross_provider: crossProvider, role: 'reviewer' });
+        }
+        continue;
+      }
+      return verdict;
+    }
+    return last!; // all reviewer candidates hit capacity failures → last fail-closed reject
+  }
+
+  private async failExhausted(id: string, tried: readonly ConcreteCandidate[]): Promise<void> {
+    this.d.store.patch(id, { status: 'FAILED', error_summary: 'all_candidates_exhausted' });
+    await this.emit('worker.all_candidates_exhausted', id, { tried: tried.map(candidateLabel) });
+    await this.cleanup(id, this.config.retention.keep_rejected);
   }
 
   private redactedOutput(run: { code: number | null; timedOut: boolean }, changedFiles: string[], boundaryOk: boolean): WorkerOutput {

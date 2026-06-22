@@ -115,6 +115,8 @@ export interface WorkerAdapterConfig {
   env_allowlist: string[];
   timeout_seconds: number;
   enabled: boolean;
+  /** Stdout format. 'json' (codex `--json` stream) routes output through the codex-json parser before verdict/usage extraction. Absent ⇒ 'text'. */
+  output_format?: 'text' | 'json';
 }
 
 export interface WorkerRouteOverride {
@@ -153,6 +155,27 @@ export interface WorkerMergeConfig {
   apply_check_required: boolean;
 }
 
+/** Rolling token budget for a metered provider (codex). Crossing `tokens` within `period_hours` marks it UNAVAILABLE. */
+export interface CodexBudgetConfig {
+  tokens: number;
+  period_hours: number;
+}
+
+/** One candidate in a role's ordered failover list. `provider` is 'claude' (account auto-selected) or a defined adapter name. */
+export interface RoleCandidateConfig {
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  budget: CodexBudgetConfig | null;
+}
+
+/** Ordered provider/account candidate lists per worker role. Account-first ordering is applied at selection time. */
+export interface RolesConfig {
+  implementer: RoleCandidateConfig[];
+  reviewer: RoleCandidateConfig[];
+  orchestrator: RoleCandidateConfig[];
+}
+
 export interface WorkersConfig {
   enabled: boolean;
   workspace_root: string | null;
@@ -185,4 +208,5 @@ export interface AisupConfig {
   statusline: StatuslineConfig;
   journal: JournalConfig;
   workers: WorkersConfig;
+  roles: RolesConfig;
 }

@@ -152,4 +152,38 @@ describe('reviewWorkerOutput', () => {
     const failed = events.find((e) => e.event_type === 'worker.review_failed');
     expect(failed?.details.reason).toBe('reviewer_side_effect');
   });
+
+  // JSON-mode reviewer (codex --json): the verdict lives inside the final agent_message item,
+  // not on a raw stdout line. parseVerdict must run on the parsed finalText, fail-closed.
+  const jsonStream = (...lines: string[]): string => lines.join('\n');
+  const agentMsg = (text: string): string => JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } });
+  const reasoningMsg = (text: string): string => JSON.stringify({ type: 'item.completed', item: { type: 'reasoning', text } });
+  const turnDone = jsonStream(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } }));
+
+  it('a json-mode reviewer yields approve from a JSON-wrapped VERDICT: APPROVE in the final agent_message', async () => {
+    const ctx = makeCtx(root);
+    const { journal, events } = spyJournal();
+    const runner: WorkerExec = async () => ({ code: 0, stdout: jsonStream(reasoningMsg('analyzing'), agentMsg('Looks correct.\nVERDICT: APPROVE'), turnDone), stderr: '', timedOut: false });
+    const v = await reviewWorkerOutput({ ...ctx, reviewerAdapter: reviewerAdapter({ name: 'codex', output_format: 'json' }), review: { allow_same_model_review: true }, journal, runner });
+    expect(v.verdict).toBe('approve');
+    expect(events.some((e) => e.event_type === 'worker.review_passed')).toBe(true);
+  });
+
+  it('a json-mode reviewer yields reject from a JSON-wrapped VERDICT: REJECT in the final agent_message', async () => {
+    const ctx = makeCtx(root);
+    const { journal } = spyJournal();
+    const runner: WorkerExec = async () => ({ code: 0, stdout: jsonStream(agentMsg('VERDICT: REJECT'), turnDone), stderr: '', timedOut: false });
+    const v = await reviewWorkerOutput({ ...ctx, reviewerAdapter: reviewerAdapter({ name: 'codex', output_format: 'json' }), review: { allow_same_model_review: true }, journal, runner });
+    expect(v.verdict).toBe('reject');
+  });
+
+  it('a json-mode reviewer fails closed when the final agent_message has no verdict, even if a reasoning line mentions one', async () => {
+    const ctx = makeCtx(root);
+    const { journal, events } = spyJournal();
+    const runner: WorkerExec = async () => ({ code: 0, stdout: jsonStream(reasoningMsg('I lean toward VERDICT: APPROVE here'), agentMsg('Summary: the change is plausible.'), turnDone), stderr: '', timedOut: false });
+    const v = await reviewWorkerOutput({ ...ctx, reviewerAdapter: reviewerAdapter({ name: 'codex', output_format: 'json' }), review: { allow_same_model_review: true }, journal, runner });
+    expect(v.verdict).toBe('reject');
+    const failed = events.find((e) => e.event_type === 'worker.review_failed');
+    expect(failed?.details.reason).toBe('parse_failed');
+  });
 });

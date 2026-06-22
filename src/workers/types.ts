@@ -19,8 +19,10 @@ export interface WorkerTask {
   prompt: string; // the task instruction given to the worker
   base_ref: string; // requested git ref the worktree branches from (default: HEAD)
   base_sha: string; // immutable commit base_ref resolves to at dispatch
-  implementer: string; // resolved adapter name
+  implementer: string; // resolved adapter name (or 'claude') — first/configured implementer
   reviewer: string | null; // resolved adapter name (null only when degraded+allowed)
+  pinned_implementer?: string | null; // explicit --implementer override → single pinned candidate, no failover
+  pinned_reviewer?: string | null; // explicit --reviewer override → single pinned reviewer candidate
   workspace_root: string; // absolute path to the main git repo
   created_at: string;
   updated_at: string;
@@ -45,6 +47,8 @@ export interface ReviewVerdict {
   degraded: boolean; // true when reviewer == implementer (same-model fallback)
   findings: { severity: 'low' | 'medium' | 'high'; summary: string }[];
   raw_output_tail: string;
+  /** Set when the reviewer subprocess failed in a failover-worthy way (429/auth/timeout/unspawnable) — drives reviewer failover. */
+  run_failure?: import('./failover.js').CandidateFailureKind | null;
 }
 
 export interface WorkerApproval {

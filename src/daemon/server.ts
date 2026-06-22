@@ -23,6 +23,7 @@ import { readTelemetryForAccount } from '../statusline/store.js';
 import type { UsageLedger } from '../accounts/usage-ledger.js';
 import type { WorkerState } from '../workers/types.js';
 import type { DispatchInput } from '../workers/orchestrator.js';
+import type { ProviderUsageReport } from '../providers/report.js';
 
 export interface WorkerActionResult {
   ok: boolean;
@@ -78,6 +79,8 @@ export interface DaemonServerOptions {
   approveWorker?: (id: string, by: string) => Promise<WorkerActionResult>;
   denyWorker?: (id: string, by: string) => Promise<WorkerActionResult>;
   cancelWorker?: (id: string) => Promise<WorkerActionResult>;
+  /** Per-provider usage readout for GET /api/workers/providers. */
+  getWorkerProviders?: () => ProviderUsageReport;
 }
 
 declare module 'fastify' {
@@ -334,6 +337,11 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
   app.get('/api/workers', async (_req, reply) => {
     if (!opts.listWorkers) return reply.code(503).send({ error: 'workers not enabled' });
     return reply.send({ workers: opts.listWorkers() });
+  });
+
+  app.get('/api/workers/providers', async (_req, reply) => {
+    if (!opts.getWorkerProviders) return reply.code(503).send({ error: 'workers not enabled' });
+    return reply.send(opts.getWorkerProviders());
   });
 
   app.get('/api/workers/:id', async (req, reply) => {

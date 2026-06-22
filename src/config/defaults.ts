@@ -1,6 +1,26 @@
-import type { AisupConfig } from './schema.js';
+import type { AisupConfig, CodexBudgetConfig, RolesConfig } from './schema.js';
 
-export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts'> = {
+/**
+ * Default codex token budget (starter, tunable to the operator's ChatGPT plan). A codex candidate with
+ * no explicit `budget` is metered against this so a codex-default task fails over once it is crossed
+ * (Goal Verification Truth 2). ~tens of tasks per 5h before a clean proactive failover (a trivial codex
+ * run ≈ 39k tokens, measured 2026-06-19). codex exposes no quota readout, so this is a heuristic.
+ */
+export const DEFAULT_CODEX_BUDGET: CodexBudgetConfig = { tokens: 3_000_000, period_hours: 5 };
+
+/** The effective codex budget: the first explicit per-candidate `budget` in any role, else the default. */
+export function resolveCodexBudget(roles: RolesConfig): CodexBudgetConfig {
+  for (const list of [roles.implementer, roles.reviewer, roles.orchestrator]) {
+    for (const c of list) {
+      if (c.provider !== 'claude' && c.budget) return c.budget;
+    }
+  }
+  return DEFAULT_CODEX_BUDGET;
+}
+
+// `roles` is omitted: it is computed by the loader (validateRoles) from an explicit `roles:` block
+// or synthesized from `workers.routing` for back-compat — never a static default.
+export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
   runner: {
     // Modern Pilot Shell is hook-integrated into Claude Code (running `pilot` alone just prints a
     // banner and exits), so the runner that actually launches a session is `claude` — Pilot's hooks,
@@ -108,13 +128,14 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts'> = {
       codex: {
         name: 'codex',
         command: 'codex',
-        args: [],
+        args: ['exec', '--json'],
         prompt_via: 'arg',
         prompt_arg_flag: null,
         prompt_file_flag: null,
         env_allowlist: ['PATH', 'HOME'],
         timeout_seconds: 1800,
         enabled: false,
+        output_format: 'json',
       },
       gemini: {
         name: 'gemini',

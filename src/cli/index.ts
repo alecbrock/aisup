@@ -11,6 +11,7 @@ import {
   workerDispatch,
   workerList,
   workerStatus,
+  workerProviders,
   workerReview,
   workerApprove,
   workerDeny,
@@ -140,6 +141,11 @@ worker
   .description('List workers')
   .option('--json', 'Print machine-readable JSON')
   .action((opts: { json?: boolean }) => void workerList({ json: opts.json ?? false }));
+worker
+  .command('providers')
+  .description('Show per-provider availability for each worker role (claude headroom, codex budget)')
+  .option('--json', 'Print machine-readable JSON')
+  .action((opts: { json?: boolean }) => void workerProviders({ json: opts.json ?? false }));
 worker
   .command('status <id>')
   .description('Show a worker\'s status')

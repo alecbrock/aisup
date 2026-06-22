@@ -227,6 +227,7 @@ Worker execution lives in the daemon; the CLI talks to it over the localhost API
 aisup worker dispatch --task-type implement --prompt "add a retry to fetchUser" --workspace ~/proj
 aisup worker dispatch --prompt @task.md            # load the prompt from a file
 aisup worker list
+aisup worker providers                              # per-role provider availability (claude headroom, codex budget)
 aisup worker status <id>                            # status, changed files, gates, review, approval
 aisup worker review <id>                            # cross-model review verdict (read-only)
 aisup worker logs <id>                              # sanitized stdout/stderr tails + artifact paths

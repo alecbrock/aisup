@@ -173,6 +173,29 @@ describe('SlackService', () => {
     expect(map['sess-abc']).toBeDefined();
   });
 
+  it('should post session info to the channel on session start', async () => {
+    const svc = new SlackService({
+      config: makeConfig(),
+      sessionManager: sessionManager as never,
+      tmuxSocket: 'aisup-test',
+      journal: journal as never,
+      channelMapPath,
+    });
+    await svc.start();
+    await svc.onSessionStart(
+      makeSession({ aisup_session_id: 'sess-info', account: 'account2', cwd: '/work/proj' })
+    );
+
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results[0]?.value;
+    expect(appInstance.client.chat.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: 'C123456',
+        text: expect.stringMatching(/sess-info[\s\S]*account2[\s\S]*\/work\/proj/),
+      })
+    );
+  });
+
   it('should restore channel map from disk on start', async () => {
     // Pre-write a channel map
     const existingMap = { 'sess-existing': 'C999' };
@@ -706,5 +729,36 @@ describe('SlackService', () => {
     });
     const say = await dispatch(svc, '!worker status');
     expect(say).toHaveBeenCalledWith(expect.stringMatching(/w-1.*AWAITING_APPROVAL/s));
+  });
+
+  it('notifyWorkerFailover posts a cross-provider failover message to the session channel', async () => {
+    const svc = new SlackService({
+      config: makeConfig(), sessionManager: sessionManager as never, tmuxSocket: 'aisup-test',
+      journal: journal as never, channelMapPath,
+    });
+    await svc.start();
+    await svc.onSessionStart(makeSession({ aisup_session_id: 'sess-fo' }));
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results[0]?.value;
+    appInstance.client.chat.postMessage.mockClear();
+
+    await svc.notifyWorkerFailover({ sessionId: 'sess-fo', taskId: 'w-42', from: 'claude:a1', to: 'codex' });
+    expect(appInstance.client.chat.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'C123456', text: expect.stringMatching(/w-42[\s\S]*claude:a1[\s\S]*codex/) })
+    );
+  });
+
+  it('notifyWorkerFailover is a no-op when the session has no mapped channel', async () => {
+    const svc = new SlackService({
+      config: makeConfig(), sessionManager: sessionManager as never, tmuxSocket: 'aisup-test',
+      journal: journal as never, channelMapPath,
+    });
+    await svc.start();
+    const { App } = await import('@slack/bolt');
+    const appInstance = vi.mocked(App).mock.results[0]?.value;
+    appInstance.client.chat.postMessage.mockClear();
+
+    await svc.notifyWorkerFailover({ sessionId: 'no-such-session', taskId: 'w-1', from: 'codex', to: 'claude:a1' });
+    expect(appInstance.client.chat.postMessage).not.toHaveBeenCalled();
   });
 });

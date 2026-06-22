@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, accessSyn
 import { join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import yaml from 'js-yaml';
-import type { AisupConfig, AccountConfig, GateCommandConfig, WorkersConfig, WorkerAdapterConfig } from './schema.js';
+import type { AisupConfig, AccountConfig, GateCommandConfig, WorkersConfig, WorkerAdapterConfig, RolesConfig, RoleCandidateConfig, CodexBudgetConfig } from './schema.js';
 import { CONFIG_DEFAULTS } from './defaults.js';
 
 const DEFAULT_CONFIG_PATH = join(homedir(), '.aisup', 'config.yaml');
@@ -136,6 +136,12 @@ function validateWorkerAdapter(name: string, raw: WorkerAdapterConfig): WorkerAd
   if (!Array.isArray(a.env_allowlist) || !a.env_allowlist.every((e) => typeof e === 'string' && ENV_VAR_NAME.test(e))) {
     throw new Error(`Config validation error: ${prefix}.env_allowlist must be an array of valid env var names`);
   }
+  // output_format defaults to 'text'; only codex --json adapters use 'json'.
+  if (a.output_format === undefined) {
+    a.output_format = 'text';
+  } else if (a.output_format !== 'text' && a.output_format !== 'json') {
+    throw new Error(`Config validation error: ${prefix}.output_format must be one of text|json`);
+  }
   return a;
 }
 
@@ -254,6 +260,90 @@ function validateWorkers(workers: WorkersConfig): WorkersConfig {
   return { ...workers, workspace_root: workspaceRoot, worktree_dir: wd, adapters };
 }
 
+/**
+ * Resolve `roles` (Part B). Explicit `roles:` block → validated; absent → synthesized as one-candidate
+ * lists from `workers.routing` (back-compat). Every candidate provider must be 'claude' (requires an
+ * enabled account) or a DEFINED adapter; budgets must be positive integers; implementer/reviewer must
+ * be non-empty when workers are enabled.
+ */
+function validateRoles(
+  raw: Record<string, unknown>,
+  workers: WorkersConfig,
+  accounts: AccountConfig[]
+): RolesConfig {
+  const adapterNames = new Set(Object.keys(workers.adapters));
+  const hasEnabledAccount = accounts.some((a) => a.enabled);
+
+  const validateBudget = (b: unknown, where: string): CodexBudgetConfig | null => {
+    if (b === null || b === undefined) return null;
+    if (typeof b !== 'object') throw new Error(`Config validation error: ${where}.budget must be an object`);
+    const { tokens, period_hours } = b as Record<string, unknown>;
+    if (!Number.isInteger(tokens) || (tokens as number) <= 0) {
+      throw new Error(`Config validation error: ${where}.budget.tokens must be a positive integer`);
+    }
+    if (!Number.isInteger(period_hours) || (period_hours as number) <= 0) {
+      throw new Error(`Config validation error: ${where}.budget.period_hours must be a positive integer`);
+    }
+    return { tokens: tokens as number, period_hours: period_hours as number };
+  };
+
+  const validateCandidate = (c: unknown, where: string): RoleCandidateConfig => {
+    if (!c || typeof c !== 'object') throw new Error(`Config validation error: ${where} must be an object`);
+    const cand = c as Record<string, unknown>;
+    const provider = cand['provider'];
+    if (typeof provider !== 'string' || provider === '') {
+      throw new Error(`Config validation error: ${where}.provider must be a non-empty string`);
+    }
+    if (provider !== 'claude' && !adapterNames.has(provider)) {
+      throw new Error(`Config validation error: ${where}.provider "${provider}" is not 'claude' or a defined adapter`);
+    }
+    if (provider === 'claude' && !hasEnabledAccount) {
+      throw new Error(`Config validation error: ${where}.provider 'claude' requires at least one enabled account`);
+    }
+    return {
+      provider,
+      model: typeof cand['model'] === 'string' ? (cand['model'] as string) : null,
+      effort: typeof cand['effort'] === 'string' ? (cand['effort'] as string) : null,
+      budget: validateBudget(cand['budget'], where),
+    };
+  };
+
+  const validateList = (list: unknown, role: string): RoleCandidateConfig[] => {
+    if (!Array.isArray(list)) throw new Error(`Config validation error: roles.${role} must be an array of candidates`);
+    if (workers.enabled && list.length === 0) {
+      throw new Error(`Config validation error: roles.${role} must be a non-empty candidate list when workers are enabled`);
+    }
+    return list.map((c, i) => validateCandidate(c, `roles.${role}[${i}]`));
+  };
+
+  const single = (provider: string): RoleCandidateConfig[] => [{ provider, model: null, effort: null, budget: null }];
+
+  const rawRoles = raw['roles'];
+  if (rawRoles !== undefined && rawRoles !== null) {
+    if (typeof rawRoles !== 'object') throw new Error('Config validation error: roles must be an object');
+    const r = rawRoles as Record<string, unknown>;
+    return {
+      implementer: validateList(r['implementer'], 'implementer'),
+      reviewer: validateList(r['reviewer'], 'reviewer'),
+      orchestrator: r['orchestrator'] !== undefined && r['orchestrator'] !== null
+        ? validateList(r['orchestrator'], 'orchestrator')
+        : single('claude'),
+    };
+  }
+
+  // Back-compat synthesis from workers.routing (validated to name defined adapters above).
+  const di = workers.routing.default_implementer;
+  const dr = workers.routing.default_reviewer;
+  if (workers.enabled && (!di || !dr)) {
+    throw new Error('Config validation error: workers.enabled requires either a roles config or workers.routing');
+  }
+  return {
+    implementer: validateList(single(di), 'implementer'),
+    reviewer: validateList(single(dr), 'reviewer'),
+    orchestrator: single('claude'),
+  };
+}
+
 function mergeDeep<T extends object>(target: T, source: Partial<T>): T {
   const result = { ...target };
   for (const key of Object.keys(source) as (keyof T)[]) {
@@ -342,6 +432,7 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
   }
   validateGates(merged.gates.gates);
   const workers = validateWorkers(merged.workers);
+  const roles = validateRoles(raw, workers, accounts);
 
   if (merged.slack.enabled) {
     if (!merged.slack.bot_token_env || !merged.slack.app_token_env) {
@@ -368,6 +459,7 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     statusline: { ...merged.statusline, directory: statuslineDirectory },
     journal: { path: journalPath },
     workers,
+    roles,
   };
 }
 

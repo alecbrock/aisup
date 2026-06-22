@@ -109,6 +109,10 @@ export type EventType =
   | 'worker.security_denied'
   | 'worker.cancelled'
   | 'worker.cleanup'
+  | 'worker.candidate_failed'
+  | 'worker.failover'
+  | 'worker.all_candidates_exhausted'
+  | 'worker.worktree_cleanup_error'
   | 'worker.rehydrated_failed'
   | 'worker.rehydrated_merged';
 

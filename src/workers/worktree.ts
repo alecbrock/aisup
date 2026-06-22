@@ -9,6 +9,7 @@ import {
   statSync,
   lstatSync,
   realpathSync,
+  rmdirSync,
 } from 'node:fs';
 import { join, isAbsolute, dirname, sep } from 'node:path';
 import picomatch from 'picomatch';
@@ -266,6 +267,17 @@ export async function removeWorktree(opts: {
   }
   assertNoSymlinkComponents(path, baseDir);
   await git(['worktree', 'remove', '--force', path], workspaceRoot);
+
+  // Tidy the now-empty worktree_dir base so a merged/cleaned worker leaves nothing behind
+  // (`git worktree remove` deletes the worktree subdir but not its parent). Best-effort and
+  // empty-only: rmdirSync throws ENOTEMPTY if another worker still has a worktree here.
+  if (readdirSync(realBase).length === 0) {
+    try {
+      rmdirSync(realBase);
+    } catch {
+      // best-effort — a concurrent worker may have repopulated the base
+    }
+  }
 }
 
 /** Whether the worktree_dir is gitignored in the main repo (warn-level check for the orchestrator). */

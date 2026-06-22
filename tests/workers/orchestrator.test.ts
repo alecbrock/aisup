@@ -9,6 +9,13 @@ import { CONFIG_DEFAULTS } from '../../src/config/defaults.js';
 import type { WorkersConfig } from '../../src/config/schema.js';
 import type { WorkerExec } from '../../src/workers/runner.js';
 import type { JournalEvent, JournalWriter } from '../../src/journal/types.js';
+import type { ConcreteCandidate } from '../../src/providers/types.js';
+import { UsageLedger } from '../../src/accounts/usage-ledger.js';
+import { AccountRegistry } from '../../src/accounts/registry.js';
+import { ClaudeProviderUsage } from '../../src/providers/claude-usage.js';
+import { CodexProviderUsage } from '../../src/providers/codex-usage.js';
+import { resolveCandidates } from '../../src/providers/selector.js';
+import type { AisupConfig, RoleCandidateConfig, AccountConfig } from '../../src/config/schema.js';
 
 function spyJournal(): { journal: JournalWriter; events: JournalEvent[] } {
   const events: JournalEvent[] = [];
@@ -50,6 +57,13 @@ function makeHarness(opts: {
   reviewOutput?: OrchestratorDeps['reviewOutput'];
   mergeOutput?: OrchestratorDeps['mergeOutput'];
   resolveCwd?: () => string | null;
+  selectCandidates?: OrchestratorDeps['selectCandidates'];
+  recordCodexUsage?: OrchestratorDeps['recordCodexUsage'];
+  markCandidateUnavailable?: OrchestratorDeps['markCandidateUnavailable'];
+  getClaudeAccountConfigDir?: OrchestratorDeps['getClaudeAccountConfigDir'];
+  resolvePinnedClaude?: OrchestratorDeps['resolvePinnedClaude'];
+  removeWorktreeImpl?: (path: string) => Promise<void>;
+  auditBoundaryImpl?: () => Promise<boolean>;
   stateDir: string;
 }): Harness {
   const { journal, events } = spyJournal();
@@ -66,10 +80,10 @@ function makeHarness(opts: {
     },
     captureDiff: async () => ({ patch: 'diff --git a/x b/x\n+x\n', changedFiles: ['x.ts'] }),
     snapshotMainTree: async () => ({ status: '', forbidden: {} }),
-    auditBoundary: async () => opts.auditOk ?? true,
+    auditBoundary: opts.auditBoundaryImpl ? () => opts.auditBoundaryImpl!() : async () => opts.auditOk ?? true,
     sanitizePatch: () => (opts.sanitizeOk ?? true ? { ok: true, violations: [] } : { ok: false, violations: ['forbidden_path:.env'] }),
     patchSha256: () => 'hash',
-    removeWorktree: async ({ path }) => { removed.push(path); },
+    removeWorktree: async ({ path }) => { if (opts.removeWorktreeImpl) await opts.removeWorktreeImpl(path); removed.push(path); },
     isGitRepo: async () => true,
     applyCheck: async () => true,
     applyReverseCheck: async () => false,
@@ -85,6 +99,11 @@ function makeHarness(opts: {
     reviewOutput: opts.reviewOutput ?? (async () => ({ reviewer: 'gemini', verdict: opts.reviewVerdict ?? 'approve', degraded: false, findings: [], raw_output_tail: '' })),
     mergeOutput: opts.mergeOutput ?? (async () => ({ merged: opts.mergeMerged ?? true, reason: null, resetApproval: false })),
     resolveActiveSessionCwd: opts.resolveCwd ?? (() => '/repo'),
+    selectCandidates: opts.selectCandidates,
+    recordCodexUsage: opts.recordCodexUsage,
+    markCandidateUnavailable: opts.markCandidateUnavailable,
+    getClaudeAccountConfigDir: opts.getClaudeAccountConfigDir,
+    resolvePinnedClaude: opts.resolvePinnedClaude,
   };
 
   return { orch: new WorkerOrchestrator(deps), store, events, removed };
@@ -271,5 +290,266 @@ describe('WorkerOrchestrator', () => {
     expect(results.filter((r) => r.ok)).toHaveLength(1);
     expect(results.find((r) => !r.ok)?.reason).toBe('not_awaiting_approval');
     expect(h.store.read(id)!.status).toBe('MERGED'); // not reset back to AWAITING_APPROVAL
+  });
+});
+
+const claudeCand = (account: string): ConcreteCandidate => ({ provider: 'claude', account, model: null, effort: null });
+const codexCand = (): ConcreteCandidate => ({ provider: 'codex', model: null, effort: null });
+const r429 = (): { code: number; stdout: string; stderr: string; timedOut: boolean } => ({ code: 1, stdout: '', stderr: 'Error 429 too many requests', timedOut: false });
+const rOk = (): { code: number; stdout: string; stderr: string; timedOut: boolean } => ({ code: 0, stdout: 'ok', stderr: '', timedOut: false });
+
+describe('WorkerOrchestrator multi-provider failover (Part B)', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'aisup-orch-fo-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('a 429 on the first implementer candidate fails over to the next and reaches AWAITING_APPROVAL', async () => {
+    let call = 0;
+    const runImplementer: WorkerExec = async () => (++call === 1 ? r429() : rOk());
+    const marks: ConcreteCandidate[] = [];
+    const h = makeHarness({
+      stateDir: dir, runImplementer,
+      selectCandidates: (role) => (role === 'implementer' ? [claudeCand('a1'), claudeCand('a2')] : [codexCand()]),
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+      markCandidateUnavailable: (c) => { marks.push(c); },
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    const idx = (t: string): number => h.events.findIndex((e) => e.event_type === t);
+    expect(idx('worker.candidate_failed')).toBeGreaterThanOrEqual(0);
+    expect(idx('worker.candidate_failed')).toBeLessThan(idx('worker.failover'));
+    expect(idx('worker.failover')).toBeLessThan(idx('worker.awaiting_approval'));
+    expect(marks).toEqual([claudeCand('a1')]); // failover-worthy → first candidate marked unavailable
+    expect(h.removed.length).toBe(1); // first candidate's worktree cleaned before the second
+  });
+
+  it('all candidates failing ends FAILED with all_candidates_exhausted and no stale worktrees', async () => {
+    const h = makeHarness({
+      stateDir: dir, runImplementer: async () => r429(),
+      selectCandidates: () => [claudeCand('a1'), codexCand()],
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'FAILED');
+    expect(h.store.read(id)!.error_summary).toBe('all_candidates_exhausted');
+    expect(h.events.find((e) => e.event_type === 'worker.all_candidates_exhausted')?.details.tried).toEqual(['claude:a1', 'codex']);
+    expect(h.removed.length).toBe(2); // every candidate's worktree removed
+  });
+
+  it('a removeWorktree failure mid-loop emits worker.worktree_cleanup_error and does not block the next candidate', async () => {
+    let call = 0;
+    const h = makeHarness({
+      stateDir: dir, runImplementer: async () => (++call === 1 ? r429() : rOk()),
+      selectCandidates: (role) => (role === 'implementer' ? [claudeCand('a1'), claudeCand('a2')] : [codexCand()]),
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+      removeWorktreeImpl: async () => { throw new Error('rm boom'); },
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    const ce = h.events.find((e) => e.event_type === 'worker.worktree_cleanup_error');
+    expect(ce?.details.error).toContain('rm boom');
+  });
+
+  for (const [label, result] of [
+    ['429', r429()],
+    ['non-zero', { code: 1, stdout: 'fail', stderr: 'AssertionError', timedOut: false }],
+    ['timeout', { code: null, stdout: '', stderr: '', timedOut: true }],
+  ] as const) {
+    it(`a ${label} candidate that mutated the main tree is terminal (boundary_violation, no failover)`, async () => {
+      const h = makeHarness({
+        stateDir: dir, runImplementer: async () => result,
+        selectCandidates: () => [claudeCand('a1'), claudeCand('a2')],
+        getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+        auditBoundaryImpl: async () => false, // main tree mutated
+      });
+      const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+      await waitFor(() => h.store.read(id)?.status === 'FAILED');
+      expect(h.events.some((e) => e.event_type === 'worker.boundary_violation')).toBe(true);
+      expect(h.events.some((e) => e.event_type === 'worker.failover')).toBe(false);
+      expect(h.events.some((e) => e.event_type === 'worker.candidate_failed')).toBe(false);
+    });
+  }
+
+  it('the reviewer falls over to a Claude account when codex is unavailable', async () => {
+    let capturedName: string | undefined;
+    let capturedFormat: string | undefined;
+    const reviewOutput: OrchestratorDeps['reviewOutput'] = async (o) => {
+      capturedName = o.reviewerOverride?.name;
+      capturedFormat = o.reviewerOverride?.format;
+      return { reviewer: 'x', verdict: 'approve', degraded: false, findings: [], raw_output_tail: '' };
+    };
+    const h = makeHarness({
+      stateDir: dir, reviewOutput, runImplementer: async () => rOk(),
+      selectCandidates: (role) => (role === 'implementer' ? [codexCand()] : [claudeCand('rev1')]),
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    expect(capturedName).toBe('claude:rev1');
+    expect(capturedFormat).toBe('claude-json');
+  });
+
+  it('the reviewer fails over at run time when the first reviewer candidate hits a 429', async () => {
+    let revCall = 0;
+    const reviewOutput: OrchestratorDeps['reviewOutput'] = async (o) => {
+      revCall++;
+      const name = o.reviewerOverride?.name ?? o.reviewerAdapter?.name ?? '?';
+      if (revCall === 1) return { reviewer: name, verdict: 'reject', degraded: false, findings: [], raw_output_tail: '429', run_failure: 'rate_limited' };
+      return { reviewer: name, verdict: 'approve', degraded: false, findings: [], raw_output_tail: '', run_failure: null };
+    };
+    const marks: ConcreteCandidate[] = [];
+    const h = makeHarness({
+      stateDir: dir, reviewOutput, runImplementer: async () => rOk(),
+      selectCandidates: (role) => (role === 'implementer' ? [codexCand()] : [codexCand(), claudeCand('rev1')]),
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+      markCandidateUnavailable: (c) => { marks.push(c); },
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    expect(revCall).toBe(2); // failed the codex reviewer over to the claude reviewer
+    expect(marks).toEqual([codexCand()]); // the 429 reviewer was marked unavailable
+    expect(h.events.some((e) => e.event_type === 'worker.candidate_failed' && e.details.role === 'reviewer')).toBe(true);
+    expect(h.events.some((e) => e.event_type === 'worker.failover' && e.details.role === 'reviewer' && e.details.cross_provider === true)).toBe(true);
+  });
+
+  it('a genuine reviewer reject (no capacity failure) does NOT fail over', async () => {
+    let revCall = 0;
+    const reviewOutput: OrchestratorDeps['reviewOutput'] = async (o) => {
+      revCall++;
+      return { reviewer: o.reviewerAdapter?.name ?? '?', verdict: 'reject', degraded: false, findings: [], raw_output_tail: 'VERDICT: REJECT', run_failure: null };
+    };
+    const h = makeHarness({
+      stateDir: dir, reviewOutput, runImplementer: async () => rOk(),
+      selectCandidates: (role) => (role === 'implementer' ? [codexCand()] : [codexCand(), claudeCand('rev1')]),
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'REJECTED');
+    expect(revCall).toBe(1); // a real reject ends the loop — no reviewer failover
+  });
+
+  it('a codex run records its chargeable token usage into the budget meter', async () => {
+    const usage: { provider: string; tokens: number }[] = [];
+    const stdout = [
+      '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+      '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0}}',
+    ].join('\n');
+    const h = makeHarness({
+      stateDir: dir, runImplementer: async () => ({ code: 0, stdout, stderr: '', timedOut: false }),
+      selectCandidates: () => [codexCand()],
+      recordCodexUsage: (provider, tokens) => { usage.push({ provider, tokens }); },
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    expect(usage).toEqual([{ provider: 'codex', tokens: 150 }]);
+  });
+
+  it('an explicit adapter --implementer pins a single candidate (no failover)', async () => {
+    let calls = 0;
+    const h = makeHarness({
+      stateDir: dir, runImplementer: async () => { calls++; return r429(); },
+      selectCandidates: () => [codexCand(), { provider: 'gemini', model: null, effort: null }], // would fail over if not pinned
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p', implementer: 'codex' });
+    await waitFor(() => h.store.read(id)?.status === 'FAILED');
+    expect(calls).toBe(1); // pinned → one candidate only
+  });
+
+  it('an unsupported --implementer override fails fast with a dispatch validation error', async () => {
+    const h = makeHarness({ stateDir: dir, selectCandidates: () => [codexCand()] });
+    await expect(h.orch.dispatch({ task_type: 'implement', prompt: 'p', implementer: 'gpt5' }))
+      .rejects.toThrow(/--implementer "gpt5" is not 'claude' or a defined adapter/);
+  });
+
+  it('a pinned --implementer claude resolves to a concrete account and launches claude with CLAUDE_CONFIG_DIR', async () => {
+    let capturedCmd: string | undefined;
+    let capturedEnv: Record<string, string> | undefined;
+    const runImplementer: WorkerExec = async (cmd, _args, opts) => { capturedCmd = cmd; capturedEnv = opts.env; return rOk(); };
+    const h = makeHarness({
+      stateDir: dir, runImplementer,
+      selectCandidates: (role) => (role === 'implementer' ? [codexCand()] : [codexCand()]), // role list is codex; the pin overrides to claude
+      resolvePinnedClaude: () => claudeCand('acctX'),
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p', implementer: 'claude' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    expect(capturedCmd).toBe('claude');
+    expect(capturedEnv?.CLAUDE_CONFIG_DIR).toBe('/cfg/acctX');
+  });
+
+  it('a pinned --implementer claude with no available account exhausts (no concrete account to launch)', async () => {
+    const h = makeHarness({
+      stateDir: dir,
+      selectCandidates: () => [codexCand()],
+      resolvePinnedClaude: () => null,
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p', implementer: 'claude' });
+    await waitFor(() => h.store.read(id)?.status === 'FAILED');
+    expect(h.store.read(id)!.error_summary).toBe('all_candidates_exhausted');
+  });
+
+  it('runs the failover loop once per RESOLVED candidate, not per account', async () => {
+    // selectCandidates resolves to a SINGLE candidate even if more accounts exist — the loop runs once.
+    let calls = 0;
+    const h = makeHarness({
+      stateDir: dir, runImplementer: async () => { calls++; return r429(); },
+      selectCandidates: () => [claudeCand('a1')],
+      getClaudeAccountConfigDir: (a) => `/cfg/${a}`,
+    });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'FAILED');
+    expect(calls).toBe(1);
+    expect(h.removed.length).toBe(1);
+  });
+});
+
+// Wire selectCandidates exactly as the daemon does, from a REAL UsageLedger + AccountRegistry +
+// provider-usage signals + the pure selector — proving the daemon's glue produces a working selector.
+const codexRole = (budget: RoleCandidateConfig['budget'] = null): RoleCandidateConfig => ({ provider: 'codex', model: null, effort: null, budget });
+const claudeRole = (): RoleCandidateConfig => ({ provider: 'claude', model: null, effort: null, budget: null });
+const acct = (name: string): AccountConfig => ({ name, config_dir: `/cfg/${name}`, priority: 1, enabled: true });
+
+function daemonSelect(opts: { implementer: RoleCandidateConfig[]; reviewer: RoleCandidateConfig[]; accounts: AccountConfig[]; ledgerPath: string }): {
+  selectCandidates: OrchestratorDeps['selectCandidates'];
+  getClaudeAccountConfigDir: OrchestratorDeps['getClaudeAccountConfigDir'];
+} {
+  const ledger = new UsageLedger(opts.ledgerPath, 60_000);
+  const registry = new AccountRegistry({ accounts: opts.accounts } as AisupConfig);
+  const claudeUsage = new ClaudeProviderUsage({
+    ledger,
+    getAccount: (name) => {
+      const a = registry.get(name);
+      return a ? { name: a.name, enabled: a.enabled, inCooldown: false, reactivelyUnavailable: false } : null;
+    },
+  });
+  const codexUsage = new CodexProviderUsage({ ledger, budget: null });
+  const accounts = registry.getAll().map((a) => ({ name: a.name, enabled: a.enabled }));
+  return {
+    selectCandidates: (role) => resolveCandidates(role === 'implementer' ? opts.implementer : opts.reviewer, { claudeUsage, codexUsage, accounts }, Date.now()),
+    getClaudeAccountConfigDir: (name) => registry.get(name)?.configDir ?? null,
+  };
+}
+
+describe('WorkerOrchestrator daemon provider wiring (Task 8)', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'aisup-orch-wire-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('resolves a single-codex roles config and dispatches end-to-end (back-compat)', async () => {
+    const wired = daemonSelect({ implementer: [codexRole()], reviewer: [{ provider: 'gemini', model: null, effort: null, budget: null }], accounts: [], ledgerPath: join(dir, 'ledger.json') });
+    const h = makeHarness({ stateDir: dir, runImplementer: async () => rOk(), ...wired });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    expect(h.store.read(id)!.status).toBe('AWAITING_APPROVAL');
+  });
+
+  it('expands claude accounts (account-first) and fails over a 429 to the next account', async () => {
+    let call = 0;
+    const wired = daemonSelect({ implementer: [claudeRole(), codexRole()], reviewer: [codexRole()], accounts: [acct('a1'), acct('a2')], ledgerPath: join(dir, 'ledger.json') });
+    const h = makeHarness({ stateDir: dir, runImplementer: async () => (++call === 1 ? r429() : rOk()), ...wired });
+    const id = await h.orch.dispatch({ task_type: 'implement', prompt: 'p' });
+    await waitFor(() => h.store.read(id)?.status === 'AWAITING_APPROVAL');
+    expect(h.events.some((e) => e.event_type === 'worker.candidate_failed')).toBe(true);
+    expect(h.events.some((e) => e.event_type === 'worker.failover')).toBe(true);
   });
 });

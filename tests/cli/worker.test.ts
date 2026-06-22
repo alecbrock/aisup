@@ -9,8 +9,10 @@ import {
   formatWorkerList,
   formatWorkerReview,
   formatWorkerLogs,
+  formatProviderUsage,
 } from '../../src/cli/commands/worker.js';
 import type { WorkerState } from '../../src/workers/types.js';
+import type { ProviderUsageReport } from '../../src/providers/report.js';
 
 function workerState(over: Partial<WorkerState> = {}): WorkerState {
   return {
@@ -102,5 +104,34 @@ describe('worker CLI pure helpers', () => {
     const out = formatWorkerLogs(workerState());
     expect(out).toContain('/state/w-1/patch.diff');
     expect(out).toContain('impl-stdout');
+  });
+
+  it('formatProviderUsage shows claude headroom + basis and codex remaining tokens vs budget per role', () => {
+    const report: ProviderUsageReport = {
+      roles: [
+        {
+          role: 'implementer',
+          candidates: [
+            { label: 'claude:a1', provider: 'claude', account: 'a1', available: true, headroom_pct: 72, remaining_tokens: null, basis: 'live' },
+            { label: 'claude:a2', provider: 'claude', account: 'a2', available: false, headroom_pct: null, remaining_tokens: null, basis: 'unknown', reason: 'cooldown' },
+            { label: 'codex', provider: 'codex', account: null, available: true, headroom_pct: null, remaining_tokens: 2_950_000, basis: 'budget' },
+          ],
+        },
+      ],
+    };
+    const out = formatProviderUsage(report);
+    expect(out).toContain('implementer:');
+    expect(out).toContain('claude:a1');
+    expect(out).toContain('headroom 72%');
+    expect(out).toContain('basis=live');
+    expect(out).toContain('UNAVAILABLE');
+    expect(out).toContain('(cooldown)');
+    expect(out).toContain('codex');
+    expect(out).toContain('2950000 tokens left');
+    expect(out).toContain('basis=budget');
+  });
+
+  it('formatProviderUsage handles an empty report', () => {
+    expect(formatProviderUsage({ roles: [] })).toBe('No provider roles configured.');
   });
 });

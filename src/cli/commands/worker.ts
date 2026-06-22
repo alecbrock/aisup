@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import type { WorkerState } from '../../workers/types.js';
+import type { ProviderUsageReport } from '../../providers/report.js';
 
 const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
 const PID_PATH = join(homedir(), '.aisup', 'daemon.pid');
@@ -108,6 +109,26 @@ export function formatWorkerLogs(w: WorkerState): string {
   return lines.join('\n');
 }
 
+/** Render the per-provider usage readout: claude account headroom + basis, codex remaining tokens vs budget. */
+export function formatProviderUsage(report: ProviderUsageReport): string {
+  if (!report.roles.length) return 'No provider roles configured.';
+  const lines: string[] = [];
+  for (const role of report.roles) {
+    lines.push(`${role.role}:`);
+    if (!role.candidates.length) { lines.push('  (no candidates)'); continue; }
+    for (const c of role.candidates) {
+      const mark = c.available ? 'available' : 'UNAVAILABLE';
+      const detail: string[] = [];
+      if (c.headroom_pct !== null) detail.push(`headroom ${Math.round(c.headroom_pct)}%`);
+      if (c.remaining_tokens !== null) detail.push(`${c.remaining_tokens} tokens left`);
+      detail.push(`basis=${c.basis}`);
+      if (!c.available && c.reason) detail.push(`(${c.reason})`);
+      lines.push(`  ${c.label.padEnd(18)} ${mark.padEnd(12)} ${detail.join('  ')}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 const DAEMON_REQUIRED = 'Daemon not running — worker commands require the daemon. Start it with `aisup daemon start`.';
 
 export async function workerDispatch(opts: WorkerDispatchOpts): Promise<void> {
@@ -135,6 +156,14 @@ export async function workerList(opts: { json?: boolean } = {}): Promise<void> {
   const body = (await res.json()) as { workers: WorkerState[] };
   if (opts.json) return void console.log(JSON.stringify(body, null, 2));
   console.log(formatWorkerList(body.workers));
+}
+
+export async function workerProviders(opts: { json?: boolean } = {}): Promise<void> {
+  const res = await daemonRequest('/api/workers/providers', 'GET');
+  if (!res || !res.ok) return void console.log(DAEMON_REQUIRED);
+  const report = (await res.json()) as ProviderUsageReport;
+  if (opts.json) return void console.log(JSON.stringify(report, null, 2));
+  console.log(formatProviderUsage(report));
 }
 
 export async function workerStatus(id: string, opts: { json?: boolean } = {}): Promise<void> {

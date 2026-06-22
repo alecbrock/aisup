@@ -172,4 +172,21 @@ describe('worktree lifecycle & boundary (@requires_git)', () => {
     await removeWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, path: wt });
     expect(existsSync(wt)).toBe(false);
   });
+
+  it('removeWorktree also removes the now-empty worktree_dir base after the last worktree', async () => {
+    const baseSha = await resolveBaseSha({ workspaceRoot: repo, baseRef: 'HEAD' });
+    const wt = await createWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, baseSha, taskId });
+    await removeWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, path: wt });
+    expect(existsSync(join(repo, WORKTREE_DIR))).toBe(false);
+  });
+
+  it('removeWorktree keeps the worktree_dir base while another worktree remains', async () => {
+    const baseSha = await resolveBaseSha({ workspaceRoot: repo, baseRef: 'HEAD' });
+    const taskA = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const taskB = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const wtA = await createWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, baseSha, taskId: taskA });
+    await createWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, baseSha, taskId: taskB });
+    await removeWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, path: wtA });
+    expect(existsSync(join(repo, WORKTREE_DIR))).toBe(true);
+  });
 });

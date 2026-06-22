@@ -29,10 +29,19 @@ import { buildContinuationPrompt } from '../skills/continuation.js';
 import { runGates } from '../gates/engine.js';
 import type { GateRunResult } from '../gates/types.js';
 import { WorkerOrchestrator } from '../workers/orchestrator.js';
+import type { WorkerRole } from '../workers/orchestrator.js';
 import { WorkerStore } from '../workers/store.js';
 import { validateWorkerOutput } from '../workers/validation.js';
 import { reviewWorkerOutput } from '../workers/review.js';
 import { mergeWorkerOutput } from '../workers/merge.js';
+import { ClaudeProviderUsage } from '../providers/claude-usage.js';
+import { CodexProviderUsage } from '../providers/codex-usage.js';
+import { resolveCandidates } from '../providers/selector.js';
+import { buildProviderUsageReport } from '../providers/report.js';
+import type { ProviderUsageReport } from '../providers/report.js';
+import { resolveCodexBudget } from '../config/defaults.js';
+import type { ConcreteCandidate, ProviderUsage } from '../providers/types.js';
+import type { WorkerTask } from '../workers/types.js';
 import {
   resolveBaseSha,
   createWorktree,
@@ -151,8 +160,55 @@ async function main(): Promise<void> {
   // Multi-LLM worker orchestrator (Phase 3) — gated by config.workers.enabled. Constructed before
   // the server so its handlers can be injected; rehydrated/started after session rehydration.
   let workerOrchestrator: WorkerOrchestrator | undefined;
+  let getWorkerProviders: (() => ProviderUsageReport) | undefined;
   if (config.workers.enabled) {
     const workerStore = new WorkerStore(join(AISUP_DIR, 'workers'));
+
+    // Multi-provider failover wiring (Part B): provider-usage signals + candidate selector, built from
+    // the existing account registry, usage ledger, and circuit-breaker state. A failover-worthy failure
+    // (429/quota/auth/timeout/unspawnable) marks a candidate UNAVAILABLE for the circuit-breaker cooldown
+    // window — the reactive backstop that sits under the proactive ledger/budget signals.
+    const reactiveUnavailable = new Map<string, number>(); // candidate key -> unavailable-until epoch ms
+    const reactiveWindowMs = config.failover.circuit_breaker_cooldown_seconds * 1000;
+    const candidateKey = (c: ConcreteCandidate): string => (c.provider === 'claude' ? `claude:${c.account ?? ''}` : c.provider);
+    const isReactivelyUnavailable = (key: string, nowMs: number): boolean => {
+      const until = reactiveUnavailable.get(key);
+      if (until === undefined) return false;
+      if (nowMs >= until) { reactiveUnavailable.delete(key); return false; }
+      return true;
+    };
+    const markCandidateUnavailable = (c: ConcreteCandidate, nowMs: number): void => {
+      reactiveUnavailable.set(candidateKey(c), nowMs + reactiveWindowMs);
+    };
+
+    const claudeUsage = new ClaudeProviderUsage({
+      ledger: usageLedger,
+      getAccount: (name) => {
+        const a = accountRegistry.get(name);
+        if (!a) return null;
+        const nowMs = Date.now();
+        const inCooldown = a.state === 'UNAVAILABLE' || a.state === 'COOLDOWN' || (a.cooldownUntil !== null && a.cooldownUntil.getTime() > nowMs);
+        return { name: a.name, enabled: a.enabled, inCooldown, reactivelyUnavailable: isReactivelyUnavailable(`claude:${a.name}`, nowMs) };
+      },
+    });
+
+    const codexBudget = resolveCodexBudget(config.roles);
+    const codexBudgetUsage = new CodexProviderUsage({ ledger: usageLedger, budget: codexBudget });
+    // Wrap the budget meter with the reactive backstop so a 429/quota error stops codex until reset.
+    const codexUsage: ProviderUsage = {
+      usageSignal: (cand, nowMs) =>
+        isReactivelyUnavailable(candidateKey(cand), nowMs)
+          ? { available: false, headroom_pct: null, remaining_tokens: null, basis: 'budget', reason: 'reactive_unavailable' }
+          : codexBudgetUsage.usageSignal(cand, nowMs),
+    };
+
+    const providerAccounts = (): { name: string; enabled: boolean }[] => accountRegistry.getAll().map((a) => ({ name: a.name, enabled: a.enabled }));
+    const selectCandidates = (role: WorkerRole, _task: WorkerTask, nowMs: number): ConcreteCandidate[] =>
+      resolveCandidates(config.roles[role], { claudeUsage, codexUsage, accounts: providerAccounts() }, nowMs);
+    // A pinned `claude` resolves to its best available account via the same scorer/selector (single candidate).
+    const resolvePinnedClaude = (nowMs: number): ConcreteCandidate | null =>
+      resolveCandidates([{ provider: 'claude', model: null, effort: null, budget: null }], { claudeUsage, codexUsage, accounts: providerAccounts() }, nowMs)[0] ?? null;
+
     workerOrchestrator = new WorkerOrchestrator({
       store: workerStore,
       config: config.workers,
@@ -174,7 +230,25 @@ async function main(): Promise<void> {
       reviewOutput: reviewWorkerOutput,
       mergeOutput: mergeWorkerOutput,
       resolveActiveSessionCwd: () => sessionManager.getActiveSession()?.cwd ?? null,
+      selectCandidates,
+      recordCodexUsage: (provider, tokens, nowMs) => usageLedger.recordConsumption(provider, tokens, nowMs, codexBudget),
+      markCandidateUnavailable,
+      getClaudeAccountConfigDir: (account) => accountRegistry.get(account)?.configDir ?? null,
+      resolvePinnedClaude,
+      // Cross-LLM failover → notify the active session's Slack channel (account↔account is routine, not posted).
+      notifyCrossProviderFailover: (taskId, from, to) => {
+        const active = sessionManager.getActiveSession();
+        void slackService?.notifyWorkerFailover({ sessionId: active?.aisup_session_id ?? null, taskId, from, to });
+      },
     });
+
+    // Per-provider usage readout for `aisup worker providers` / GET /api/workers/providers.
+    getWorkerProviders = () =>
+      buildProviderUsageReport(
+        config.roles,
+        { claudeUsage, codexUsage, accounts: accountRegistry.getAll().map((a) => ({ name: a.name, enabled: a.enabled })) },
+        Date.now()
+      );
   }
 
   // Validation gates: run the configured executable/arg-array gates (manual via API/Slack/CLI,
@@ -318,6 +392,7 @@ async function main(): Promise<void> {
     approveWorker: workerOrchestrator ? (id, by) => workerOrchestrator!.approve(id, by) : undefined,
     denyWorker: workerOrchestrator ? (id, by) => workerOrchestrator!.deny(id, by) : undefined,
     cancelWorker: workerOrchestrator ? (id) => workerOrchestrator!.cancel(id) : undefined,
+    getWorkerProviders,
     onSessionStart: (session) => slackService?.onSessionStart(session),
     onSessionStop: (session) => {
       // R13: a stopped session ends the recovery cycle — clear its restart + network windows.

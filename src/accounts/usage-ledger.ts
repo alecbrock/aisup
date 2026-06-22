@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { CodexBudgetConfig } from '../config/schema.js';
 
 /**
  * Per-account usage ledger.
@@ -43,25 +44,45 @@ interface LedgerEntry {
   seven_day?: LedgerWindow;
 }
 
+/** A metered token budget for a provider (codex). `period_reset_at` is Unix epoch SECONDS. */
+interface BudgetEntry {
+  tokens_used: number;
+  cap: number;
+  period_reset_at: number;
+}
+
+export interface BudgetEstimate {
+  tokens_used: number;
+  cap: number;
+  remaining: number;
+  available: boolean;
+}
+
 const DEFAULT_FRESHNESS_MS = 5 * 60 * 1000;
 
 export class UsageLedger {
   private readonly path: string;
   private readonly freshnessMs: number;
   private entries: Record<string, LedgerEntry>;
+  private budgets: Record<string, BudgetEntry>;
 
   constructor(path: string, freshnessMs: number = DEFAULT_FRESHNESS_MS) {
     this.path = path;
     this.freshnessMs = freshnessMs;
-    this.entries = this.load();
+    const loaded = this.load();
+    this.entries = loaded.accounts;
+    this.budgets = loaded.budgets;
   }
 
-  private load(): Record<string, LedgerEntry> {
+  private load(): { accounts: Record<string, LedgerEntry>; budgets: Record<string, BudgetEntry> } {
     try {
-      const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as { accounts?: Record<string, LedgerEntry> };
-      return parsed.accounts ?? {};
+      const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as {
+        accounts?: Record<string, LedgerEntry>;
+        budgets?: Record<string, BudgetEntry>;
+      };
+      return { accounts: parsed.accounts ?? {}, budgets: parsed.budgets ?? {} };
     } catch {
-      return {};
+      return { accounts: {}, budgets: {} };
     }
   }
 
@@ -72,8 +93,37 @@ export class UsageLedger {
       // best-effort; the write below will surface a real failure
     }
     const tmp = `${this.path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ accounts: this.entries }, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify({ accounts: this.entries, budgets: this.budgets }, null, 2), { mode: 0o600 });
     renameSync(tmp, this.path);
+  }
+
+  /**
+   * Add `tokens` to a provider's rolling budget meter. Starts a fresh period (tokens_used=0) when there
+   * is no entry or the stored period has elapsed; `cap` is refreshed from the live config each call.
+   */
+  recordConsumption(provider: string, tokens: number, nowMs: number, cfg: CodexBudgetConfig): void {
+    const nowS = Math.floor(nowMs / 1000);
+    const existing = this.budgets[provider];
+    const fresh = !existing || nowS >= existing.period_reset_at;
+    const entry: BudgetEntry = fresh
+      ? { tokens_used: 0, cap: cfg.tokens, period_reset_at: nowS + cfg.period_hours * 3600 }
+      : { ...existing, cap: cfg.tokens };
+    entry.tokens_used += tokens;
+    this.budgets[provider] = entry;
+    this.persist();
+  }
+
+  /**
+   * Best-estimate budget state for a provider against the LIVE config cap (so a config change takes
+   * effect immediately, not after the next run). `tokens_used` decays to 0 once the stored period elapses.
+   */
+  estimateBudget(provider: string, nowMs: number, cfg: CodexBudgetConfig): BudgetEstimate {
+    const nowS = Math.floor(nowMs / 1000);
+    const entry = this.budgets[provider];
+    const used = !entry || nowS >= entry.period_reset_at ? 0 : entry.tokens_used;
+    const cap = cfg.tokens;
+    const remaining = Math.max(0, cap - used);
+    return { tokens_used: used, cap, remaining, available: used < cap };
   }
 
   /** Record live usage for an account. Only the windows present are updated. */

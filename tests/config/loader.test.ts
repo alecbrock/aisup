@@ -495,6 +495,8 @@ describe('loadConfig — workers section', () => {
     expect(config.workers.adapters.codex.command).toBe('codex');
     expect(config.workers.adapters.codex.name).toBe('codex');
     expect(config.workers.adapters.codex.enabled).toBe(false);
+    expect(config.workers.adapters.codex.output_format).toBe('json');
+    expect(config.workers.adapters.gemini.output_format).toBe('text');
     expect(config.workers.routing.default_implementer).toBe('codex');
     expect(config.workers.review.allow_same_model_review).toBe(false);
     expect(config.workers.merge.require_approval).toBe(true);
@@ -515,6 +517,12 @@ describe('loadConfig — workers section', () => {
     await expect(
       loadConfig(writeConfig('workers:\n  merge:\n    require_approval: false\n'))
     ).rejects.toThrow(/require_approval/i);
+  });
+
+  it('rejects an adapter output_format that is not text|json', async () => {
+    await expect(
+      loadConfig(writeConfig('workers:\n  adapters:\n    codex:\n      output_format: yaml\n'))
+    ).rejects.toThrow(/output_format must be one of text\|json/i);
   });
 
   it('rejects security.boundary_audit: false', async () => {
@@ -621,5 +629,66 @@ describe('loadConfig — workers section', () => {
   validation_gates: []
 `;
     await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/validation|required|gate/i);
+  });
+
+  // --- roles: section (Part B — multi-provider failover) ---
+
+  it('synthesizes one-candidate roles from workers.routing when roles is absent', async () => {
+    const config = await loadConfig(writeConfig(enabledBase));
+    expect(config.roles.implementer).toEqual([{ provider: 'codex', model: null, effort: null, budget: null }]);
+    expect(config.roles.reviewer).toEqual([{ provider: 'gemini', model: null, effort: null, budget: null }]);
+  });
+
+  it('parses an explicit roles block with claude + codex candidates in order', async () => {
+    const yaml = `${enabledBase}roles:
+  implementer:
+    - provider: claude
+      model: claude-opus-4-8
+    - provider: codex
+      budget:
+        tokens: 1000000
+        period_hours: 5
+  reviewer:
+    - provider: codex
+`;
+    const config = await loadConfig(writeConfig(yaml));
+    expect(config.roles.implementer).toHaveLength(2);
+    expect(config.roles.implementer[0].provider).toBe('claude');
+    expect(config.roles.implementer[0].model).toBe('claude-opus-4-8');
+    expect(config.roles.implementer[1].provider).toBe('codex');
+    expect(config.roles.implementer[1].budget).toEqual({ tokens: 1000000, period_hours: 5 });
+    expect(config.roles.reviewer[0].provider).toBe('codex');
+  });
+
+  it('rejects a roles candidate naming neither claude nor a defined adapter', async () => {
+    const yaml = `${enabledBase}roles:
+  implementer:
+    - provider: nonsense
+  reviewer:
+    - provider: codex
+`;
+    await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/nonsense|defined adapter|claude/i);
+  });
+
+  it('rejects an empty implementer candidate list when workers are enabled', async () => {
+    const yaml = `${enabledBase}roles:
+  implementer: []
+  reviewer:
+    - provider: codex
+`;
+    await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/implementer|non-empty|candidate/i);
+  });
+
+  it('rejects a non-positive codex budget on a candidate', async () => {
+    const yaml = `${enabledBase}roles:
+  implementer:
+    - provider: codex
+      budget:
+        tokens: 0
+        period_hours: 5
+  reviewer:
+    - provider: codex
+`;
+    await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/budget|tokens|positive/i);
   });
 });

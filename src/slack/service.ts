@@ -175,6 +175,19 @@ export class SlackService {
       aisup_session_id: session.aisup_session_id,
       details: { channel_id: channelId },
     });
+
+    // PRD Flow 1 step 5: post session info so the channel opens with context, not just joins.
+    try {
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: [
+          ':rocket: *Supervised session started*',
+          `• Session: \`${session.aisup_session_id}\``,
+          `• Account: \`${session.account}\``,
+          `• Directory: \`${session.cwd}\``,
+        ].join('\n'),
+      });
+    } catch { /* best effort */ }
   }
 
   async onSessionStop(sessionId: string): Promise<void> {
@@ -200,6 +213,23 @@ export class SlackService {
       await this.app.client.chat.postMessage({
         channel: channelId,
         text: `:warning: Session \`${sessionId}\` is EXHAUSTED — no eligible failover account is available (reason: ${reason}).`,
+      });
+    } catch { /* best effort */ }
+  }
+
+  /**
+   * Notify the active session's channel that a worker crossed LLM providers (claude↔codex). Best-effort.
+   * Account-to-account failover within Claude is routine and NOT notified here — the daemon only calls
+   * this for cross-provider failovers.
+   */
+  async notifyWorkerFailover(opts: { sessionId: string | null; taskId: string; from: string; to: string }): Promise<void> {
+    if (!this.app) return;
+    const channelId = opts.sessionId ? this.channelMap.get(opts.sessionId) : undefined;
+    if (!channelId) return;
+    try {
+      await this.app.client.chat.postMessage({
+        channel: channelId,
+        text: `:arrows_counterclockwise: Worker \`${opts.taskId}\` failed over across providers: *${opts.from}* → *${opts.to}*.`,
       });
     } catch { /* best effort */ }
   }
