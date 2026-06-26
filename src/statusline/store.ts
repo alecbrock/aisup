@@ -43,7 +43,28 @@ type TelemetryParse =
   | { ok: true; telemetry: StatuslineTelemetry }
   | { ok: false; reason: 'missing' | 'invalid_json'; error: string };
 
-/** Read and parse a telemetry file, distinguishing a missing file from malformed JSON. */
+/**
+ * Runtime shape guard (AF-303): the statusline file is written by an external process, so valid
+ * JSON with the wrong field types (e.g. `transcript_path: 123`) would slip past `JSON.parse` and
+ * later throw a TypeError at `.startsWith(...)`. Reject a non-object root and any present string
+ * field that is not a string, so such files are surfaced as invalid_json rather than crashing.
+ */
+function isValidTelemetryShape(v: unknown): v is StatuslineTelemetry {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  for (const key of ['session_id', 'transcript_path', 'cwd'] as const) {
+    if (key in o && o[key] !== undefined && typeof o[key] !== 'string') return false;
+  }
+  if ('workspace' in o && o.workspace !== undefined) {
+    const w = o.workspace;
+    if (typeof w !== 'object' || w === null || Array.isArray(w)) return false;
+    const pd = (w as Record<string, unknown>).project_dir;
+    if (pd !== undefined && typeof pd !== 'string') return false;
+  }
+  return true;
+}
+
+/** Read and parse a telemetry file, distinguishing a missing file from malformed/wrong-shape JSON. */
 function parseTelemetryFile(path: string): TelemetryParse {
   let raw: string;
   try {
@@ -51,13 +72,18 @@ function parseTelemetryFile(path: string): TelemetryParse {
   } catch {
     return { ok: false, reason: 'missing', error: 'file not found' };
   }
+  let parsed: unknown;
   try {
-    return { ok: true, telemetry: JSON.parse(raw) as StatuslineTelemetry };
+    parsed = JSON.parse(raw);
   } catch (err) {
     // Safe summary only — the parser message, never the file contents.
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, reason: 'invalid_json', error: message.slice(0, 160) };
   }
+  if (!isValidTelemetryShape(parsed)) {
+    return { ok: false, reason: 'invalid_json', error: 'telemetry JSON has an unexpected shape (wrong field types)' };
+  }
+  return { ok: true, telemetry: parsed };
 }
 
 /** Convenience wrapper for callers that only need telemetry-or-null (account scoring, scan). */

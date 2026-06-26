@@ -101,6 +101,27 @@ describe('refreshAccountScores', () => {
     expect(winner?.name).toBe('secondary');
   });
 
+  // AF-314: a recovered account must drop its stale cooldownUntil, not carry it into runnable states.
+  it('clears cooldownUntil when an account recovers from UNAVAILABLE to a runnable state (AF-314)', () => {
+    const registry = makeRegistry([{ name: 'primary', dir: '/tmp/p', priority: 1 }]);
+
+    // Hard threshold crossed → UNAVAILABLE with a cooldown.
+    registry.applyTelemetry('primary', 99, 0, 85, 95, new Date(Date.now() + 600_000));
+    expect(registry.get('primary')?.state).toBe('UNAVAILABLE');
+    expect(registry.get('primary')?.cooldownUntil).toBeInstanceOf(Date);
+
+    // Usage falls below soft → HEALTHY; the stale cooldown must be cleared.
+    registry.applyTelemetry('primary', 10, 10, 85, 95, null);
+    expect(registry.get('primary')?.state).toBe('HEALTHY');
+    expect(registry.get('primary')?.cooldownUntil).toBeNull();
+
+    // Recovery into the DEGRADED band also clears the cooldown.
+    registry.applyTelemetry('primary', 99, 0, 85, 95, new Date(Date.now() + 600_000)); // UNAVAILABLE again
+    registry.applyTelemetry('primary', 88, 0, 85, 95, null); // soft band → DEGRADED
+    expect(registry.get('primary')?.state).toBe('DEGRADED');
+    expect(registry.get('primary')?.cooldownUntil).toBeNull();
+  });
+
   it('drives an account to DEGRADED when soft threshold is crossed by telemetry', () => {
     const dir = accountDir('primary');
     writeTelemetry(dir, 88, 20); // five-hour 88% ≥ soft 85, < hard 95

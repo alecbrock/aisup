@@ -15,7 +15,10 @@ export const DEFAULT_PERMISSION_PATTERNS: RegExp[] = [
   new RegExp(`\\ballow\\s+(?<tool>${TOOL})\\s+to\\s+(?<detail>.+?)\\s*\\?`, 'i'),
   new RegExp(`permission to (?:use|run)\\s+(?<tool>${TOOL})\\b[:\\s-]*(?<detail>.*)`, 'i'),
   new RegExp(`^\\s*(?<tool>${TOOL})\\b[^:\\n]*:\\s*(?<detail>.+\\S)\\s*$`, 'i'),
-  /(?:^|\s)(?<detail>do you want to (?:proceed|continue|make this edit|run this)\b[^?\n]*\??)/i,
+  // Verb set audited against real Claude 2.1.x prompts (AF-103): "create" was missing, so a live
+  // "Do you want to create <file>?" never fired permission.detected. (Cursor-fragmentation of the
+  // modal render is a separate, deeper detection-robustness issue tracked under the validation plan.)
+  /(?:^|\s)(?<detail>do you want to (?:proceed|continue|make this edit|create|run this|delete|overwrite)\b[^?\n]*\??)/i,
 ];
 
 const MAX_FIELD = 200;

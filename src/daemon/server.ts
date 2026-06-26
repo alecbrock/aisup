@@ -184,7 +184,8 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     }
 
     if (!opts.sessionManager || !opts.accountRegistry || (!opts.runnerConfig && !opts.runner)) {
-      return reply.status(201).send({ status: 'created', cwd, message: 'deps not wired' });
+      // Fail loudly (AF-327): a misconfigured daemon must NOT report a phantom "created" session.
+      return reply.status(503).send({ error: 'session dependencies not configured' });
     }
 
     // Refresh scores/state from telemetry + circuit breaker, then use the canonical
@@ -204,7 +205,6 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
       const state = await opts.sessionManager.createSession({
         aisupSessionId,
         account: bestAccount.name,
-        accountConfigDir: bestAccount.configDir,
         command: launchCommand.command,
         args: launchCommand.args,
         env: launchCommand.env,
@@ -290,6 +290,25 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
   // returned JSON tells Claude Code to allow or deny, so no dialog/keystroke handling is needed.
   app.post('/api/hooks/permission', async (req, reply) => {
     const body = (req.body ?? {}) as { tool_name?: string; tool_input?: unknown; session_id?: string };
+    // Validate shape/size (AF-327): reject wrong-typed fields and an oversized tool_input payload
+    // before it is forwarded to the broker / posted to Slack.
+    if (body.tool_name !== undefined && typeof body.tool_name !== 'string') {
+      return reply.status(400).send({ error: 'tool_name must be a string' });
+    }
+    if (body.session_id !== undefined && typeof body.session_id !== 'string') {
+      return reply.status(400).send({ error: 'session_id must be a string' });
+    }
+    if (body.tool_input !== undefined && body.tool_input !== null) {
+      let inputSize: number;
+      try {
+        inputSize = JSON.stringify(body.tool_input).length;
+      } catch {
+        return reply.status(400).send({ error: 'tool_input is not serializable' });
+      }
+      if (inputSize > 100_000) {
+        return reply.status(413).send({ error: 'tool_input exceeds 100000 bytes' });
+      }
+    }
     if (!opts.onPermissionHook) {
       // Broker not wired → no decision; Claude Code's own permission flow proceeds.
       return reply.send({});
@@ -451,7 +470,6 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
           return opts.sessionManager!.createSession({
             aisupSessionId: snapshot.aisupSessionId,
             account: target.name,
-            accountConfigDir: target.configDir,
             command: commandForTarget.command,
             args: commandForTarget.args,
             env: commandForTarget.env,

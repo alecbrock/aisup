@@ -1,13 +1,13 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../../config/loader.js';
 import { readTelemetryForAccount } from '../../statusline/store.js';
 
 export async function showAccounts(): Promise<void> {
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
-  const tokenPath = join(homedir(), '.aisup', 'api-token');
+  const pidPath = join(aisupHome(), 'daemon.pid');
+  const tokenPath = join(aisupHome(), 'api-token');
 
   if (!existsSync(pidPath) || !existsSync(tokenPath)) {
     await showAccountsOffline();

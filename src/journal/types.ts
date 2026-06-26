@@ -6,6 +6,7 @@ export type EventType =
   | 'session.attach'
   | 'session.destroyed_externally'
   | 'session.exhausted'
+  | 'session.state_corrupt'
   // Account
   | 'account.switch'
   // Runner lifecycle
@@ -72,6 +73,7 @@ export type EventType =
   | 'daemon.stopped'
   | 'daemon.rehydrated'
   | 'daemon.ready'
+  | 'daemon.uncaught_error'
   // Telemetry
   | 'telemetry.stale_warning'
   | 'telemetry.invalid_json'
@@ -83,6 +85,7 @@ export type EventType =
   | 'slack.queue_dropped'
   | 'slack.rate_limited'
   | 'slack.message_ignored'
+  | 'slack.invite_failed'
   // tmux
   | 'tmux.command_timeout'
   // Output log
@@ -131,6 +134,13 @@ export interface ReadEventsOptions {
   since?: string;
   type?: EventType | string;
   limit?: number;
+}
+
+/** Outcome of a journal append. `appendEvent` NEVER throws (AF-301) — a write/scan failure is
+ * reported here as `{ok:false, reason}` and surfaced as a stderr health line, not a crash. */
+export interface JournalAppendResult {
+  ok: boolean;
+  reason?: string;
 }
 
 export interface JournalWriter {

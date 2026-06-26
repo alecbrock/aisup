@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runWorker } from '../../src/workers/runner.js';
+import { runWorker, tailOutput } from '../../src/workers/runner.js';
 import type { WorkerExec } from '../../src/workers/runner.js';
 import type { WorkerLaunchPlan } from '../../src/workers/adapter.js';
 import { GATE_OUTPUT_TAIL_LIMIT } from '../../src/gates/engine.js';
@@ -58,7 +58,7 @@ describe('runWorker', () => {
     expect(res.stdout).toBe('GOT:hello-stdin');
   });
 
-  it('truncates stdout to the tail limit', async () => {
+  it('returns FULL stdout (no tail-truncation) so the orchestrator/reviewer can parse large JSON output', async () => {
     const n = GATE_OUTPUT_TAIL_LIMIT + 500;
     const plan: WorkerLaunchPlan = {
       command: 'node',
@@ -68,7 +68,13 @@ describe('runWorker', () => {
       promptFile: null,
     };
     const res = await runWorker(plan, { cwd: tmpDir, timeoutSeconds: 30 });
-    expect(res.stdout.length).toBe(GATE_OUTPUT_TAIL_LIMIT);
+    // FULL — truncating before the JSON parse corrupts the reviewer verdict + worker usage.
+    expect(res.stdout.length).toBe(n);
+  });
+
+  it('tailOutput truncates a persisted sample to the tail limit', () => {
+    expect(tailOutput('x'.repeat(GATE_OUTPUT_TAIL_LIMIT + 500)).length).toBe(GATE_OUTPUT_TAIL_LIMIT);
+    expect(tailOutput('short')).toBe('short');
   });
 
   it('passes shell metacharacters literally (no expansion) — proves shell-free', async () => {

@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../config/paths.js';
 import { mkdir, readFile } from 'node:fs/promises';
 import { RotatingLog } from '../util/rotating-log.js';
 import { loadConfig } from '../config/loader.js';
@@ -21,6 +21,7 @@ import { ExhaustedRecovery, resumeExhaustedSession } from '../recovery/exhausted
 import { PermissionDetector } from '../permissions/detector.js';
 import { PermissionBroker } from '../permissions/broker.js';
 import { evaluatePermission } from '../permissions/policy.js';
+import { PendingPermissionQueue } from '../permissions/pending-queue.js';
 import type { PermissionRequest } from '../permissions/types.js';
 import type { PermissionHookRequest } from './server.js';
 import { writeHookSettings } from '../hooks/claude-hooks.js';
@@ -61,7 +62,9 @@ import type { LaunchMode } from '../failover/switcher.js';
 import type { AccountInfo } from '../accounts/types.js';
 import type { SessionState } from '../session/types.js';
 
-const AISUP_DIR = join(homedir(), '.aisup');
+// Read at import time: the daemon process has AISUP_HOME (when set) in its env before launch, so
+// this captures the correct isolated state dir for the whole process lifetime (see config/paths.ts).
+const AISUP_DIR = aisupHome();
 const PID_PATH = join(AISUP_DIR, 'daemon.pid');
 const TOKEN_PATH = join(AISUP_DIR, 'api-token');
 const LOG_PATH = join(AISUP_DIR, 'daemon.log');
@@ -155,6 +158,7 @@ async function main(): Promise<void> {
     stateDir: join(AISUP_DIR, 'sessions'),
     outputLogMaxSizeMb: config.session.output_log_max_size_mb,
     outputLogRetentionDays: config.session.output_log_retention_days,
+    journal,
   });
 
   // Multi-LLM worker orchestrator (Phase 3) — gated by config.workers.enabled. Constructed before
@@ -255,10 +259,21 @@ async function main(): Promise<void> {
   // automatic via the idle+skill trigger). The latest run is cached for GET /api/gates.
   let latestGateRun: GateRunResult | null = null;
   const runConfiguredGates = async (): Promise<GateRunResult> => {
-    const active = sessionManager.getActiveSession();
-    const result = await runGates(config.gates.gates, { journal, defaultCwd: active?.cwd });
-    latestGateRun = result;
-    return result;
+    // Centralized guard for ALL gate entry points (HTTP /api/gates/run, Slack !gate, idle trigger):
+    // a gate-execution failure must return a failed result, never throw/crash the handler (AF-301).
+    try {
+      const active = sessionManager.getActiveSession();
+      const result = await runGates(config.gates.gates, { journal, defaultCwd: active?.cwd });
+      latestGateRun = result;
+      return result;
+    } catch (err: unknown) {
+      try {
+        process.stderr.write(`[aisup daemon] gate run failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      } catch { /* log sink down */ }
+      const result: GateRunResult = { passed: false, results: [] };
+      latestGateRun = result;
+      return result;
+    }
   };
 
   // Permission broker via Claude Code's PermissionRequest hook (F). The hook is the reliable
@@ -266,7 +281,9 @@ async function main(): Promise<void> {
   // terminal dialog appear. `!permit`/`!deny` then resolves by sending a keystroke to that dialog —
   // which never times out — so a human can decide minutes or hours later. Pending requests keyed by
   // aisup session id (the dialog persists; the keystroke confirms whichever option the config names).
-  const hookPermissions = new Map<string, PermissionRequest>();
+  // Per-session FIFO queue of pending hook permissions (AF-302): two concurrent permission.ask for
+  // one session are both tracked and resolved independently (earliest-first), not overwritten.
+  const hookPermissions = new PendingPermissionQueue();
   const sendPermissionKey = (aisupSessionId: string, approve: boolean): boolean => {
     const s = sessionManager.readState(aisupSessionId);
     if (!s || (s.status !== 'ACTIVE' && s.status !== 'SWITCH_PENDING_AT_IDLE')) return false;
@@ -275,9 +292,8 @@ async function main(): Promise<void> {
     return true;
   };
   const resolveHookPermissionViaKeystroke = (aisupSessionId: string, approve: boolean): boolean => {
-    const pending = hookPermissions.get(aisupSessionId);
+    const pending = hookPermissions.dequeue(aisupSessionId); // earliest-pending (FIFO)
     if (!pending) return false;
-    hookPermissions.delete(aisupSessionId);
     const sent = sendPermissionKey(aisupSessionId, approve);
     void journal.append({
       ts: new Date().toISOString(),
@@ -339,8 +355,9 @@ async function main(): Promise<void> {
     if (!config.permissions.slack_routing || !slackService) {
       return config.permissions.policy.default_action === 'allow' ? 'allow' : 'deny';
     }
-    // Register the pending request, post to Slack, and DEFER (null) so the dialog shows and waits.
-    hookPermissions.set(active.aisup_session_id, request);
+    // Register the pending request (appended to the session's FIFO queue), post to Slack, and DEFER
+    // (null) so the dialog shows and waits. Concurrent asks queue rather than overwrite (AF-302).
+    hookPermissions.enqueue(active.aisup_session_id, request);
     void journal.append({
       ts: new Date().toISOString(),
       event_type: 'permission.detected',
@@ -399,8 +416,8 @@ async function main(): Promise<void> {
       loopManagerRef?.clearRecoveryCounters(session.aisup_session_id);
       // A terminal stop also ends any EXHAUSTED auto-resume polling for the session.
       exhaustedRecoveryRef?.stop(session.aisup_session_id);
-      // Drop any pending hook permission for the stopped session (its dialog/pane is gone).
-      hookPermissions.delete(session.aisup_session_id);
+      // Drop any pending hook permissions for the stopped session (its dialog/pane is gone).
+      hookPermissions.clear(session.aisup_session_id);
       return slackService?.onSessionStop(session.aisup_session_id);
     },
     refreshAccounts,
@@ -457,7 +474,6 @@ async function main(): Promise<void> {
     const state = await sessionManager.createSession({
       aisupSessionId: snapshot.aisupSessionId,
       account: acct.name,
-      accountConfigDir: acct.configDir,
       command: cmd.command,
       args: cmd.args,
       env: cmd.env,
@@ -813,6 +829,23 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // AF-301 backstop: the supervisor daemon's one job is to keep the supervised session alive. A stray
+  // rejection or uncaught error (gate/journal/Slack hiccup, etc.) must NOT take it down. Log loudly +
+  // best-effort journal, but DO NOT process.exit — overriding Node's default crash-on-unhandled.
+  const handleDaemonError = (kind: string) => (err: unknown): void => {
+    const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    try {
+      process.stderr.write(`[aisup daemon] ${kind} (non-fatal — daemon staying up): ${detail}\n`);
+    } catch { /* log sink down */ }
+    void journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'daemon.uncaught_error',
+      details: { kind, error: err instanceof Error ? err.message : String(err) },
+    });
+  };
+  process.on('unhandledRejection', handleDaemonError('unhandledRejection'));
+  process.on('uncaughtException', handleDaemonError('uncaughtException'));
 }
 
 main().catch((err: unknown) => {

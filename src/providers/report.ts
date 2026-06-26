@@ -35,6 +35,9 @@ export interface ProviderUsageInputs {
 
 /** Enumerate every role candidate (claude expands to enabled accounts) with its current usage signal. */
 export function buildProviderUsageReport(roles: RolesConfig, inputs: ProviderUsageInputs, nowMs: number): ProviderUsageReport {
+  // Only the two roles the worker orchestrator actually executes are reported (AF-307). `roles.orchestrator`
+  // is reserved/latent — declared + validated in config but never consumed by worker execution (AF-R009),
+  // so surfacing its availability would imply a capability that does not exist.
   const roleLists: [string, RolesConfig['implementer']][] = [
     ['implementer', roles.implementer],
     ['reviewer', roles.reviewer],

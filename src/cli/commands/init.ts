@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { writeFileSync, existsSync, mkdirSync } from 'node:fs';
 
 const DEFAULT_CONFIG_YAML = `accounts:
@@ -65,7 +65,7 @@ export function generateInitConfig(): InitConfigResult {
 }
 
 export async function runInit(opts: { dryRun?: boolean; force?: boolean }): Promise<void> {
-  const aisupDir = join(homedir(), '.aisup');
+  const aisupDir = aisupHome();
   const configPath = join(aisupDir, 'config.yaml');
   const tokenPath = join(aisupDir, 'api-token');
 

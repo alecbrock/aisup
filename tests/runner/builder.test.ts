@@ -69,6 +69,21 @@ describe('buildLaunchCommand', () => {
     expect(result.env['CLAUDE_CONFIG_DIR']).toBeUndefined();
   });
 
+  // AF-318: config_dir_env becomes a bare tmux -e key — reject non-POSIX env var names.
+  it('rejects a config_dir_env that is not a valid env var name', () => {
+    const config: RunnerConfig = { ...BASE_CONFIG, config_dir_env: 'BAD-NAME' };
+    expect(() => buildLaunchCommand(config, '/home/user/.claude')).toThrow(/config_dir_env|env var name/i);
+  });
+
+  // AF-317: an empty/control-byte accountConfigDir would produce a cryptic auth failure.
+  it('rejects an empty accountConfigDir', () => {
+    expect(() => buildLaunchCommand(BASE_CONFIG, '')).toThrow(/accountConfigDir|non-empty/i);
+  });
+
+  it('rejects an accountConfigDir containing a control character', () => {
+    expect(() => buildLaunchCommand(BASE_CONFIG, '/home/\nuser/.claude')).toThrow(/accountConfigDir|control/i);
+  });
+
   it('should include extra args from config.args', () => {
     const config: RunnerConfig = { ...BASE_CONFIG, args: ['--model', 'opus'] };
     const result = buildLaunchCommand(config, '/home/user/.claude');
@@ -137,5 +152,11 @@ describe('validateRunner', () => {
     // /bin/sh is always on PATH
     const resolved = validateRunner({ ...BASE_CONFIG, command: 'sh' });
     expect(resolved.startsWith('/')).toBe(true);
+  });
+
+  // AF-319: a non-executable absolute path reports "not executable", distinct from "not found".
+  it('distinguishes a found-but-not-executable command from not-found (AF-319)', () => {
+    // /etc/hosts exists but is not executable.
+    expect(() => validateRunner({ ...BASE_CONFIG, command: '/etc/hosts' })).toThrow(/not executable/i);
   });
 });

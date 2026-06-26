@@ -29,6 +29,14 @@ describe('PermissionDetector', () => {
     expect(reqs[0].detail.toLowerCase()).toContain('do you want to proceed');
   });
 
+  // AF-103: the real Claude prompt "Do you want to create <file>?" must fire permission.detected.
+  it('detects the "create" verb prompt (AF-103)', () => {
+    const d = new PermissionDetector([]);
+    const reqs = d.scan('Do you want to create permtest.txt?');
+    expect(reqs).toHaveLength(1);
+    expect(reqs[0].detail.toLowerCase()).toContain('do you want to create');
+  });
+
   it('deduplicates a prompt that persists across consecutive scans', () => {
     const d = new PermissionDetector([]);
     expect(d.scan('Do you want to proceed?')).toHaveLength(1);

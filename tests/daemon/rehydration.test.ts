@@ -134,6 +134,36 @@ describe('rehydrateSessions', () => {
     );
   });
 
+  // AF-312: a corrupt/wrong-shape state.json must emit session.state_corrupt, not silently drop the
+  // session from supervision — and must not crash rehydration.
+  it('emits session.state_corrupt for an unparseable state.json (AF-312)', async () => {
+    const stateDir = join(tmpDir, 'sessions');
+    const sessionDir = join(stateDir, 'sess-corrupt');
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sessionDir, 'state.json'), '{ not valid json', { mode: 0o600 });
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    await expect(
+      rehydrateSessions({ stateDir, tmuxSocket: 'aisup-test', liveSessions: new Set<string>(), setSessionState: vi.fn(), journal })
+    ).resolves.toBeTruthy();
+
+    const events = journal.append.mock.calls.map((c) => c[0] as { event_type: string });
+    expect(events.some((e) => e.event_type === 'session.state_corrupt')).toBe(true);
+  });
+
+  it('emits session.state_corrupt for a wrong-shape (valid JSON, not a SessionState) state.json (AF-312)', async () => {
+    const stateDir = join(tmpDir, 'sessions');
+    const sessionDir = join(stateDir, 'sess-shape');
+    mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sessionDir, 'state.json'), JSON.stringify({ aisup_session_id: 123 }), { mode: 0o600 });
+
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    await rehydrateSessions({ stateDir, tmuxSocket: 'aisup-test', liveSessions: new Set<string>(), setSessionState: vi.fn(), journal });
+
+    const events = journal.append.mock.calls.map((c) => c[0] as { event_type: string });
+    expect(events.some((e) => e.event_type === 'session.state_corrupt')).toBe(true);
+  });
+
   it('uses the shared resolver to flag stale source-account telemetry for a rehydrated known session', async () => {
     const statuslineDir = join(tmpDir, 'statusline');
     const currentConfigDir = join(tmpDir, '.claude-current');

@@ -1,12 +1,12 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../../config/loader.js';
 import { readEvents } from '../../journal/reader.js';
 import type { JournalEvent } from '../../journal/types.js';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
 
 function printEvents(events: Array<Pick<JournalEvent, 'ts' | 'event_type' | 'account'>>): void {
   for (const ev of events) {
@@ -21,7 +21,7 @@ function printEvents(events: Array<Pick<JournalEvent, 'ts' | 'event_type' | 'acc
 }
 
 async function fetchOnline(limit: number, type?: string): Promise<JournalEvent[] | null> {
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
+  const pidPath = join(aisupHome(), 'daemon.pid');
   if (!existsSync(pidPath)) return null;
   try {
     const { port } = JSON.parse(await readFile(pidPath, 'utf8')) as { port: number };

@@ -16,6 +16,8 @@ import {
   startOutputLog,
 } from './tmux.js';
 import type { SessionState } from './types.js';
+import { isValidSessionState } from './validate.js';
+import type { JournalWriter } from '../journal/types.js';
 import { singleQuote } from '../util/shell.js';
 import { getBlockingSession as getBlockingSessionFromState } from '../cli/pid.js';
 
@@ -24,12 +26,13 @@ export interface SessionManagerOpts {
   stateDir: string;
   outputLogMaxSizeMb: number;
   outputLogRetentionDays?: number;
+  /** Optional: when set, a corrupt/wrong-shape state.json emits session.state_corrupt (AF-313). */
+  journal?: JournalWriter;
 }
 
 export interface CreateSessionOpts {
   aisupSessionId: string;
   account: string;
-  accountConfigDir: string;
   command: string;
   args: string[];
   env: Record<string, string>;
@@ -42,12 +45,14 @@ export class SessionManager {
   private stateDir: string;
   private outputLogMaxSizeMb: number;
   private outputLogRetentionDays: number;
+  private journal?: JournalWriter;
 
   constructor(opts: SessionManagerOpts) {
     this.socket = opts.tmuxSocket;
     this.stateDir = opts.stateDir;
     this.outputLogMaxSizeMb = opts.outputLogMaxSizeMb;
     this.outputLogRetentionDays = opts.outputLogRetentionDays ?? 7;
+    this.journal = opts.journal;
   }
 
   private sessionDir(aisupSessionId: string): string {
@@ -74,11 +79,30 @@ export class SessionManager {
   readState(aisupSessionId: string): SessionState | null {
     const path = this.statePath(aisupSessionId);
     if (!existsSync(path)) return null;
+    let parsed: unknown;
     try {
-      return JSON.parse(readFileSync(path, 'utf8')) as SessionState;
-    } catch {
+      parsed = JSON.parse(readFileSync(path, 'utf8'));
+    } catch (err) {
+      // Don't silently drop a corrupt state.json from supervision — surface it (AF-313). Best-effort
+      // journal (never throws); the read still returns null so callers degrade safely.
+      void this.journal?.append({
+        ts: new Date().toISOString(),
+        event_type: 'session.state_corrupt',
+        aisup_session_id: aisupSessionId,
+        details: { source: 'readState', error: (err instanceof Error ? err.message : String(err)).slice(0, 160) },
+      });
       return null;
     }
+    if (!isValidSessionState(parsed)) {
+      void this.journal?.append({
+        ts: new Date().toISOString(),
+        event_type: 'session.state_corrupt',
+        aisup_session_id: aisupSessionId,
+        details: { source: 'readState', error: 'state.json has an unexpected shape' },
+      });
+      return null;
+    }
+    return parsed;
   }
 
   async createSession(opts: CreateSessionOpts): Promise<SessionState> {
@@ -189,7 +213,6 @@ export class SessionManager {
       return this.createSession({
         aisupSessionId,
         account: state.account,
-        accountConfigDir: '',
         command,
         args,
         env,

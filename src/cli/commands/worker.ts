@@ -1,12 +1,12 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import type { WorkerState } from '../../workers/types.js';
 import type { ProviderUsageReport } from '../../providers/report.js';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
-const PID_PATH = join(homedir(), '.aisup', 'daemon.pid');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
+const PID_PATH = join(aisupHome(), 'daemon.pid');
 
 export interface DispatchBody {
   task_type: string;

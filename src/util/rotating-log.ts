@@ -26,16 +26,23 @@ export class RotatingLog {
   }
 
   write(data: string | Uint8Array): boolean {
-    const buf = typeof data === 'string' ? data : Buffer.from(data);
-    appendFileSync(this.path, buf, { mode: 0o600 });
-    const len = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
-    this.bytesWritten += len;
+    // ⛔ NEVER throws (AF-301): this backs the daemon's stdout/stderr override, so a throw here from
+    // a transient disk/permission error would propagate out of *any* console write and crash the
+    // process. The log sink is exactly what failed, so we cannot log the error — swallow + return false.
+    try {
+      const buf = typeof data === 'string' ? data : Buffer.from(data);
+      appendFileSync(this.path, buf, { mode: 0o600 });
+      const len = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
+      this.bytesWritten += len;
 
-    if (this.bytesWritten > this.maxBytes) {
-      this.rotate();
+      if (this.bytesWritten > this.maxBytes) {
+        this.rotate();
+      }
+
+      return true;
+    } catch {
+      return false;
     }
-
-    return true;
   }
 
   private rotate(): void {

@@ -28,6 +28,17 @@ function tail(text: string, limit: number): string {
   return text.length <= limit ? text : text.slice(text.length - limit);
 }
 
+/**
+ * Worker stdout/stderr are returned in FULL by runWorker so the orchestrator/reviewer can PARSE them:
+ * claude `--output-format json` and codex `--json` emit a single JSON value, so tail-truncating before
+ * the parse corrupts the JSON → empty verdict/usage (the reviewer `parse_failed` root cause). Callers
+ * that PERSIST a bounded sample (output.json stdout_tail, review raw_output_tail) truncate to this limit.
+ */
+export const WORKER_OUTPUT_TAIL_LIMIT = GATE_OUTPUT_TAIL_LIMIT;
+export function tailOutput(text: string): string {
+  return tail(text, WORKER_OUTPUT_TAIL_LIMIT);
+}
+
 /** Default executor: shell-free `execFile(command, args)` mirroring defaultGateRunner; writes stdin then closes it. */
 const defaultWorkerExec: WorkerExec = (command, args, opts) =>
   new Promise((resolve) => {
@@ -53,8 +64,9 @@ const defaultWorkerExec: WorkerExec = (command, args, opts) =>
   });
 
 /**
- * Execute a built launch plan as a shell-free, timed subprocess in the worktree, capturing
- * tail-truncated stdout/stderr. For prompt_via='file', writes promptFile.contents to its path
+ * Execute a built launch plan as a shell-free, timed subprocess in the worktree, capturing FULL
+ * stdout/stderr (callers parse them; persisted samples are tail-truncated at the persistence site).
+ * For prompt_via='file', writes promptFile.contents to its path
  * (under the worker state dir, outside the worktree) before the run and deletes it after —
  * regardless of success/timeout (MD-008/MD-003). Never passes a shell.
  */
@@ -76,8 +88,9 @@ export async function runWorker(plan: WorkerLaunchPlan, opts: RunWorkerOpts): Pr
     return {
       code: res.code,
       timedOut: res.timedOut,
-      stdout: tail(res.stdout, GATE_OUTPUT_TAIL_LIMIT),
-      stderr: tail(res.stderr, GATE_OUTPUT_TAIL_LIMIT),
+      // FULL output — the orchestrator/reviewer JSON-parse this; truncation happens at persistence.
+      stdout: res.stdout,
+      stderr: res.stderr,
     };
   } finally {
     if (plan.promptFile) {

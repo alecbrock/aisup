@@ -250,4 +250,35 @@ describe('resumeExhaustedSession', () => {
     expect(ok).toBe(false);
     expect(performSwitch).not.toHaveBeenCalled();
   });
+
+  // AF-316: an invalid resume target is rejected up front, not partway through performSwitch.
+  it('rejects an unknown target account and emits failover.target_invalid (AF-316)', async () => {
+    const performSwitch = vi.fn();
+    const { deps, journal } = buildDeps(performSwitch);
+    const ok = await resumeExhaustedSession('sess-1', 'ghost-account', deps as never);
+    expect(ok).toBe(false);
+    expect(performSwitch).not.toHaveBeenCalled();
+    expect(journal.append).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'failover.target_invalid' })
+    );
+  });
+
+  it('rejects a disabled target account without calling performSwitch (AF-316)', async () => {
+    const performSwitch = vi.fn();
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const deps = {
+      sessionManager: { readState: vi.fn().mockReturnValue(exhaustedState) },
+      accounts: [
+        { name: 'primary', configDir: '/tmp/primary', priority: 1, enabled: true, state: 'HEALTHY' as const, score: null, cooldownUntil: null },
+        { name: 'secondary', configDir: '/tmp/secondary', priority: 2, enabled: false, state: 'HEALTHY' as const, score: null, cooldownUntil: null },
+      ],
+      journal: journal as never,
+      performSwitch,
+      switchDeps: {} as never,
+      onResumed: vi.fn(),
+    };
+    const ok = await resumeExhaustedSession('sess-1', 'secondary', deps as never);
+    expect(ok).toBe(false);
+    expect(performSwitch).not.toHaveBeenCalled();
+  });
 });

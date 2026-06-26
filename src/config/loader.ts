@@ -4,8 +4,7 @@ import { homedir } from 'node:os';
 import yaml from 'js-yaml';
 import type { AisupConfig, AccountConfig, GateCommandConfig, WorkersConfig, WorkerAdapterConfig, RolesConfig, RoleCandidateConfig, CodexBudgetConfig } from './schema.js';
 import { CONFIG_DEFAULTS } from './defaults.js';
-
-const DEFAULT_CONFIG_PATH = join(homedir(), '.aisup', 'config.yaml');
+import { aisupHome } from './paths.js';
 
 const PLACEHOLDER_ACCOUNTS_YAML = `accounts:
   - name: primary
@@ -75,9 +74,12 @@ function validateTmuxSocket(socket: string): string {
 }
 
 function validateKeyInput(key: string, fieldName: string): string {
-  if (!key || /[\x00-\x1f\x7f]/.test(key)) {
+  // A permission keystroke is sent verbatim to the tmux dialog (AF-306): it must be exactly ONE
+  // printable ASCII character. Multi-char ("yes") or multi-byte (emoji) values silently fail to
+  // resolve the dialog, so reject them loudly at load.
+  if (!/^[\x20-\x7e]$/.test(key)) {
     throw new Error(
-      `Config validation error: ${fieldName} must be non-empty printable text with no NUL, newline, or control characters`
+      `Config validation error: ${fieldName} must be a single printable ASCII character (one keystroke)`
     );
   }
   return key;
@@ -409,6 +411,19 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
   if (hard_pct < 0 || hard_pct > 100) {
     throw new Error(`Config validation error: thresholds.hard_pct must be 0-100, got ${hard_pct}`);
   }
+  // soft must be strictly below hard, else the DEGRADED (proactive-failover) band is empty or the
+  // semantics invert (AF-315).
+  if (soft_pct >= hard_pct) {
+    throw new Error(
+      `Config validation error: thresholds.soft_pct (${soft_pct}) must be less than thresholds.hard_pct (${hard_pct})`
+    );
+  }
+
+  // statusline freshness window: a negative value makes ALL telemetry appear stale (AF-320).
+  const freshness = merged.statusline.freshness_window_s;
+  if (typeof freshness !== 'number' || !Number.isFinite(freshness) || freshness < 0) {
+    throw new Error(`Config validation error: statusline.freshness_window_s must be a non-negative number, got ${freshness}`);
+  }
 
   // validate port
   const { port } = merged.daemon;
@@ -416,8 +431,16 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     throw new Error(`Config validation error: daemon.port must be 1-65535, got ${port}`);
   }
 
-  // expand paths in journal
-  const journalPath = validatePath(merged.journal.path, 'journal.path');
+  // journal.path is config-driven (default '~/.aisup/journal.jsonl'); when the operator does NOT
+  // override it, resolve the default through aisupHome() so AISUP_HOME relocates the journal — the
+  // generic join-site routing cannot reach this config default (review 2026-06-23 CR-001). Unset
+  // AISUP_HOME ⇒ identical to expanding '~/.aisup/journal.jsonl' (no behavior change).
+  const rawJournal = raw['journal'];
+  const journalOverridden =
+    !!rawJournal && typeof rawJournal === 'object' && (rawJournal as Record<string, unknown>)['path'] != null;
+  const journalRaw = journalOverridden ? merged.journal.path : join(aisupHome(), 'journal.jsonl');
+  const journalPath = validatePath(journalRaw, 'journal.path');
+  // statusline.directory is shared statusline-tap telemetry INPUT — intentionally NOT relocated by AISUP_HOME.
   const statuslineDirectory = validatePath(merged.statusline.directory, 'statusline.directory');
 
   // Phase 2 contract baseline: tmux socket, permission keystrokes, gate commands.
@@ -464,14 +487,15 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
 }
 
 function ensureAisupDir(): void {
-  const dir = join(homedir(), '.aisup');
+  const dir = aisupHome();
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 }
 
 export async function loadConfig(configPath?: string): Promise<AisupConfig> {
-  const resolvedPath = configPath ?? DEFAULT_CONFIG_PATH;
+  // Computed at call time (not a module const) so AISUP_HOME set by tests/live-run is honored.
+  const resolvedPath = configPath ?? join(aisupHome(), 'config.yaml');
 
   if (cachedConfig && cachedPath === resolvedPath) {
     return cachedConfig;

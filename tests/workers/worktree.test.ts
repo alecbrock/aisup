@@ -81,6 +81,24 @@ describe('worktree lifecycle & boundary (@requires_git)', () => {
     expect(patch).not.toContain('"secret"');
   });
 
+  it('tool-data dirs (.codegraph/.serena) in the worktree are absent from the patch even when the workspace does not gitignore them', async () => {
+    const baseSha = await resolveBaseSha({ workspaceRoot: repo, baseRef: 'HEAD' });
+    const wt = await createWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, baseSha, taskId });
+    // Simulate CodeGraph's SessionStart hook + Serena MCP writing data dirs into the worker cwd
+    // (the repo .gitignore intentionally does NOT cover them — mirrors a fresh scratch/user repo).
+    mkdirSync(join(wt, '.codegraph'), { recursive: true });
+    writeFileSync(join(wt, '.codegraph', 'codegraph.db'), 'binary\n');
+    writeFileSync(join(wt, '.codegraph', '.gitignore'), '*.db\n');
+    mkdirSync(join(wt, '.serena'), { recursive: true });
+    writeFileSync(join(wt, '.serena', 'project.yml'), 'name: x\n');
+    writeFileSync(join(wt, 'real-change.ts'), 'export const w = 4;\n');
+    const { patch, changedFiles } = await captureDiff({ worktree: wt, baseSha });
+    expect(changedFiles).toContain('real-change.ts');
+    expect(changedFiles.some((f) => f.startsWith('.codegraph') || f.startsWith('.serena'))).toBe(false);
+    expect(patch).not.toContain('.codegraph');
+    expect(patch).not.toContain('.serena');
+  });
+
   it('captureDiff still diffs against the stored base_sha after the source branch advances', async () => {
     const baseSha = await resolveBaseSha({ workspaceRoot: repo, baseRef: 'HEAD' });
     const wt = await createWorktree({ workspaceRoot: repo, worktreeDir: WORKTREE_DIR, baseSha, taskId });

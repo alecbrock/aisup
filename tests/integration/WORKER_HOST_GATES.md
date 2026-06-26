@@ -43,6 +43,36 @@ AISUP_TEST_CODEX=1 npx vitest run tests/integration/workers.smoke.test.ts
 # → the @requires_codex tier runs; gemini/local tiers skip.
 ```
 
+### Required codex worker adapter args
+
+A codex **worker** must both edit files in its worktree **and** emit JSON for the budget meter and
+the reviewer-verdict parser. The shipped default (`src/config/defaults.ts`) is therefore:
+
+```yaml
+workers:
+  adapters:
+    codex:
+      command: codex
+      args: ['exec', '--json', '--skip-git-repo-check', '-s', 'workspace-write']
+      output_format: json
+```
+
+- `exec --json` → non-interactive run whose stream `codex-json` parses for `turn.completed.usage`
+  (meter) and the reviewer `VERDICT:`.
+- `-s workspace-write` → without it codex is read-only and the worker produces an empty diff.
+- `--skip-git-repo-check` → harmless inside a worktree (already a git repo); matches the operator's
+  proven config. The aisup workspace boundary is still enforced independently by
+  `auditBoundary`/`sanitizePatch`, not by this flag.
+
+**Auth:** codex's ChatGPT login lives in `~/.codex/auth.json`. The worker forces `HOME` to the
+isolated worktree `.home`, so the real auth is reached via `CODEX_HOME` (the `@requires_codex` test
+sets `CODEX_HOME=~/.codex` and includes it in the adapter `env_allowlist`). ⛔ The worker MUST close
+the child's stdin — `codex exec` appends piped stdin as a `<stdin>` block and blocks forever if the
+pipe stays open; `runWorker` does this via `child.stdin.end()`.
+
+The `@requires_codex` tier is a **real** `codex exec --json` run (no longer a placeholder): it edits
+a file in a `/private/tmp` scratch repo and asserts a non-empty diff + parsed `turn.completed.usage`.
+
 Gemini / local tiers (not installed here — install the CLI first, then):
 
 ```bash

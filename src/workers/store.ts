@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../config/paths.js';
 import type { WorkerState, WorkerTask } from './types.js';
 
 /** UUID shape (any version) — worker ids are generated UUIDs; reject anything else to prevent traversal. */
@@ -11,7 +11,7 @@ export class WorkerStore {
   private readonly stateDir: string;
 
   constructor(stateDir?: string) {
-    this.stateDir = stateDir ?? join(homedir(), '.aisup', 'workers');
+    this.stateDir = stateDir ?? join(aisupHome(), 'workers');
   }
 
   private validateId(id: string): string {

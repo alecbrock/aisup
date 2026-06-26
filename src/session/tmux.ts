@@ -62,7 +62,7 @@ function tmuxWithTimeout(socket: string, args: string[], timeoutMs = 5000): stri
 export async function createTmuxSession(opts: CreateSessionOpts): Promise<void> {
   const { socket, name, command, args, env, cwd, logPath } = opts;
 
-  mkdirSync(dirname(logPath), { recursive: true });
+  mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
 
   // Step 1: new-session with /bin/sh and any env vars
   const envArgs: string[] = [];
@@ -142,7 +142,7 @@ export function isPipePaneActive(socket: string, name: string): boolean {
 }
 
 export function startOutputLog(socket: string, name: string, logPath: string): void {
-  mkdirSync(dirname(logPath), { recursive: true });
+  mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
   tmuxWithTimeout(socket, ['pipe-pane', '-o', '-t', name, `cat >> ${singleQuote(logPath)}`]);
 }
 

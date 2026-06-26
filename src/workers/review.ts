@@ -6,7 +6,7 @@ import type { WorkerLaunchPlan } from './adapter.js';
 import { parseCodexJsonStream } from './codex-json.js';
 import { parseClaudeResult } from './claude-adapter.js';
 import { classifyCandidateFailure } from './failover.js';
-import { runWorker } from './runner.js';
+import { runWorker, tailOutput } from './runner.js';
 import type { WorkerExec } from './runner.js';
 import type { WorkerAdapterConfig, WorkerReviewConfig } from '../config/schema.js';
 import type { WorkerTask, WorkerOutput, ReviewVerdict } from './types.js';
@@ -147,7 +147,7 @@ export async function reviewWorkerOutput(opts: {
     return { reviewer, verdict: 'reject', degraded: true, findings: [], raw_output_tail: '', run_failure: null };
   }
 
-  mkdirSync(join(reviewDir, '.home'), { recursive: true });
+  mkdirSync(join(reviewDir, '.home'), { recursive: true, mode: 0o700 });
 
   // Read-only gate: fingerprint the worktree + main workspace (minus the worktree subtree) before.
   const worktreeTop = relative(workspaceRoot, worktreePath).split(sep)[0];
@@ -172,7 +172,7 @@ export async function reviewWorkerOutput(opts: {
       event_type: 'worker.review_failed',
       details: { worker_task_id: task.id, reviewer, verdict: 'reject', degraded, reason: 'reviewer_side_effect' },
     });
-    return { reviewer, verdict: 'reject', degraded, findings: [], raw_output_tail: res.stdout, run_failure: runFailure };
+    return { reviewer, verdict: 'reject', degraded, findings: [], raw_output_tail: tailOutput(res.stdout), run_failure: runFailure };
   }
 
   // JSON-mode reviewers (codex/claude) wrap the verdict inside a message item; extract that text first
@@ -186,7 +186,7 @@ export async function reviewWorkerOutput(opts: {
       event_type: 'worker.review_failed',
       details: { worker_task_id: task.id, reviewer, verdict: 'reject', degraded, reason: 'parse_failed' },
     });
-    return { reviewer, verdict: 'reject', degraded, findings: [], raw_output_tail: res.stdout, run_failure: runFailure };
+    return { reviewer, verdict: 'reject', degraded, findings: [], raw_output_tail: tailOutput(res.stdout), run_failure: runFailure };
   }
 
   if (verdict === 'reject') {
@@ -195,7 +195,7 @@ export async function reviewWorkerOutput(opts: {
       event_type: 'worker.review_failed',
       details: { worker_task_id: task.id, reviewer, verdict: 'reject', degraded, reason: 'rejected' },
     });
-    return { reviewer, verdict: 'reject', degraded, findings: [], raw_output_tail: res.stdout, run_failure: null };
+    return { reviewer, verdict: 'reject', degraded, findings: [], raw_output_tail: tailOutput(res.stdout), run_failure: null };
   }
 
   await journal.append({
@@ -203,5 +203,5 @@ export async function reviewWorkerOutput(opts: {
     event_type: 'worker.review_passed',
     details: { worker_task_id: task.id, reviewer, verdict: 'approve', degraded },
   });
-  return { reviewer, verdict: 'approve', degraded, findings: [], raw_output_tail: res.stdout, run_failure: runFailure };
+  return { reviewer, verdict: 'approve', degraded, findings: [], raw_output_tail: tailOutput(res.stdout), run_failure: runFailure };
 }

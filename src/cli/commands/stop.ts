@@ -1,12 +1,12 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
 
 export async function sessionStop(opts: { force?: boolean }): Promise<void> {
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
+  const pidPath = join(aisupHome(), 'daemon.pid');
   if (!existsSync(pidPath)) {
     console.error('aisup daemon is not running');
     process.exit(1);

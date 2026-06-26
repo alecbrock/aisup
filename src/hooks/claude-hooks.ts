@@ -50,7 +50,9 @@ export function buildHookSettings(opts: HookSettingsOpts): HookSettings {
   }
   if (opts.includePermission) {
     hooks.PermissionRequest = [
-      { matcher: '*', hooks: [{ type: 'http', url: `${base}/permission`, timeout: opts.permissionTimeoutS ?? 600, headers }] },
+      // Default 30s matches the daemon's intent ("short is plenty"): the hook is a non-blocking
+      // detector that returns in ms; the human decision is resolved later via a keystroke (AF-310).
+      { matcher: '*', hooks: [{ type: 'http', url: `${base}/permission`, timeout: opts.permissionTimeoutS ?? 30, headers }] },
     ];
   }
   return { hooks };

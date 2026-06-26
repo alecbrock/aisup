@@ -4,13 +4,14 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
 import { SessionManager } from '../../src/session/manager.js';
+import type { JournalEvent } from '../../src/journal/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -53,11 +54,49 @@ describe('SessionManager (integration)', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  // AF-313: readState must not silently drop a corrupt state.json — it returns null AND emits
+  // session.state_corrupt. No tmux needed (pure file read).
+  it('readState returns null and emits session.state_corrupt for a corrupt state.json (AF-313)', () => {
+    const events: JournalEvent[] = [];
+    const stateDir = join(tmpDir, 'sessions');
+    const mgr = new SessionManager({
+      tmuxSocket: TEST_SOCKET,
+      stateDir,
+      outputLogMaxSizeMb: 50,
+      journal: { append: async (e: JournalEvent) => { events.push(e); } },
+    });
+    const dir = join(stateDir, 'sess-corrupt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'state.json'), '{ broken json');
+
+    let result: ReturnType<typeof mgr.readState> = undefined as never;
+    expect(() => { result = mgr.readState('sess-corrupt'); }).not.toThrow();
+    expect(result).toBeNull();
+    expect(events.some((e) => e.event_type === 'session.state_corrupt')).toBe(true);
+  });
+
+  it('readState returns null and emits session.state_corrupt for a wrong-shape state.json (AF-313)', () => {
+    const events: JournalEvent[] = [];
+    const stateDir = join(tmpDir, 'sessions');
+    const mgr = new SessionManager({
+      tmuxSocket: TEST_SOCKET,
+      stateDir,
+      outputLogMaxSizeMb: 50,
+      journal: { append: async (e: JournalEvent) => { events.push(e); } },
+    });
+    const dir = join(stateDir, 'sess-shape');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({ aisup_session_id: 123, status: 'ACTIVE' }));
+
+    const result = mgr.readState('sess-shape');
+    expect(result).toBeNull();
+    expect(events.some((e) => e.event_type === 'session.state_corrupt')).toBe(true);
+  });
+
   runIf('should create a session with ACTIVE state', async () => {
     const session = await manager.createSession({
       aisupSessionId: 'test-session-123',
       account: 'primary',
-      accountConfigDir: tmpDir,
       command: '/bin/sh',
       args: [FAKE_RUNNER],
       env: {},
@@ -74,7 +113,6 @@ describe('SessionManager (integration)', () => {
     const session = await manager.createSession({
       aisupSessionId: 'state-test-456',
       account: 'primary',
-      accountConfigDir: tmpDir,
       command: '/bin/sh',
       args: [FAKE_RUNNER],
       env: {},
@@ -94,7 +132,6 @@ describe('SessionManager (integration)', () => {
     const session = await manager.createSession({
       aisupSessionId: 'stop-test-789',
       account: 'primary',
-      accountConfigDir: tmpDir,
       command: '/bin/sh',
       args: [FAKE_RUNNER],
       env: {},
@@ -112,7 +149,6 @@ describe('SessionManager (integration)', () => {
     await manager.createSession({
       aisupSessionId: 'list-test-aaa',
       account: 'primary',
-      accountConfigDir: tmpDir,
       command: '/bin/sh',
       args: [FAKE_RUNNER],
       env: {},

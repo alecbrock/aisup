@@ -1,11 +1,11 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
 export async function triggerFailover(targetAccount: string): Promise<void> {
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
-  const tokenPath = join(homedir(), '.aisup', 'api-token');
+  const pidPath = join(aisupHome(), 'daemon.pid');
+  const tokenPath = join(aisupHome(), 'api-token');
 
   if (!existsSync(pidPath)) {
     console.error('aisup daemon is not running');

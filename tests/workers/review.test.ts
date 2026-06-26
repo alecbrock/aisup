@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { reviewWorkerOutput, buildReviewPrompt } from '../../src/workers/review.js';
@@ -138,6 +138,8 @@ describe('reviewWorkerOutput', () => {
     const v = await reviewWorkerOutput({ ...ctx, reviewerAdapter: reviewerAdapter(), review, journal, runner: cwdWriteRunner });
     expect(v.verdict).toBe('approve'); // write contained in reviewDir → not flagged
     expect(existsSync(join(ctx.reviewDir, 'reviewer-side-effect.txt'))).toBe(true);
+    // AF-305: the reviewer's isolated .home is created 0o700 (no group/other access).
+    expect(statSync(join(ctx.reviewDir, '.home')).mode & 0o077).toBe(0);
   });
 
   it('a reviewer that writes into the implementation worktree fails closed with reviewer_side_effect', async () => {

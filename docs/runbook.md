@@ -31,6 +31,30 @@ aisup daemon stop && aisup daemon start
 aisup doctor    # exits non-zero if any required check fails
 ```
 
+### State directory & `AISUP_HOME` (full isolation override)
+
+All aisup state — `config.yaml`, `api-token`, `daemon.pid`, `daemon.log`, `journal.jsonl`,
+`usage-ledger.json`, `circuit-breaker-state.json`, `channel-map.json`, `claude-hooks.json`,
+`sessions/`, and the `workers/` store — lives under `~/.aisup` by default.
+
+Set `AISUP_HOME=<dir>` to relocate the **entire** state directory. This is the full-isolation
+override used to run a real daemon without reading or writing the operator's real `~/.aisup`:
+
+```bash
+AISUP_HOME=/private/tmp/aisup-val node dist/daemon/index.js   # fully isolated daemon
+AISUP_HOME=/private/tmp/aisup-val aisup worker providers       # same isolated state
+```
+
+Notes:
+- Unset (or empty) `AISUP_HOME` falls back to `~/.aisup` exactly as before — no behavior change.
+- `AISUP_HOME` relocates aisup state **only**. Account `config_dir`s and `HOME` are *not* moved —
+  they must keep pointing at the real `~/.claude*` so Claude auth still works.
+- `statusline.directory` (default `/tmp/pilot-failover`) is shared statusline-tap telemetry input
+  and is intentionally *not* relocated by `AISUP_HOME`; set it explicitly in the throwaway config
+  when you need an isolated daemon to ignore the operator's telemetry.
+- `journal.path` is config-driven; when not overridden in `config.yaml` it resolves under
+  `AISUP_HOME`, so the isolated daemon's journal lands in the temp dir, not the real `~/.aisup`.
+
 ---
 
 ## Slack App Setup
@@ -303,6 +327,42 @@ Operator checklist for full MVP validation (run after automated tests pass):
 - [ ] Gate 7: daemon restart → session rehydrated, pipe-pane restored
 - [ ] Gate 8: echo 429 pattern via fake-runner → daemon triggers failover
 - [ ] Gate 9: 3 recovery failures → circuit breaker trips, `circuit_breaker.tripped` in journal
+
+---
+
+## Configuration Notes
+
+### Gate triggering (`gates.trigger`)
+
+With `gates.enabled: true` the validation gates can auto-run on the active session. `gates.trigger`
+controls when:
+
+- **`idle_and_skill`** (default) — gates run when the session has been idle past
+  `gates.idle_delay_seconds` (default 30) **and** a tracked skill has completed (the loop clears the
+  session's `active_skill` once the gate fires, debounced so one completion triggers one run).
+- The gate command runs with `cwd` = the active session's working directory (lead-session gates).
+  Worker validation gates are different: they always run inside the worker's worktree with `cwd`
+  forced to null (the worktree wins) and an isolated `HOME` — `workers.validation_gates[*].cwd` must
+  be null.
+- **Debugging gate failures:** `aisup gate` shows the latest run; `aisup log --type gate.failed` (and
+  `gate.timeout` / `gate.passed` / `gate.run_completed`) shows per-gate outcomes in the journal.
+
+### Statusline telemetry contract
+
+The statusline tap writes one JSON file per Claude session to `statusline.directory` (default
+`/tmp/pilot-failover`), named `statusline-<claude-session-uuid>.json`. Fields aisup reads:
+`session_id`, `transcript_path`, `cwd` / `workspace.project_dir` (project identity),
+`rate_limits.five_hour` / `.seven_day` (`{used_percentage, resets_at}`; `resets_at` is Unix epoch
+**seconds**). A file is considered **stale** when `now - mtime > statusline.freshness_window_s`
+(default 300s); stale telemetry is ignored for live scoring and decays to 0% once its reset passes.
+A negative `freshness_window_s` is rejected at config load (it would make all telemetry appear stale).
+
+### `session.resume_prompt_mode` trade-off
+
+Defaults to **`never`**: detected skills are journaled but NOT re-injected as a continuation prompt
+after a failover/restart. This avoids surprising the resumed session with an auto-prompt, but means
+"carry the skill across failover" (Phase 1 Task 11) is **opt-in** — set `resume_prompt_mode` to a
+non-`never` value to have aisup rebuild and inject a continuation prompt on resume.
 
 ---
 

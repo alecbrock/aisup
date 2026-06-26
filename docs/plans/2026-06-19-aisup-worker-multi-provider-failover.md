@@ -56,7 +56,7 @@ The worker pipeline today runs the implementer exactly **once** (`orchestrator.t
 ### Truths
 
 1. With `roles.implementer = [claude(2+ accounts), codex]`, forcing the first Claude account to 429 (reactive) or past its ledger headroom causes the **same task** to complete on the **next Claude account** in a fresh worktree, with no operator action — observable in the journal as `worker.candidate_failed` → `worker.failover` → `worker.completed`.
-2. When **all** Claude accounts are unavailable, the same implementer task crosses to **codex** (cross-LLM) and completes; when codex's metered usage crosses its configured budget, a codex-default task instead fails over to an available Claude account.
+2. When **all** Claude accounts are unavailable, the same implementer task crosses to **codex** (cross-LLM) and completes; and codex's metered token budget **gates codex** — with the budget crossed and all Claude unavailable, the task terminates `worker.all_candidates_exhausted` rather than running unbounded codex. _(Corrected 2026-06-25: the earlier clause "a codex-default task instead fails over to an available Claude account" was unreachable — if all Claude is unavailable there is no Claude to fall back to; the budget gate is what bounds codex. Validated live — see Real-run Validation and `docs/plans/2026-06-22-aisup-worker-failover-closure-validation.md`.)_
 3. `aisup` surfaces, per provider, a live availability/headroom readout (Claude account headroom % with `live|aged|reset` basis; codex tokens-used vs budget with remaining), and a cross-LLM failover posts a Slack notification to the session channel.
 
 ## Progress Tracking
@@ -354,6 +354,16 @@ The worker pipeline today runs the implementer exactly **once** (`orchestrator.t
 - **Default codex budget value** (`tokens: 3_000_000 / period_hours: 5`) is a starter heuristic — confirm or adjust at approval to match your ChatGPT plan. codex exposes no quota readout, so this can't be derived.
 
 ## Real-run Validation (Task 10)
+
+### Live full-daemon run (2026-06-25) — all three Truths proven
+
+Executed `scripts/validation/live-multiprovider-failover.sh` (committed in the closure plan) against a real state-isolated daemon, real `aisup worker dispatch`, real `claude -p` + `codex exec --json`. Exit 0; operator `~/.aisup` untouched (config sha + journal mtime/size asserted unchanged). Each leg ran its own worker (A 60s, B 2m13s, C 3s).
+
+- **Truth 1 (Leg A, `d7b591ad`):** `candidate_failed{auth_failed, claude:noauth}` → `failover{noauth→authed}` → `completed{README.md}` → `validated` → `review_passed{approve}` → `awaiting_approval`. Real account, clean README-only patch, reviewer approved. ✓
+- **Truth 2 (Leg B, `06b2d6a5`):** `candidate_failed{auth_failed, claude:noauth1}` → `failover{noauth1→codex, cross_provider:true}` → codex `completed` → `review_passed` → `awaiting_approval` (cross-LLM to a real codex winner). **(Leg C, `f44bb5e4`):** with codex budget crossed (`providers`: `codex UNAVAILABLE 0 tokens left budget_exhausted`) and all Claude unavailable → `all_candidates_exhausted`, no codex subprocess — confirming the corrected Truth 2 (budget gates codex). ✓
+- **Truth 3:** `aisup worker providers` reported live availability per leg — `codex … 3000000 tokens left basis=budget` / claude `basis=unknown`, flipping to `budget_exhausted` in Leg C. ✓ Cross-provider Slack post is wired (`notifyCrossProviderFailover`) but did not fire this run (lead session blocked by an active session); the `cross_provider:true` journal event is the DoD-fallback evidence.
+
+Two product bugs were found+fixed during this run (real-subprocess output the fake adapters could not exercise): tool-data dirs (`.codegraph/`/`.serena/` from the operator's CodeGraph SessionStart hook + Serena MCP) leaking into the captured patch → `worktree.ts` `DIFF_EXCLUDE_DIRS`; and `runWorker` tail-truncating stdout before the JSON parse (corrupting reviewer verdict + usage) → full stdout returned, truncation moved to `tailOutput` persistence. Full suite: 712 pass / 0 fail. Details in `docs/plans/2026-06-22-aisup-worker-failover-closure-validation.md` § Real-run Validation.
 
 ### Host-gated test
 

@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync, statSync, accessSync, constants } from 'node:fs';
 import { resolve } from 'node:path';
@@ -15,7 +15,7 @@ import { selectSwitchTarget } from '../../failover/switcher.js';
 import type { AisupConfig } from '../../config/schema.js';
 import type { AccountInfo } from '../../accounts/types.js';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
 
 /**
  * Resolve the account a real `aisup start` would admit, using the same scoring,
@@ -38,13 +38,13 @@ export function selectDryRunAccount(config: AisupConfig, circuitBreakerStatePath
     softPct: config.thresholds.soft_pct,
     hardPct: config.thresholds.hard_pct,
     circuitBreaker,
-    ledger: new UsageLedger(join(homedir(), '.aisup', 'usage-ledger.json'), config.statusline.freshness_window_s * 1000),
+    ledger: new UsageLedger(join(aisupHome(), 'usage-ledger.json'), config.statusline.freshness_window_s * 1000),
   });
   return selectSwitchTarget(registry.getAll(), '', []);
 }
 
 async function getDaemonUrl(): Promise<{ url: string; token: string }> {
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
+  const pidPath = join(aisupHome(), 'daemon.pid');
   if (!existsSync(pidPath)) {
     throw new Error('aisup daemon is not running. Start it with: aisup daemon start');
   }
@@ -88,7 +88,7 @@ export async function sessionStart(opts: {
     }
     const config = await loadConfig();
     const liveSessions = listSessions(config.session.tmux_socket).filter((s) => s.startsWith('aisup-'));
-    const blocking = getBlockingSession(join(homedir(), '.aisup', 'sessions'), liveSessions);
+    const blocking = getBlockingSession(join(aisupHome(), 'sessions'), liveSessions);
     const admission = canStartNewSession(blocking);
     if (!admission.allowed) {
       throw new Error(admission.reason);
@@ -99,7 +99,7 @@ export async function sessionStart(opts: {
       accessSync(planPath, constants.R_OK);
       if (!statSync(planPath).isFile()) throw new Error(`plan is not a file: ${planPath}`);
     }
-    const cbStatePath = join(homedir(), '.aisup', 'circuit-breaker-state.json');
+    const cbStatePath = join(aisupHome(), 'circuit-breaker-state.json');
     const account = selectDryRunAccount(config, cbStatePath);
     if (!account) throw new Error('no eligible account available');
     const runner = { ...config.runner, command: validateRunner(config.runner) };

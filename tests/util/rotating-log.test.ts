@@ -47,4 +47,13 @@ describe('RotatingLog', () => {
     const content = readFileSync(logPath, 'utf8');
     expect(content).toContain('after-rotation');
   });
+
+  // AF-301: write backs the daemon's stdout/stderr override — a sink failure must return false,
+  // never throw, or it would crash the process from any console write.
+  it('returns false (does not throw) when the log sink is unwritable', () => {
+    const badPath = join(tmpDir, 'not-a-dir', 'daemon.log'); // parent dir does not exist
+    const log = new RotatingLog({ path: badPath, maxSizeMb: 1, maxFiles: 3 });
+    expect(() => log.write('hello\n')).not.toThrow();
+    expect(log.write('hello\n')).toBe(false);
+  });
 });

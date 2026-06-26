@@ -2,7 +2,19 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { scoreAccount } from '../../src/accounts/scorer.js';
+import { scoreAccount, computeScore } from '../../src/accounts/scorer.js';
+
+describe('computeScore (AF-321)', () => {
+  it('clamps out-of-range used-percentages to [0,100] so headroom never goes negative or >100', () => {
+    // >100% usage clamps to 100 → zero headroom, never a negative score.
+    expect(computeScore(150, 0)).toBe(computeScore(100, 0));
+    expect(computeScore(150, 200)).toBe(0);
+    // negative usage clamps to 0 → full headroom, never >100.
+    expect(computeScore(-50, -50)).toBe(100);
+    // in-range values are unchanged.
+    expect(computeScore(30, 20)).toBeCloseTo((100 - 30) * 0.7 + (100 - 20) * 0.3);
+  });
+});
 
 const NOW_EPOCH = Math.floor(Date.now() / 1000);
 const FUTURE_EPOCH = NOW_EPOCH + 3600; // resets in 1h

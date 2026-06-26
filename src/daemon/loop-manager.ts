@@ -211,6 +211,9 @@ export class LoopManager {
     const result = this.rateLimitMonitor.tick(telemetry.rate_limits, d.softPct, d.hardPct);
 
     if (result.level === 'hard') {
+      // AF-324: a single boolean guard is adequate here — the monitor loops run on one Node event-loop
+      // thread, so the check-then-set below is atomic (no await between them); `.finally` clears the flag
+      // when the switch settles. Overlapping ticks observe `failoverInProgress=true` and skip.
       if (this.failoverInProgress) {
         void d.journal.append({
           ts: new Date().toISOString(),
@@ -383,6 +386,9 @@ export class LoopManager {
           this.lastGateRun.set(sessionId, now);
           const completedSkill = session.active_skill;
           d.sessionManager.patchState(sessionId, { active_skill: null });
+          // Skill completion is a meaningful state change: clear idleEmitted so the next idle tick
+          // re-fires onIdle for the post-completion idle period instead of staying suppressed (AF-311).
+          this.idleEmitted.delete(sessionId);
           void d.onGateTrigger(sessionId, completedSkill);
         }
       }
@@ -652,8 +658,14 @@ export class LoopManager {
   /** Clear a session's recovery counters (restart-failure window + network-error window)
    *  — on successful recovery, session stop, or switch. */
   clearRecoveryCounters(sessionId: string): void {
+    // Clear ALL per-session collections so a long-running daemon doesn't leak one entry per
+    // session-id over its lifetime (AF-304).
     this.restartAttempts.delete(sessionId);
     this.networkErrors.delete(sessionId);
+    this.lastNoTargetNotice.delete(sessionId);
+    this.lastGateRun.delete(sessionId);
+    this.costState.delete(sessionId);
+    this.idleEmitted.delete(sessionId);
   }
 
   /** Refresh scores/state from telemetry + circuit breaker before a failover selection. */

@@ -27,7 +27,11 @@ const program = new Command();
 
 program
   .name('aisup')
-  .description('AI supervisor daemon with multi-account failover')
+  .description(
+    'AI supervisor daemon with multi-account failover. ' +
+    'Prerequisite: start the daemon first with `aisup daemon start` — session/query/worker commands ' +
+    'talk to it over a localhost HTTP API and fail if it is not running.'
+  )
   .version('0.1.0');
 
 const daemon = program.command('daemon').description('Manage the aisup daemon process');
@@ -44,7 +48,7 @@ daemon
 
 program
   .command('start')
-  .description('Start a supervised AI coding session')
+  .description('Start a supervised AI coding session (requires the daemon: run `aisup daemon start` first)')
   .option('--cwd <path>', 'Working directory for the session')
   .option('--plan <path>', 'Path to implementation plan file')
   .option('--dry-run', 'Validate and print selected account without starting')

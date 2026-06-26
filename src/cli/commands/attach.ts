@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../../config/loader.js';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
 
 export async function sessionAttach(): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -13,7 +13,7 @@ export async function sessionAttach(): Promise<void> {
     process.exit(1);
   }
 
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
+  const pidPath = join(aisupHome(), 'daemon.pid');
   if (!existsSync(pidPath)) {
     console.error('aisup daemon is not running');
     process.exit(1);

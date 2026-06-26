@@ -26,7 +26,12 @@ export function resolveSkillFromCommandName(commandName: string, trackedSkills: 
   return null;
 }
 
-/** Extract the tracked skill from output text, or null if none found. */
+/**
+ * FALLBACK-ONLY (AF-323): scrape a tracked skill from a `Launching skill:` marker in pane output.
+ * The PRIMARY live path is `resolveSkillFromCommandName` via the `UserPromptExpansion` hook — modern
+ * Claude Code no longer reliably emits the pane marker, so this is retained only for the pane-output
+ * fallback. Returns the tracked skill, or null if none found.
+ */
 export function detectSkill(output: string, trackedSkills: string[]): string | null {
   const trackedSet = new Set(trackedSkills);
   let match: RegExpExecArray | null;

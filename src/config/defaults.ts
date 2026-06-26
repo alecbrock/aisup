@@ -128,11 +128,18 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
       codex: {
         name: 'codex',
         command: 'codex',
-        args: ['exec', '--json'],
+        // exec = non-interactive run; --json = stream parsed by codex-json (budget meter + reviewer
+        // verdict); --skip-git-repo-check = harmless inside a worktree (already a git repo); -s
+        // workspace-write = lets the worker actually edit files. Matches the operator's proven config.
+        // The workspace boundary is still enforced independently by auditBoundary/sanitizePatch.
+        args: ['exec', '--json', '--skip-git-repo-check', '-s', 'workspace-write'],
         prompt_via: 'arg',
         prompt_arg_flag: null,
         prompt_file_flag: null,
-        env_allowlist: ['PATH', 'HOME'],
+        // CODEX_HOME lets the worker reach codex's ChatGPT auth (~/.codex) while HOME is isolated to
+        // the worktree — without it, codex looks for ~/.codex under the empty worktree HOME and can't
+        // authenticate (the daemon must export CODEX_HOME=~/.codex). Proven by the T3/T4 host-gated runs.
+        env_allowlist: ['PATH', 'HOME', 'CODEX_HOME'],
         timeout_seconds: 1800,
         enabled: false,
         output_format: 'json',
@@ -160,6 +167,10 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
         enabled: false,
       },
     },
+    // ⚠️ `routing.*` is the BACK-COMPAT path used only when no `roles:` block is configured; it
+    // synthesizes one-candidate role lists. It does NOT mean codex runs first: the account-first
+    // selector (providers/selector.ts) always orders every enabled Claude account ahead of any codex
+    // candidate, so codex is reached only when all Claude accounts are unavailable (AF-207 / AF-R009).
     routing: {
       default_implementer: 'codex',
       default_reviewer: 'gemini',

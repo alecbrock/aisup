@@ -245,6 +245,30 @@ describe('readTelemetryForSession', () => {
     expect(result.invalidJson?.error.length).toBeGreaterThan(0);
     expect(typeof result.invalidJson?.stale).toBe('boolean');
   });
+
+  // AF-303: valid JSON with a wrong-typed field (transcript_path: 123) must be surfaced as
+  // invalid_json, NOT crash later at transcriptPath.startsWith(...).
+  it('treats valid JSON with a wrong-typed transcript_path as invalid_json (no TypeError)', () => {
+    const claudeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    writeFileSync(
+      join(statuslineDir, `statusline-${claudeId}.json`),
+      JSON.stringify({ session_id: claudeId, transcript_path: 123, cwd: '/home/project' })
+    );
+    let result!: ReturnType<typeof readTelemetryForSession>;
+    expect(() => {
+      result = readTelemetryForSession(claudeId, configDir, '/home/project', statuslineDir);
+    }).not.toThrow();
+    expect(result.telemetry).toBeNull();
+    expect(result.invalidJson).toBeTruthy();
+  });
+
+  it('treats a non-object telemetry root (e.g. a JSON number) as invalid_json', () => {
+    const claudeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    writeFileSync(join(statuslineDir, `statusline-${claudeId}.json`), '42');
+    const result = readTelemetryForSession(claudeId, configDir, '/home/project', statuslineDir);
+    expect(result.telemetry).toBeNull();
+    expect(result.invalidJson).toBeTruthy();
+  });
 });
 
 describe('readTelemetryForActiveSession', () => {

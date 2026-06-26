@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readPidFile, removePidFile } from '../pid.js';
 
-const AISUP_DIR = join(homedir(), '.aisup');
+const AISUP_DIR = aisupHome();
 const PID_PATH = join(AISUP_DIR, 'daemon.pid');
 
 async function isDaemonAlive(pid: number, port: number): Promise<boolean> {

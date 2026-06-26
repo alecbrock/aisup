@@ -9,7 +9,7 @@ import { buildReviewPrompt } from './review.js';
 import type { ReviewerPlanOverride } from './review.js';
 import { runCandidateLoop } from './failover.js';
 import type { CandidateLoopHooks } from './failover.js';
-import { runWorker } from './runner.js';
+import { runWorker, tailOutput } from './runner.js';
 import type { WorkerExec, WorkerExecResult } from './runner.js';
 import type { validateWorkerOutput } from './validation.js';
 import type { reviewWorkerOutput } from './review.js';
@@ -270,8 +270,8 @@ export class WorkerOrchestrator {
       const output: WorkerOutput = {
         exit_code: run.code,
         timed_out: run.timedOut,
-        stdout_tail: redactTails(run.stdout),
-        stderr_tail: redactTails(run.stderr),
+        stdout_tail: redactTails(tailOutput(run.stdout)),
+        stderr_tail: redactTails(tailOutput(run.stderr)),
         patch,
         patch_path: patchPath,
         patch_sha256: patchSha,

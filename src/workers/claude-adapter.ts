@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { WorkerLaunchPlan } from './adapter.js';
 
 /**
@@ -16,9 +16,9 @@ export interface ClaudeWorkerAccount {
 export interface ClaudeWorkerOptions {
   account: ClaudeWorkerAccount;
   prompt: string;
-  /** The worktree the worker edits; HOME is isolated to `<worktreePath>/.home`. */
+  /** The worktree the worker edits (its cwd). */
   worktreePath: string;
-  /** Effective env allowlist (security ∪ adapter) — only these names are copied from process.env. */
+  /** Retained for interface symmetry; NOT applied to claude's env — keychain OAuth needs the full env. */
   envAllowlist: string[];
   /** Non-interactive permission mode; `bypassPermissions` lets the headless worker Edit/Write without prompts. */
   permissionMode?: string;
@@ -43,8 +43,8 @@ const DEFAULT_PERMISSION_MODE = 'bypassPermissions';
 
 /**
  * Build the `claude -p --output-format json` launch plan for a selected account (pure; no I/O).
- * The prompt is the final positional arg; env is allowlisted + `CLAUDE_CONFIG_DIR` (real auth) +
- * `HOME=<worktree>/.home` (isolation), mirroring `buildWorkerCommand`'s env handling.
+ * The prompt is the final positional arg; env inherits the daemon env (required for keychain OAuth)
+ * with `CLAUDE_CONFIG_DIR` (account auth) + the REAL `HOME` (keychain path). See the env block below.
  */
 export function buildClaudeWorkerCommand(opts: ClaudeWorkerOptions): WorkerLaunchPlan {
   const args = ['-p', '--permission-mode', opts.permissionMode ?? DEFAULT_PERMISSION_MODE, '--output-format', 'json'];
@@ -53,13 +53,20 @@ export function buildClaudeWorkerCommand(opts: ClaudeWorkerOptions): WorkerLaunc
   }
   args.push(opts.prompt);
 
+  // ⛔ claude's OAuth lives in the macOS Keychain ($HOME/Library/Keychains), readable only with the
+  // REAL $HOME and the inherited login-session env: an isolated HOME → "Not logged in", a
+  // stripped/allowlisted env → 401. So a claude WORKER inherits the daemon's env and uses the real
+  // HOME for auth (Option C, operator-approved 2026-06-24). File containment is preserved by the
+  // worktree-scoped boundary audit + patch sanitize; $HOME-resolved writes never enter the captured
+  // worktree diff. (Validation gates keep their isolated HOME — HI-005 — and the codex worker keeps
+  // its isolated HOME via CODEX_HOME.) `opts.envAllowlist` is intentionally NOT applied here — env
+  // isolation is incompatible with claude's keychain OAuth.
   const env: Record<string, string> = {};
-  for (const name of opts.envAllowlist) {
-    const val = process.env[name];
-    if (val !== undefined) env[name] = val;
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) env[k] = v;
   }
   env.CLAUDE_CONFIG_DIR = opts.account.config_dir;
-  env.HOME = join(opts.worktreePath, '.home');
+  env.HOME = homedir();
 
   return { command: 'claude', args, env, stdin: null, promptFile: null };
 }

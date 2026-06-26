@@ -34,7 +34,12 @@ function listStatuslineFiles(dir: string): { path: string; mtime: Date }[] {
 }
 
 export function computeScore(five: number, seven: number): number {
-  return (100 - five) * 0.7 + (100 - seven) * 0.3;
+  // Clamp used-percentages to [0,100] (AF-321): out-of-range telemetry (>100 or negative) would
+  // otherwise produce a negative or inflated headroom score and corrupt selection ordering.
+  const clamp = (n: number): number => (Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 100);
+  const f = clamp(five);
+  const s = clamp(seven);
+  return (100 - f) * 0.7 + (100 - s) * 0.3;
 }
 
 /**

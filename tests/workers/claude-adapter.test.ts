@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { buildClaudeWorkerCommand, parseClaudeResult } from '../../src/workers/claude-adapter.js';
 
 describe('buildClaudeWorkerCommand', () => {
@@ -28,10 +28,10 @@ describe('buildClaudeWorkerCommand', () => {
     expect(plan.args[i + 1]).toBe('bypassPermissions');
   });
 
-  it('injects the account CLAUDE_CONFIG_DIR and an isolated HOME under the worktree', () => {
+  it('injects the account CLAUDE_CONFIG_DIR and uses the real HOME for keychain OAuth (Option C)', () => {
     const plan = buildClaudeWorkerCommand(base);
     expect(plan.env.CLAUDE_CONFIG_DIR).toBe('/home/u/.claude-acct1');
-    expect(plan.env.HOME).toBe(join('/tmp/wt', '.home'));
+    expect(plan.env.HOME).toBe(homedir()); // real HOME — keychain auth needs it (NOT the worktree .home)
     expect(plan.env.PATH).toBe(process.env.PATH);
   });
 

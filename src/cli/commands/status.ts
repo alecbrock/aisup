@@ -1,12 +1,12 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import type { SessionState } from '../../session/types.js';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
 
-export function readOfflineSessionStates(stateDir = join(homedir(), '.aisup', 'sessions')): Partial<SessionState>[] {
+export function readOfflineSessionStates(stateDir = join(aisupHome(), 'sessions')): Partial<SessionState>[] {
   if (!existsSync(stateDir)) return [];
   const sessions: Partial<SessionState>[] = [];
   try {
@@ -24,7 +24,7 @@ export function readOfflineSessionStates(stateDir = join(homedir(), '.aisup', 's
   return sessions.sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
 }
 
-function printOfflineStatus(stateDir = join(homedir(), '.aisup', 'sessions'), json = false): void {
+function printOfflineStatus(stateDir = join(aisupHome(), 'sessions'), json = false): void {
   const sessions = readOfflineSessionStates(stateDir);
   if (json) {
     console.log(JSON.stringify({ daemon: { running: false }, sessions }, null, 2));
@@ -40,7 +40,7 @@ function printOfflineStatus(stateDir = join(homedir(), '.aisup', 'sessions'), js
 }
 
 export async function showStatus(opts: { json?: boolean } = {}): Promise<void> {
-  const pidPath = join(homedir(), '.aisup', 'daemon.pid');
+  const pidPath = join(aisupHome(), 'daemon.pid');
   if (!existsSync(pidPath)) {
     printOfflineStatus(undefined, opts.json ?? false);
     return;

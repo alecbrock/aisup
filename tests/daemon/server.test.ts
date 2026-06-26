@@ -91,7 +91,7 @@ describe('daemon HTTP server', () => {
     expect(body.error).toMatch(/session.*active|operation.*progress/i);
   });
 
-  it('should allow POST /api/sessions when no session exists', async () => {
+  it('fails loudly (503) on POST /api/sessions when session deps are not configured (AF-327)', async () => {
     app.setReady();
     app.setSessionState(null);
 
@@ -101,8 +101,31 @@ describe('daemon HTTP server', () => {
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ cwd: tmpDir }),
     });
-    // 200 or 201 — session created (stub)
-    expect([200, 201]).toContain(res.statusCode);
+    // Deps are not wired in this bare test server → must NOT report a phantom "created" session.
+    expect(res.statusCode).toBe(503);
+    expect(res.json<{ error: string }>().error).toMatch(/dependencies not configured/i);
+  });
+
+  it('rejects an oversized tool_input on POST /api/hooks/permission (AF-327)', async () => {
+    app.setReady();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/hooks/permission',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ tool_name: 'Bash', tool_input: { cmd: 'x'.repeat(100_001) } }),
+    });
+    expect(res.statusCode).toBe(413);
+  });
+
+  it('rejects a non-string tool_name on POST /api/hooks/permission (AF-327)', async () => {
+    app.setReady();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/hooks/permission',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ tool_name: 123 }),
+    });
+    expect(res.statusCode).toBe(400);
   });
 
   it('rejects POST /api/sessions when cwd exists but is not a directory', async () => {

@@ -408,6 +408,71 @@ permissions:
     await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/approval_key/i);
   });
 
+  // AF-306: a permission keystroke must be exactly one printable ASCII char — multi-char or
+  // multi-byte values silently fail to resolve the dialog, so reject them at load.
+  it('rejects a multi-character approval_key', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+permissions:
+  approval_key: "yes"
+`);
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/approval_key.*single|single.*character/i);
+  });
+
+  it('rejects a multi-byte (emoji) denial_key', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+permissions:
+  denial_key: "🚫"
+`);
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/denial_key/i);
+  });
+
+  // AF-315: soft_pct must be strictly below hard_pct, else proactive failover semantics invert.
+  it('rejects inverted thresholds (soft_pct >= hard_pct)', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+thresholds:
+  soft_pct: 95
+  hard_pct: 85
+`);
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/soft_pct.*less than.*hard_pct/i);
+  });
+
+  // AF-320: a negative freshness window makes ALL telemetry appear stale.
+  it('rejects a negative statusline.freshness_window_s', async () => {
+    const configDir = join(tmpDir, '.aisup');
+    mkdirSync(configDir, { mode: 0o700 });
+    const accountDir = join(tmpDir, '.claude');
+    mkdirSync(accountDir);
+    writeFileSync(join(configDir, 'config.yaml'), `
+accounts:
+  - name: primary
+    config_dir: ${accountDir}
+statusline:
+  freshness_window_s: -5
+`);
+    await expect(loadConfig(join(configDir, 'config.yaml'))).rejects.toThrow(/freshness_window_s/i);
+  });
+
   it('should expand statusline.directory and validate Slack enabled prerequisites', async () => {
     const configDir = join(tmpDir, '.aisup');
     mkdirSync(configDir, { mode: 0o700 });
@@ -496,6 +561,17 @@ describe('loadConfig — workers section', () => {
     expect(config.workers.adapters.codex.name).toBe('codex');
     expect(config.workers.adapters.codex.enabled).toBe(false);
     expect(config.workers.adapters.codex.output_format).toBe('json');
+    // A real codex WORKER must both write files and emit JSON: exec + --json (parser/meter) +
+    // -s workspace-write (file edits) are required out-of-the-box (plan Task 2 / gates T3-T5).
+    expect(config.workers.adapters.codex.args).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-s',
+      'workspace-write',
+    ]);
+    // CODEX_HOME must be allowlisted so the worker reaches codex auth under the isolated HOME (T4).
+    expect(config.workers.adapters.codex.env_allowlist).toContain('CODEX_HOME');
     expect(config.workers.adapters.gemini.output_format).toBe('text');
     expect(config.workers.routing.default_implementer).toBe('codex');
     expect(config.workers.review.allow_same_model_review).toBe(false);

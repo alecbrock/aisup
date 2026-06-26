@@ -1,9 +1,32 @@
 import { describe, it, expect } from 'vitest';
-import { detectSkill } from '../../src/skills/detector.js';
+import { detectSkill, resolveSkillFromCommandName } from '../../src/skills/detector.js';
 
 const TRACKED = ['/prd', '/spec', '/fix', '/review', '/security-review'];
 
-describe('detectSkill', () => {
+// AF-309/AF-323: the PRIMARY live skill path is the UserPromptExpansion hook → resolveSkillFromCommandName.
+// These tests live with the function they cover (moved here from tests/hooks/claude-hooks.test.ts) and
+// exercise the real hook command names. detectSkill below is the pane-output fallback only.
+describe('resolveSkillFromCommandName (live hook path)', () => {
+  it('maps an exact command name to its tracked skill', () => {
+    expect(resolveSkillFromCommandName('prd', TRACKED)).toBe('/prd');
+  });
+
+  it('maps a prefixed sub-command (spec-plan) to the parent skill', () => {
+    expect(resolveSkillFromCommandName('spec-plan', TRACKED)).toBe('/spec');
+    expect(resolveSkillFromCommandName('security-review', TRACKED)).toBe('/security-review');
+  });
+
+  it('tolerates a leading slash from the raw prompt', () => {
+    expect(resolveSkillFromCommandName('/fix', TRACKED)).toBe('/fix');
+  });
+
+  it('returns null for untracked or unrelated commands', () => {
+    expect(resolveSkillFromCommandName('clear', TRACKED)).toBeNull();
+    expect(resolveSkillFromCommandName('prd', ['/spec'])).toBeNull();
+  });
+});
+
+describe('detectSkill (pane-output fallback)', () => {
   it('should detect spec skill from "Launching skill: spec-plan"', () => {
     expect(detectSkill('Launching skill: spec-plan', TRACKED)).toBe('/spec');
   });

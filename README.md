@@ -1,6 +1,6 @@
 # aisup
 
-AI supervisor daemon for Claude/Pilot coding sessions. Targets multi-account failover, Slack remote control, workflow skill propagation, and session observability. Phase 1 provides the core primitives (session management, account scoring, transcript migration, event journal); full automated failover orchestration and Slack control are in progress for Phase 2.
+AI supervisor daemon for Claude/Pilot coding sessions: multi-account failover, Slack remote control, workflow skill propagation, and session observability. Phases 1–3 are implemented — session management, account scoring/selection, reactive + proactive failover, transcript migration, event journal, Slack remote control, the permission broker, validation gates, cost tracking, and multi-LLM workers (isolated git worktrees with cross-model review and a human-approved merge), including account-first → cross-LLM worker failover (Part B). The HTTP mobile dashboard (Phase 4) is the remaining roadmap item.
 
 ## Prerequisites
 

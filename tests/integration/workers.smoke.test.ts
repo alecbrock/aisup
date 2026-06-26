@@ -1,18 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { WorkerOrchestrator, type WorktreeOps } from '../../src/workers/orchestrator.js';
 import { WorkerStore } from '../../src/workers/store.js';
 import * as wt from '../../src/workers/worktree.js';
 import { validateWorkerOutput } from '../../src/workers/validation.js';
 import { reviewWorkerOutput } from '../../src/workers/review.js';
 import { mergeWorkerOutput } from '../../src/workers/merge.js';
+import { buildWorkerCommand } from '../../src/workers/adapter.js';
+import { parseCodexJsonStream } from '../../src/workers/codex-json.js';
 import type { WorkersConfig, WorkerAdapterConfig, GateCommandConfig } from '../../src/config/schema.js';
 import type { JournalEvent } from '../../src/journal/types.js';
-import type { WorkerState, WorkerStatus } from '../../src/workers/types.js';
+import type { WorkerState, WorkerStatus, WorkerTask } from '../../src/workers/types.js';
 
 const exec = promisify(execFile);
 const g = (args: string[], cwd: string): Promise<unknown> => exec('git', args, { cwd });
@@ -230,13 +233,81 @@ describe('multi-LLM worker E2E smoke (@requires_git)', () => {
 // See tests/integration/WORKER_HOST_GATES.md for the per-tier run procedure.
 // ---------------------------------------------------------------------------
 const codexEnabled = process.env.AISUP_TEST_CODEX === '1';
-describe.skipIf(!codexEnabled)('@requires_codex real worker run', () => {
-  it('runs a real codex worker against a temp repo (documented in WORKER_HOST_GATES.md)', () => {
-    // Intentionally a placeholder gated by AISUP_TEST_CODEX=1 — the operator fills in the real
-    // codex CLI invocation per their installed version; the deterministic suite above is the
-    // always-run proof. Marked here so the tier is discoverable and never fails when skipped.
-    expect(codexEnabled).toBe(true);
+describe.skipIf(!codexEnabled)('@requires_codex real worker run (set AISUP_TEST_CODEX=1)', () => {
+  let scratch: string;
+  afterEach(() => {
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
   });
+
+  it('runs a real codex exec --json worker that edits a file; parses turn.completed.usage + finalText', async () => {
+    // Canonical /private/tmp so codex's HOME-resolution and git agree on the path (MD-003).
+    scratch = join('/private/tmp', `aisup-codex-test-${randomUUID()}`);
+    mkdirSync(join(scratch, '.home'), { recursive: true });
+    writeFileSync(join(scratch, 'README.md'), '# scratch\n');
+    await g(['init', '-q'], scratch);
+    await g(['config', 'user.email', 'test@example.com'], scratch);
+    await g(['config', 'user.name', 'aisup test'], scratch);
+    await g(['add', '.'], scratch);
+    await g(['commit', '-q', '-m', 'init'], scratch);
+
+    // codex auth (ChatGPT login) lives in the REAL ~/.codex; buildWorkerCommand forces HOME to the
+    // isolated worktree .home, so point CODEX_HOME at the real auth dir explicitly (same mechanism
+    // the prior codex E2E used — commit 29a25f1).
+    process.env.CODEX_HOME = join(homedir(), '.codex');
+
+    // The shipped default codex worker args (Task 2): exec + --json + -s workspace-write.
+    const codexAdapter: WorkerAdapterConfig = {
+      name: 'codex',
+      command: 'codex',
+      args: ['exec', '--json', '--skip-git-repo-check', '-s', 'workspace-write'],
+      prompt_via: 'arg',
+      prompt_arg_flag: null,
+      prompt_file_flag: null,
+      env_allowlist: ['PATH', 'HOME', 'CODEX_HOME'],
+      timeout_seconds: 300,
+      enabled: true,
+      output_format: 'json',
+    };
+    const task: WorkerTask = {
+      id: randomUUID(),
+      task_type: 'implement',
+      title: 'codex smoke',
+      prompt: 'Append a single new line that says "hello from codex worker" to README.md. Make only that one edit.',
+      base_ref: 'HEAD',
+      base_sha: 'HEAD',
+      implementer: 'codex',
+      reviewer: null,
+      workspace_root: scratch,
+      created_at: new Date().toISOString(),
+    } as WorkerTask;
+
+    const plan = buildWorkerCommand(codexAdapter, task, scratch, join(scratch, '.worker-state'));
+
+    // Raw execFile (not runWorker, which tail-truncates to 2000 chars) so the full NDJSON stream is
+    // captured for parsing. ⛔ MUST close the child's stdin (EOF): `codex exec` appends piped stdin
+    // as a <stdin> block and blocks forever if the pipe stays open — runWorker does this via
+    // child.stdin.end(); here we replicate it.
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = execFile(
+        plan.command,
+        plan.args,
+        { cwd: scratch, env: plan.env, timeout: 240_000, maxBuffer: 10 * 1024 * 1024 },
+        (err, out) => {
+          if (err && (err as { killed?: boolean }).killed) reject(new Error('codex worker timed out'));
+          else resolve(String(out ?? ''));
+        }
+      );
+      child.stdin?.end();
+    });
+
+    const changed = (await exec('git', ['diff', '--name-only'], { cwd: scratch }) as { stdout: string }).stdout;
+    expect(changed).toContain('README.md');
+
+    const parsed = parseCodexJsonStream(stdout);
+    expect(parsed.usage).not.toBeNull();
+    expect(parsed.usage!.input_tokens).toBeGreaterThan(0);
+    expect(parsed.finalText.length).toBeGreaterThan(0);
+  }, 330_000);
 });
 
 describe.skipIf(process.env.AISUP_TEST_GEMINI !== '1')('@requires_gemini real worker run', () => {

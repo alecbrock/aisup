@@ -163,7 +163,19 @@ export class SlackService {
           channel: channelId,
           users: userId,
         });
-      } catch { /* user may already be member */ }
+      } catch (err) {
+        // already_in_channel / cant_invite_self are expected and benign; surface anything else so a
+        // misconfigured workspace (bad scopes, archived channel) is observable, not silent (AF-327).
+        const code = (err as { data?: { error?: string } }).data?.error ?? (err instanceof Error ? err.message : String(err));
+        if (code !== 'already_in_channel' && code !== 'cant_invite_self') {
+          await this.opts.journal.append({
+            ts: new Date().toISOString(),
+            event_type: 'slack.invite_failed',
+            aisup_session_id: session.aisup_session_id,
+            details: { channel: channelId, user: userId, error: code },
+          });
+        }
+      }
     }
 
     this.channelMap.set(session.aisup_session_id, channelId);

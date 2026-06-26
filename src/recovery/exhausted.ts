@@ -159,6 +159,19 @@ export async function resumeExhaustedSession(
   const state = deps.sessionManager.readState(sessionId);
   if (!state || state.status !== 'EXHAUSTED') return false;
 
+  // Validate the resume target up front (AF-316): an unknown or disabled account fails cleanly here
+  // rather than partway through performSwitch.
+  const target = deps.accounts.find((a) => a.name === targetAccount);
+  if (!target || !target.enabled) {
+    await deps.journal.append({
+      ts: new Date().toISOString(),
+      event_type: 'failover.target_invalid',
+      aisup_session_id: sessionId,
+      details: { target: targetAccount, reason: target ? 'disabled' : 'unknown_account' },
+    });
+    return false;
+  }
+
   const result = await deps.performSwitch(
     {
       aisupSessionId: sessionId,

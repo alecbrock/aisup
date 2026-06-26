@@ -29,6 +29,15 @@ async function git(args: string[], cwd: string): Promise<string> {
 const SECRET_LINE =
   /(token|secret|api[_-]?key|password|authorization|bot_token|app_token|signing_secret)\s*[:=]/i;
 
+// Dirs created in the worker's cwd by session hooks / MCP servers — CodeGraph's SessionStart hook
+// (`~/.pilot/hooks/codegraph_init.py` → `.codegraph/`) and Serena (`.serena/`) — plus the isolated
+// `.home/`. None are the worker's task output. They are excluded from BOTH the worktree-local
+// info/exclude (so `git add -A -N` skips them) AND the captured-diff pathspec, so they can never
+// pollute the patch when the worker's workspace repo does not already gitignore them (a fresh scratch
+// repo, or a user repo without these entries). An unexcluded tool dir breaks reviewer verdict parsing.
+const DIFF_EXCLUDE_DIRS = ['.home/', '.codegraph/', '.serena/'] as const;
+const EXCLUDE_PATHSPECS = DIFF_EXCLUDE_DIRS.map((d) => `:(exclude)${d}`);
+
 export interface MainTreeSnapshot {
   status: string; // `git status --porcelain --ignored`, worktreeDir lines removed
   forbidden: Record<string, string>; // matched forbidden path -> "size:mtimeMs:sha256"
@@ -86,12 +95,12 @@ export async function createWorktree(opts: {
   // Isolated throwaway HOME for the worker subprocess.
   mkdirSync(join(worktree, '.home'), { recursive: true, mode: 0o700 });
 
-  // Worktree-local exclude so `git add -A -N` never stages .home/ (belt-and-suspenders with the
-  // :(exclude).home/ pathspec in captureDiff — MD-003).
+  // Worktree-local exclude so `git add -A -N` never stages .home/ or tool-data dirs (belt-and-suspenders
+  // with the :(exclude) pathspecs in captureDiff — MD-003 + DIFF_EXCLUDE_DIRS).
   const excludeRaw = (await git(['rev-parse', '--git-path', 'info/exclude'], worktree)).trim();
   const excludePath = isAbsolute(excludeRaw) ? excludeRaw : join(worktree, excludeRaw);
-  mkdirSync(dirname(excludePath), { recursive: true });
-  appendFileSync(excludePath, '.home/\n');
+  mkdirSync(dirname(excludePath), { recursive: true, mode: 0o700 });
+  appendFileSync(excludePath, DIFF_EXCLUDE_DIRS.map((d) => `${d}\n`).join(''));
 
   return worktree;
 }
@@ -102,12 +111,13 @@ export async function captureDiff(opts: {
   baseSha: string;
 }): Promise<{ patch: string; changedFiles: string[] }> {
   const { worktree, baseSha } = opts;
-  // Intent-to-add so new files appear in the diff. .home/ is in the worktree-local info/exclude so a
-  // plain `add -A -N` skips it; the diff calls add a :(exclude).home/ pathspec as belt-and-suspenders
-  // (MD-003/MD-012). An explicit pathspec on `add` would error on the now-ignored .home, so it is omitted.
+  // Intent-to-add so new files appear in the diff. .home/ + tool-data dirs are in the worktree-local
+  // info/exclude so a plain `add -A -N` skips them; the diff calls add :(exclude) pathspecs as
+  // belt-and-suspenders (MD-003/MD-012 + DIFF_EXCLUDE_DIRS). An explicit pathspec on `add` would error
+  // on the now-ignored dirs, so it is omitted.
   await git(['add', '-A', '-N'], worktree);
-  const patch = await git(['diff', baseSha, '--', '.', ':(exclude).home/'], worktree);
-  const namesOut = await git(['diff', '--name-only', baseSha, '--', '.', ':(exclude).home/'], worktree);
+  const patch = await git(['diff', baseSha, '--', '.', ...EXCLUDE_PATHSPECS], worktree);
+  const namesOut = await git(['diff', '--name-only', baseSha, '--', '.', ...EXCLUDE_PATHSPECS], worktree);
   const changedFiles = namesOut.split('\n').map((l) => l.trim()).filter(Boolean);
   // Defense-in-depth: a diff path must never resolve outside the worktree (structurally it cannot).
   for (const f of changedFiles) {

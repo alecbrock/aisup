@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../../config/loader.js';
@@ -7,8 +7,8 @@ import { createJournalWriter } from '../../journal/writer.js';
 import { runGates } from '../../gates/engine.js';
 import type { GateRunResult } from '../../gates/types.js';
 
-const TOKEN_PATH = join(homedir(), '.aisup', 'api-token');
-const PID_PATH = join(homedir(), '.aisup', 'daemon.pid');
+const TOKEN_PATH = join(aisupHome(), 'api-token');
+const PID_PATH = join(aisupHome(), 'daemon.pid');
 
 /** Human-readable summary of a gate run (pure — used by both `aisup gate` and `aisup gate run`). */
 export function formatGateRun(result: GateRunResult): string {

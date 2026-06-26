@@ -297,6 +297,38 @@ describe('LoopManager with deps', () => {
     expect(onIdle).toHaveBeenCalledTimes(2);
   });
 
+  // AF-304: clearRecoveryCounters clears ALL per-session collections (incl. idleEmitted), so after a
+  // session stop the per-session state is gone — observable here as onIdle re-firing on the next tick.
+  it('clearRecoveryCounters resets per-session idle state (AF-304)', () => {
+    const { tmpDir, deps } = makeFakeDeps();
+    cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
+    const session = deps.sessionManager.getActiveSession();
+    const logPath = session.output_log_path as string;
+    const onIdle = vi.fn();
+    const lm = new LoopManager({
+      rateLimitIntervalMs: 5000,
+      healthIntervalMs: 5000,
+      recoveryIntervalMs: 5000,
+      idleIntervalMs: 5000,
+      onThresholdBreach: vi.fn(),
+      onCrashDetected: vi.fn(),
+      onHealthResult: vi.fn(),
+      onIdle,
+      deps: deps as unknown as LoopManagerDeps,
+    });
+    const idleTick = (lm as unknown as { idleTick(d: LoopManagerDeps): void }).idleTick.bind(lm);
+
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(logPath, old, old);
+    idleTick(deps as unknown as LoopManagerDeps);
+    idleTick(deps as unknown as LoopManagerDeps);
+    expect(onIdle).toHaveBeenCalledTimes(1); // idleEmitted suppresses repeats within the period
+
+    lm.clearRecoveryCounters(session.aisup_session_id as string); // clears idleEmitted + the per-session maps
+    idleTick(deps as unknown as LoopManagerDeps);
+    expect(onIdle).toHaveBeenCalledTimes(2); // cleared → re-fires
+  });
+
   describe('gate triggering on idle', () => {
     const idleSessionWithSkill = (deps: ReturnType<typeof makeFakeDeps>['deps'], skill: string | null) => {
       const base = deps.sessionManager.getActiveSession();
@@ -367,6 +399,32 @@ describe('LoopManager with deps', () => {
       idleSessionWithSkill(deps, '/spec');
       const lm = buildLoop(deps);
       expect(() => idleTick(lm, deps)).not.toThrow();
+    });
+
+    // AF-311: when a skill completes mid-idle (active_skill cleared on the gate trigger), idleEmitted
+    // is reset so the next idle tick re-fires onIdle instead of staying suppressed for the period.
+    it('re-fires onIdle on the next tick after a skill completes mid-idle (AF-311)', () => {
+      const onIdle = vi.fn();
+      const onGateTrigger = vi.fn().mockResolvedValue(undefined);
+      const { tmpDir, deps } = makeFakeDeps({ onGateTrigger, gateDebounceMs: 60_000 });
+      cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
+      idleSessionWithSkill(deps, '/spec');
+      const lm = new LoopManager({
+        rateLimitIntervalMs: 5000,
+        healthIntervalMs: 5000,
+        recoveryIntervalMs: 5000,
+        idleIntervalMs: 5000,
+        onThresholdBreach: vi.fn(),
+        onCrashDetected: vi.fn(),
+        onHealthResult: vi.fn(),
+        onIdle,
+        deps: deps as unknown as LoopManagerDeps,
+      });
+
+      idleTick(lm, deps); // idle → onIdle #1, gate fires + clears skill → idleEmitted reset
+      idleTick(lm, deps); // still idle → onIdle re-fires because idleEmitted was reset
+      expect(onGateTrigger).toHaveBeenCalledTimes(1); // gate still debounced within the window
+      expect(onIdle).toHaveBeenCalledTimes(2);
     });
   });
 

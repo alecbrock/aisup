@@ -60,8 +60,10 @@ export class AccountRegistry {
       acct.cooldownUntil = cooldownUntil;
     } else if (fiveHourPct >= softPct || sevenDayPct >= softPct) {
       acct.state = 'DEGRADED';
+      acct.cooldownUntil = null; // recovered to a runnable state → drop the stale cooldown (AF-314)
     } else {
       acct.state = 'HEALTHY';
+      acct.cooldownUntil = null; // recovered to a runnable state → drop the stale cooldown (AF-314)
     }
   }
 }

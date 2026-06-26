@@ -7,6 +7,7 @@ import {
   destroyTmuxSession,
 } from '../session/tmux.js';
 import type { SessionState, SessionInfo, SwitchTx } from '../session/types.js';
+import { isValidSessionState } from '../session/validate.js';
 import type { JournalWriter } from '../journal/types.js';
 import { SwitchReason } from '../failover/types.js';
 import { readTelemetryForSession } from '../statusline/store.js';
@@ -80,14 +81,20 @@ async function validateRehydratedTelemetry(state: SessionState, deps: Rehydratio
   }
 }
 
-function readSessionState(stateDir: string, sessionId: string): SessionState | null {
+/** Distinguishes a missing entry (normal) from a corrupt/wrong-shape state.json (AF-312). */
+function readSessionState(stateDir: string, sessionId: string): { state: SessionState | null; corrupt: boolean; error?: string } {
   const path = join(stateDir, sessionId, 'state.json');
-  if (!existsSync(path)) return null;
+  if (!existsSync(path)) return { state: null, corrupt: false };
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(path, 'utf8')) as SessionState;
-  } catch {
-    return null;
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    return { state: null, corrupt: true, error: (err instanceof Error ? err.message : String(err)).slice(0, 160) };
   }
+  if (!isValidSessionState(parsed)) {
+    return { state: null, corrupt: true, error: 'state.json has an unexpected shape' };
+  }
+  return { state: parsed, corrupt: false };
 }
 
 function writeSessionState(stateDir: string, state: SessionState): void {
@@ -218,7 +225,18 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
   }
 
   for (const sessionId of sessionIds) {
-    const state = readSessionState(stateDir, sessionId);
+    const read = readSessionState(stateDir, sessionId);
+    if (read.corrupt) {
+      // A corrupt state.json must be observable, not a silent drop from supervision (AF-312).
+      await journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'session.state_corrupt',
+        aisup_session_id: sessionId,
+        details: { source: 'rehydration', error: read.error },
+      });
+      continue;
+    }
+    const state = read.state;
     if (!state) continue;
 
     const hasTmux = liveSessions.has(state.tmux_name);
