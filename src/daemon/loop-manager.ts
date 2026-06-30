@@ -24,6 +24,8 @@ import type { StatuslineTelemetry } from '../statusline/types.js';
 const RECOVERY_LOG_SCAN_BYTES = 65536; // 64KB
 const RESTART_FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_RESTARTS_BEFORE_SWITCH = 3;
+/** Grace period after launch before a still-no-telemetry active session is flagged (F-7). */
+const TELEMETRY_ABSENT_GRACE_MS = 60 * 1000;
 /** Default minimum interval between automatic gate runs for a session. */
 const DEFAULT_GATE_DEBOUNCE_MS = 30 * 1000;
 /** Minimum upward cost delta (USD) that is journaled as a periodic cost.snapshot. */
@@ -96,6 +98,8 @@ export class LoopManager {
   /** Per-session consecutive network-error count; resets alongside restartAttempts. */
   private networkErrors = new Map<string, number>();
   private lastNoTargetNotice = new Map<string, number>();
+  /** Sessions already warned that NO statusline telemetry is reaching the daemon (F-7). One-shot per session. */
+  private telemetryAbsentWarned = new Set<string>();
   /** Sessions for which the current continuous idle period has already emitted onIdle. */
   private idleEmitted = new Set<string>();
   /** Last automatic gate-run time per session (debounce window). */
@@ -192,6 +196,34 @@ export class LoopManager {
           stale: telemetryResult.invalidJson.stale,
         },
       });
+    }
+
+    // F-7: an ACTIVE session with NO telemetry at all (no matching file in statusline.directory) past
+    // a grace window means telemetry is silently not reaching the daemon — typically the account's
+    // settings.json statusLine.command taps a different directory than config.statusline.directory. Left
+    // silent, claude_session_id / rate-limit % / cost never hydrate and failover telemetry is disabled.
+    // Surface it ONCE per session instead of failing silently; clears so a later recovery re-arms.
+    if (telemetry) {
+      this.telemetryAbsentWarned.delete(session.aisup_session_id);
+    } else if (!telemetryResult.mismatch && !telemetryResult.invalidJson) {
+      const launchMs = new Date(session.launch_started_at).getTime();
+      if (
+        Number.isFinite(launchMs) &&
+        Date.now() - launchMs > TELEMETRY_ABSENT_GRACE_MS &&
+        !this.telemetryAbsentWarned.has(session.aisup_session_id)
+      ) {
+        this.telemetryAbsentWarned.add(session.aisup_session_id);
+        void d.journal.append({
+          ts: new Date().toISOString(),
+          event_type: 'telemetry.absent',
+          aisup_session_id: session.aisup_session_id,
+          details: {
+            account: session.account,
+            statusline_dir: d.statuslineDir,
+            hint: 'No statusline telemetry for the active session — claude_session_id, rate-limit %, and cost will not hydrate and failover telemetry is disabled. Ensure each account settings.json statusLine.command writes to config.statusline.directory.',
+          },
+        });
+      }
     }
 
     // Hydrate claude_session_id and transcript_path from telemetry when first available
@@ -666,6 +698,7 @@ export class LoopManager {
     this.lastGateRun.delete(sessionId);
     this.costState.delete(sessionId);
     this.idleEmitted.delete(sessionId);
+    this.telemetryAbsentWarned.delete(sessionId);
   }
 
   /** Refresh scores/state from telemetry + circuit breaker before a failover selection. */

@@ -1115,4 +1115,54 @@ describe('LoopManager with deps', () => {
       expect(costEvents(deps)).toHaveLength(0);
     });
   });
+
+  describe('telemetry absent warning (F-7)', () => {
+    type Deps = ReturnType<typeof makeFakeDeps>['deps'];
+    const buildLoop = (deps: Deps) => new LoopManager({
+      rateLimitIntervalMs: 5000, healthIntervalMs: 5000, recoveryIntervalMs: 5000, idleIntervalMs: 5000,
+      onThresholdBreach: vi.fn(), onCrashDetected: vi.fn(), onHealthResult: vi.fn(), onIdle: vi.fn(),
+      deps: deps as unknown as LoopManagerDeps,
+    });
+    const tick = (lm: LoopManager, deps: Deps): void =>
+      (lm as unknown as { rateLimitTick(d: LoopManagerDeps): void }).rateLimitTick(deps as unknown as LoopManagerDeps);
+    const absentEvents = (deps: Deps): string[] =>
+      (deps.journal.append as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => (c[0] as { event_type: string }).event_type)
+        .filter((e) => e === 'telemetry.absent');
+    const oldLaunch = (): string => new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+    it('emits telemetry.absent ONCE for an active session with no telemetry past the grace window', () => {
+      const { tmpDir, deps } = makeFakeDeps();
+      cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
+      const session = { ...deps.sessionManager.getActiveSession(), launch_started_at: oldLaunch(), claude_session_id: null };
+      deps.sessionManager.getActiveSession = vi.fn().mockReturnValue(session);
+      const lm = buildLoop(deps);
+      tick(lm, deps); tick(lm, deps); tick(lm, deps); // repeated ticks → still one-shot
+      expect(absentEvents(deps)).toEqual(['telemetry.absent']);
+    });
+
+    it('does NOT emit telemetry.absent when telemetry IS present', () => {
+      const { tmpDir, deps } = makeFakeDeps();
+      cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
+      const csid = 'dddddddd-1111-2222-3333-444444444444';
+      const session = { ...deps.sessionManager.getActiveSession(), launch_started_at: oldLaunch(), claude_session_id: csid, cwd: tmpDir };
+      deps.sessionManager.getActiveSession = vi.fn().mockReturnValue(session);
+      const future = Math.floor(Date.now() / 1000) + 3600;
+      writeFileSync(join(tmpDir, `statusline-${csid}.json`), JSON.stringify({
+        session_id: csid, transcript_path: join(tmpDir, 'projects', 'p', `${csid}.jsonl`), cwd: tmpDir,
+        rate_limits: { five_hour: { used_percentage: 10, resets_at: future }, seven_day: { used_percentage: 5, resets_at: future } },
+      }));
+      tick(buildLoop(deps), deps);
+      expect(absentEvents(deps)).toEqual([]);
+    });
+
+    it('does NOT emit within the grace window (recent launch)', () => {
+      const { tmpDir, deps } = makeFakeDeps();
+      cleanup = () => rmSync(tmpDir, { recursive: true, force: true });
+      const session = { ...deps.sessionManager.getActiveSession(), launch_started_at: new Date().toISOString(), claude_session_id: null };
+      deps.sessionManager.getActiveSession = vi.fn().mockReturnValue(session);
+      tick(buildLoop(deps), deps);
+      expect(absentEvents(deps)).toEqual([]);
+    });
+  });
 });

@@ -184,14 +184,26 @@ function statuslineExecutable(words: string[]): string {
 
 function printTelemetry(config: Awaited<ReturnType<typeof loadConfig>>): void {
   console.log('Account | Model | Context Window | Total Cost');
+  let anyTelemetry = false;
   for (const acct of config.accounts) {
     const telemetry = readTelemetryForAccount(acct.config_dir, config.statusline.directory, config.statusline.freshness_window_s);
     const model = telemetry?.model?.id ?? '—';
     const contextWindow = telemetry?.context_window?.context_window_size ?? '—';
     const cost = telemetry?.cost?.total_cost_usd ?? '—';
     console.log(`${acct.name} | ${model} | ${contextWindow} | ${cost}`);
-    if (!telemetry) {
+    if (telemetry) {
+      anyTelemetry = true;
+    } else {
       console.log(`  ! ${acct.name}: no telemetry`);
     }
+  }
+  // F-7: when NO account has telemetry in the configured directory, surface the most common cause —
+  // the account statusLine.command tap writes somewhere other than config.statusline.directory, which
+  // silently disables claude_session_id / rate-limit % / cost / failover telemetry.
+  if (!anyTelemetry) {
+    console.log(
+      `  ! no telemetry in statusline.directory (${config.statusline.directory}). ` +
+      `If a session is active, ensure each account's settings.json statusLine.command writes to this exact directory (F-7).`
+    );
   }
 }

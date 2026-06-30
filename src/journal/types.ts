@@ -78,6 +78,7 @@ export type EventType =
   | 'telemetry.stale_warning'
   | 'telemetry.invalid_json'
   | 'telemetry.session_mismatch'
+  | 'telemetry.absent'
   // Slack
   | 'slack.channel_created'
   | 'slack.channel_name_collision'
