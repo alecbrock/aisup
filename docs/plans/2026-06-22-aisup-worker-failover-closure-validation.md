@@ -79,9 +79,21 @@ The Part B feature is shipped and VERIFIED (commit `2ab8440`, plan `docs/plans/2
 - [x] Task 10: [NEW] Remove dead code, fix Map leaks & semantic tech-debt (AF-304, AF-307, AF-308, AF-309, AF-322, AF-323, AF-324)
 - [x] Task 11: [NEW] Tighten secret redaction, worker-dir perms & injection paths (AF-305, AF-325, AF-326, AF-327)
 - [x] Task 12: [NEW] Confirm-coverage (LOW) of the already-resolved Phase 3 isolation/security blockers (AF-201…AF-206; resolved per AF-R001…R007)
-- [ ] Task 13: [NEW] Execute the deferred Full-System Validation suite (2026-06-17 Part A + Phase 1 live gates) (AF-101, AF-102)
+- [x] Task 13: [NEW] Execute the deferred Full-System Validation suite (2026-06-17 Part A + Phase 1 live gates) (AF-101, AF-102) — executed 2026-06-26; evidence: `docs/plans/2026-06-26-aisup-FULL-MANUAL-SYSTEM-VALIDATION-RESULTS.md`
 - [x] Task 14: [NEW] Documentation & PRD sync (AF-501…AF-505)
 - [x] Task 15: [NEW] Dependency-hygiene pass (AF-506)
+
+### F-* disposition (2026-06-26 Full-System Validation adversarial findings → resolved in the 2026-06-30 final-completion plan)
+
+| Finding | Summary | Disposition |
+|---------|---------|-------------|
+| F-1 | `worker providers` conflated workers-disabled with daemon-down | Fixed by Task B1 (2026-06-30 plan) |
+| F-2 | `aisup log --json` missing | Fixed by Task B1 |
+| F-3 | absolute `worktree_dir` failed silently (blank daemon.out) | Fixed by Task B2 (fail-loud config validation) |
+| F-4 | security-denied worker task prompt/title retained | Fixed by Task B3 (opt-in `redact_denied_prompts`) |
+| F-5 | `gate run` exit code always 0 | Fixed by Task B2 |
+| F-6 | gate `command` ENOENT swallowed | Fixed by Task B2 (surfaced in `stderr_tail`/reason) |
+| F-7 | silent no-telemetry for active sessions | Already shipped (commit fc7678d, pre-2026-06-30 plan) |
 
 ## Implementation Tasks
 

@@ -299,7 +299,7 @@ accounts:
     expect(config.permissions.denial_key).toBe('n');
     expect(config.permissions.policy.default_action).toBe('deny');
     expect(config.permissions.slack_routing).toBe(false);
-    expect(config.permissions.grant_ttl_seconds).toBe(300);
+    expect(config.permissions.grant_ttl_seconds).toBe(null); // A3: never expire by default
     expect(config.gates.enabled).toBe(false);
     expect(config.gates.gates).toEqual([]);
     expect(config.gates.trigger).toBe('idle_and_skill');
@@ -766,5 +766,16 @@ describe('loadConfig — workers section', () => {
     - provider: codex
 `;
     await expect(loadConfig(writeConfig(yaml))).rejects.toThrow(/budget|tokens|positive/i);
+  });
+
+  // Regression (FV-7, 2026-07-07): the loader must carry journal.max_size_mb through to the returned
+  // config — it was previously dropped (built as `{ path }` only), so journal rotation never fired.
+  it('preserves journal.max_size_mb from config and applies the default when unset', async () => {
+    const configured = await loadConfig(writeConfig('journal:\n  max_size_mb: 7\n'));
+    expect(configured.journal.max_size_mb).toBe(7);
+
+    resetConfigCache();
+    const defaulted = await loadConfig(writeConfig(''));
+    expect(defaulted.journal.max_size_mb).toBe(50); // CONFIG_DEFAULTS.journal.max_size_mb
   });
 });

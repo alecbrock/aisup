@@ -333,6 +333,11 @@ describe('WorkerOrchestrator multi-provider failover (Part B)', () => {
     await waitFor(() => h.store.read(id)?.status === 'FAILED');
     expect(h.store.read(id)!.error_summary).toBe('all_candidates_exhausted');
     expect(h.events.find((e) => e.event_type === 'worker.all_candidates_exhausted')?.details.tried).toEqual(['claude:a1', 'codex']);
+    // C3: the durable state records each tried candidate + its failure reason (no journal grep needed).
+    expect(h.store.read(id)!.tried_candidates).toEqual([
+      { provider: 'claude', account: 'a1', reason: 'rate_limited', role: 'implementer' },
+      { provider: 'codex', reason: 'rate_limited', role: 'implementer' },
+    ]);
     expect(h.removed.length).toBe(2); // every candidate's worktree removed
   });
 

@@ -16,6 +16,8 @@ export interface HookSettingsOpts {
   includeSkill: boolean;
   /** Install the PermissionRequest → /api/hooks/permission hook (broker, blocks for Slack decision). */
   includePermission: boolean;
+  /** Install the PostToolUse → /api/hooks/activity hook (live activity feed; fire-and-forget). */
+  includeActivity?: boolean;
   /** Seconds the permission hook blocks awaiting a Slack decision before Claude's own dialog resumes. */
   permissionTimeoutS?: number;
 }
@@ -53,6 +55,17 @@ export function buildHookSettings(opts: HookSettingsOpts): HookSettings {
       // Default 30s matches the daemon's intent ("short is plenty"): the hook is a non-blocking
       // detector that returns in ms; the human decision is resolved later via a keystroke (AF-310).
       { matcher: '*', hooks: [{ type: 'http', url: `${base}/permission`, timeout: opts.permissionTimeoutS ?? 30, headers }] },
+    ];
+  }
+  if (opts.includeActivity) {
+    // A4 SOURCE-PATH DECISION: hook-primary. PostToolUse → the activity feed is the SHIPPED source —
+    // it uses the same proven HTTP-hook transport as PermissionRequest above and PostToolUse is a
+    // standard Claude Code event. The transcript-`.jsonl`-tail path is the documented FOLLOW-UP
+    // resilience add (read the active session's transcript tail on the relay tick), not shipped here.
+    // Fire-and-forget (short timeout): the daemon returns immediately and posts to Slack out-of-band,
+    // so a slow Slack call never stalls the session.
+    hooks.PostToolUse = [
+      { matcher: '*', hooks: [{ type: 'http', url: `${base}/activity`, timeout: 5, headers }] },
     ];
   }
   return { hooks };

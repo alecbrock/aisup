@@ -34,4 +34,15 @@ describe('buildHookSettings', () => {
     expect(s.hooks.UserPromptExpansion[0].hooks[0].url).toBe('http://localhost:1/api/hooks/skill');
     expect(s.hooks.PermissionRequest[0].hooks[0].url).toBe('http://localhost:1/api/hooks/permission');
   });
+
+  it('installs the PostToolUse activity hook only when includeActivity is set', () => {
+    const off = buildHookSettings({ port: 7394, token: 't', includeSkill: false, includePermission: false });
+    expect(off.hooks.PostToolUse).toBeUndefined();
+
+    const on = buildHookSettings({ port: 7394, token: 'tok', includeSkill: false, includePermission: false, includeActivity: true });
+    const h = on.hooks.PostToolUse[0].hooks[0];
+    expect(h.url).toBe('http://127.0.0.1:7394/api/hooks/activity');
+    expect(h.headers.Authorization).toBe('Bearer tok');
+    expect(on.hooks.PostToolUse[0].matcher).toBe('*');
+  });
 });

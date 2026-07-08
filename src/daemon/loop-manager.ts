@@ -40,6 +40,8 @@ interface CostState {
   contextWindowSize?: number;
   claudeSessionId: string | null;
   account: string;
+  /** Active skill on the session at snapshot time (C8 cost-by-skill attribution). */
+  activeSkill?: string | null;
 }
 
 export interface LoopManagerDeps {
@@ -106,11 +108,20 @@ export class LoopManager {
   private lastGateRun = new Map<string, number>();
   /** Per-session cost tracking for delta-filtered periodic + lifecycle cost snapshots. */
   private costState = new Map<string, CostState>();
+  /** D3 health self-check: last-tick epoch ms per loop + each loop's interval for staleness. */
+  private lastTicks = new Map<string, number>();
+  private loopIntervalsMs: Record<string, number> = {};
 
   constructor(opts: LoopManagerOpts) {
     this.deps = opts.deps;
     this.onHealthResult = opts.onHealthResult;
     this.onIdle = opts.onIdle;
+    this.loopIntervalsMs = {
+      rate_limit: opts.rateLimitIntervalMs,
+      recovery: opts.recoveryIntervalMs,
+      health: opts.healthIntervalMs,
+      idle: opts.idleIntervalMs,
+    };
     this.rateLimitMonitor = new RateLimitMonitor({
       intervalMs: opts.rateLimitIntervalMs,
       onThresholdBreach: opts.onThresholdBreach,
@@ -133,16 +144,43 @@ export class LoopManager {
     const d = this.deps;
 
     if (d) {
-      this.rateLimitMonitor.start(() => this.rateLimitTick(d));
-      this.recoveryHandler.start(() => void this.recoveryTick(d));
-      this.healthChecker.start(() => this.healthTick(d));
-      this.idleWatchdog.start(() => this.idleTick(d));
+      this.rateLimitMonitor.start(() => { this.markTick('rate_limit'); this.rateLimitTick(d); });
+      this.recoveryHandler.start(() => { this.markTick('recovery'); void this.recoveryTick(d); });
+      this.healthChecker.start(() => {
+        this.markTick('health');
+        this.healthTick(d);
+        // D3 self-check: journal daemon liveness (per-loop last-tick + staleness) each health tick.
+        void d.journal.append({ ts: new Date().toISOString(), event_type: 'daemon.health_check', details: { loops: this.getLoopHealth() } });
+      });
+      this.idleWatchdog.start(() => { this.markTick('idle'); this.idleTick(d); });
     } else {
       this.rateLimitMonitor.start();
       this.recoveryHandler.start();
       this.healthChecker.start();
       this.idleWatchdog.start();
     }
+  }
+
+  /** C13: apply new soft/hard usage thresholds to the live monitoring loop (no restart). */
+  updateThresholds(softPct: number, hardPct: number): void {
+    if (this.deps) { this.deps.softPct = softPct; this.deps.hardPct = hardPct; }
+  }
+
+  /** D3: record that a monitoring loop just ticked (for the health self-check). */
+  markTick(loop: string, nowMs: number = Date.now()): void {
+    this.lastTicks.set(loop, nowMs);
+  }
+
+  /**
+   * D3: per-loop liveness — each loop's last tick + whether it is stale (no tick in > 3× its
+   * interval, or never ticked). Surfaced by GET /api/health and the overview so a stalled loop is visible.
+   */
+  getLoopHealth(nowMs: number = Date.now()): Array<{ loop: string; last_tick: string | null; stale: boolean }> {
+    return Object.entries(this.loopIntervalsMs).map(([loop, intervalMs]) => {
+      const last = this.lastTicks.get(loop) ?? null;
+      const stale = last === null || nowMs - last > 3 * intervalMs;
+      return { loop, last_tick: last === null ? null : new Date(last).toISOString(), stale };
+    });
   }
 
   stopAll(): void {
@@ -337,12 +375,12 @@ export class LoopManager {
     const prev = this.costState.get(id);
 
     if (prev === undefined) {
-      this.costState.set(id, { observed: cost, emitted: cost, modelId, contextWindowSize, claudeSessionId, account: session.account });
+      this.costState.set(id, { observed: cost, emitted: cost, modelId, contextWindowSize, claudeSessionId, account: session.account, activeSkill: session.active_skill });
       if (cost >= COST_MIN_DELTA_USD) this.appendCostSnapshot(d, id, 'periodic');
       return;
     }
 
-    const entry: CostState = { observed: cost, emitted: prev.emitted, modelId, contextWindowSize, claudeSessionId, account: session.account };
+    const entry: CostState = { observed: cost, emitted: prev.emitted, modelId, contextWindowSize, claudeSessionId, account: session.account, activeSkill: session.active_skill };
     if (cost - prev.emitted >= COST_MIN_DELTA_USD) {
       entry.emitted = cost; // re-baseline at the journaled value so increments accumulate
       this.costState.set(id, entry);
@@ -384,6 +422,8 @@ export class LoopManager {
         total_cost_usd: entry.observed,
         model_id: entry.modelId ?? null,
         context_window_size: entry.contextWindowSize ?? null,
+        active_skill: entry.activeSkill ?? null, // C8: cost-by-skill attribution
+        provider: 'claude', // lead-session cost is always the Claude runner (C8 provider split)
         trigger,
       },
     });

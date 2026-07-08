@@ -62,8 +62,17 @@ aisup status
 | `aisup attach` | Attach to active tmux session |
 | `aisup status` | Show daemon and session status |
 | `aisup failover --to ACCOUNT` | Manual account failover |
-| `aisup log [--limit N]` | Show recent events |
-| `aisup accounts` | Show account usage and health |
+| `aisup health` / `aisup watch` | Unified live snapshot (session, accounts, workers, cost, events); `watch` auto-refreshes |
+| `aisup pause` / `aisup resume` | Pause/resume the active session (SIGSTOP/SIGCONT its runner) to save headroom |
+| `aisup log [--limit N] [--type T] [--account A] [--session S] [--since ISO] [--details]` | Show/filter recent events; `--details` shows failover rationale |
+| `aisup explain <event_type>` | Explain what a journal event type means |
+| `aisup session timeline [id]` / `aisup session rename <id> <name>` | Ordered session lifecycle / label a session (also `start --name`) |
+| `aisup accounts [--pin\|--exclude\|--enable\|--disable <name>\|--clear]` | Show accounts, or apply a runtime override (no restart) |
+| `aisup cost [--by account\|skill\|provider\|task]` | Cost windows, or a dimensional breakdown |
+| `aisup daemon reload` | Hot-reload config (thresholds/verbosity/accounts) without dropping the session |
+| `aisup worker retry\|undo\|cleanup [--force]` · `aisup worker logs <id> [--follow]` | Retry a failed worker / revert a merge / clean orphan worktrees / stream live output |
+
+**Control vs observe:** interactive control (approve permissions, drive workers, pause/failover) lives in **Slack**; the read-only `/dashboard` is **observe-only**. See "Slack control & dashboard" below.
 
 ## Config Reference (`~/.aisup/config.yaml`)
 
@@ -85,6 +94,15 @@ daemon:
 ```
 
 See `aisup init --dry-run` for the full config template.
+
+## Slack control & dashboard
+
+aisup separates **control** from **observe**:
+
+- **Control (Slack, interactive):** with `slack.enabled: true` and the Slack app's **Interactivity** toggle ON, Claude's permission requests post as Block Kit cards with Approve / Approve-for-session / Deny buttons — no `!permit` typing, and they never time out. Worker approvals, `!pause`/`!resume`, `!account …`, `!worker …`, and a live activity feed are also driven from Slack. Optional `notifications.ntfy` mirrors key push events to an ntfy topic (notification-only).
+- **Observe (dashboard, read-only):** `http://127.0.0.1:<daemon.port>/dashboard` is a token-authed, auto-refreshing HTML page showing the active session, per-account headroom, worker queue, cost-today, and recent events. Paste the daemon token once (it is exchanged in-page for a short-lived read-only cookie — **never placed in a URL**); the dashboard cannot reach any control route. Remote access is the operator's tunnel choice.
+
+Enable Slack interactivity and review the never-expire permission behavior in `docs/runbook.md`.
 
 ## Security
 

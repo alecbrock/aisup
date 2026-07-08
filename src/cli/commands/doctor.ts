@@ -7,6 +7,24 @@ import { readTelemetryForAccount } from '../../statusline/store.js';
 
 interface Check { label: string; ok: boolean; detail?: string }
 
+type DoctorConfig = Awaited<ReturnType<typeof loadConfig>>;
+
+/** C5: failover needs at least two accounts to have anywhere to go. */
+export function checkAccountCount(config: Pick<DoctorConfig, 'accounts'>): Check {
+  const n = config.accounts.length;
+  if (n < 2) return { label: '≥2 accounts configured', ok: false, detail: `only ${n} configured — failover needs ≥2` };
+  return { label: '≥2 accounts configured', ok: true, detail: `${n} accounts` };
+}
+
+/** C5: interactivity is a one-time Slack-app toggle; flag it when the config opts out, remind otherwise. */
+export function checkSlackInteractivity(config: Pick<DoctorConfig, 'slack'>): Check | null {
+  if (!config.slack.enabled) return null;
+  if (config.slack.interactivity_enabled === false) {
+    return { label: 'Slack interactivity', ok: false, detail: 'interactivity_enabled is false in config — buttons/cards will not work' };
+  }
+  return { label: 'Slack interactivity', ok: true, detail: 'enabled in config — ensure the Slack app\'s Interactivity toggle is ON' };
+}
+
 function check(label: string, fn: () => string | true): Check {
   try {
     const r = fn();
@@ -46,6 +64,9 @@ export async function runDoctor(): Promise<void> {
     return;
   }
   checks.push({ label: 'Config valid', ok: true });
+
+  // ≥2 accounts (C5): failover has nowhere to go with a single account.
+  checks.push(checkAccountCount(config));
 
   // Runner binary
   checks.push(check('Runner binary exists', () => validateRunner(config.runner)));
@@ -120,6 +141,8 @@ export async function runDoctor(): Promise<void> {
       if (!token) throw new Error(`env var ${config.slack.app_token_env} not set`);
       return 'set';
     }));
+    const interactivity = checkSlackInteractivity(config);
+    if (interactivity) checks.push(interactivity);
   }
 
   printResults(checks);

@@ -17,9 +17,10 @@ import type { AccountInfo } from '../accounts/types.js';
 import { buildLaunchCommand, buildResumeCommand } from '../runner/builder.js';
 import type { RunnerConfig } from '../config/schema.js';
 import { readEvents } from '../journal/reader.js';
-import { aggregateCosts } from '../cost/aggregator.js';
+import { aggregateCosts, breakdownCosts } from '../cost/aggregator.js';
+import { renderDashboardPage } from '../dashboard/page.js';
 import type { GateRunResult } from '../gates/types.js';
-import { readTelemetryForAccount } from '../statusline/store.js';
+import { buildAccountsView } from '../accounts/view.js';
 import type { UsageLedger } from '../accounts/usage-ledger.js';
 import type { WorkerState } from '../workers/types.js';
 import type { DispatchInput } from '../workers/orchestrator.js';
@@ -34,6 +35,13 @@ export interface WorkerActionResult {
 export interface PermissionHookRequest {
   toolName: string;
   toolInput: unknown;
+  claudeSessionId: string | null;
+}
+
+export interface ActivityHookRequest {
+  toolName: string;
+  toolInput: unknown;
+  toolResponse: unknown;
   claudeSessionId: string | null;
 }
 
@@ -68,6 +76,8 @@ export interface DaemonServerOptions {
   /** Claude Code PermissionRequest hook: 'allow'/'deny' to decide, or null to defer to the dialog
    *  (the ask-path posts to Slack and is resolved later by a keystroke — non-blocking). */
   onPermissionHook?: (req: PermissionHookRequest) => Promise<'allow' | 'deny' | null>;
+  /** Claude Code PostToolUse hook: structured tool activity for the live Slack feed (fire-and-forget). */
+  onActivityHook?: (req: ActivityHookRequest) => void;
   /** Run the configured validation gates (manual trigger from API/Slack/CLI). */
   runGates?: () => Promise<GateRunResult>;
   /** Latest gate run for GET /api/gates. */
@@ -79,8 +89,15 @@ export interface DaemonServerOptions {
   approveWorker?: (id: string, by: string) => Promise<WorkerActionResult>;
   denyWorker?: (id: string, by: string) => Promise<WorkerActionResult>;
   cancelWorker?: (id: string) => Promise<WorkerActionResult>;
+  /** C6: re-dispatch a terminal-failed worker; resolves with the new worker id on success. */
+  retryWorker?: (id: string) => Promise<{ ok: boolean; reason?: string; id?: string }>;
+  /** C10: revert a merged worker's patch; list/remove orphaned worktrees. */
+  undoWorker?: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  cleanupWorktrees?: (force: boolean) => Promise<{ orphans: string[]; removed: string[] }>;
   /** Per-provider usage readout for GET /api/workers/providers. */
   getWorkerProviders?: () => ProviderUsageReport;
+  /** D3: per-loop liveness for /api/health (loop → last tick + staleness). */
+  getLoopHealth?: () => Array<{ loop: string; last_tick: string | null; stale: boolean }>;
 }
 
 declare module 'fastify' {
@@ -122,13 +139,39 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
 
   const app = Fastify({ logger: false });
 
+  // D1 dashboard cookies: opaque value → expiry(ms). A read-only-scoped credential minted by exchanging
+  // the bearer token; it authorizes ONLY the read-only /api/overview, never a control route.
+  const DASHBOARD_TTL_MS = 30 * 60 * 1000;
+  const dashboardCookies = new Map<string, number>();
+  const COOKIE_NAME = 'aisup_dash';
+  const mintDashboardCookie = (): string => {
+    const value = randomUUID();
+    dashboardCookies.set(value, Date.now() + DASHBOARD_TTL_MS);
+    return value;
+  };
+  const validDashboardCookie = (req: FastifyRequest): boolean => {
+    const header = req.headers.cookie ?? '';
+    const match = header.split(';').map((c) => c.trim()).find((c) => c.startsWith(`${COOKIE_NAME}=`));
+    if (!match) return false;
+    const value = match.slice(COOKIE_NAME.length + 1);
+    const exp = dashboardCookies.get(value);
+    if (!exp) return false;
+    if (Date.now() > exp) { dashboardCookies.delete(value); return false; }
+    return true;
+  };
+  // Routes reachable with a dashboard cookie (read-only). Everything else needs the bearer header.
+  const COOKIE_ALLOWED = new Set(['/api/overview']);
+  // Routes that self-handle auth (no preHandler bearer check).
+  const OPEN_ROUTES = new Set(['/api/health', '/dashboard', '/api/dashboard/session']);
+
   // Expose test helpers on the instance
   app.decorate('setReady', () => { ready = true; });
   app.decorate('setSessionState', (s: SessionInfo | null) => { sessionState = s; });
 
-  // Auth check — skipped for /api/health
+  // Auth check — bearer header for control routes; bearer OR read-only cookie for /api/overview.
   app.addHook('preHandler', async (req: FastifyRequest, reply: FastifyReply) => {
-    if (req.url === '/api/health') return;
+    const path = req.url.split('?')[0];
+    if (OPEN_ROUTES.has(path)) return;
 
     if (!ready) {
       return reply.status(503).send({ error: 'daemon_starting', message: 'Daemon is starting. Retry shortly.' });
@@ -136,13 +179,29 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
 
     const auth = req.headers.authorization ?? '';
     const tok = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (!bearerToken || tok !== bearerToken) {
-      return reply.status(401).send({ error: 'unauthorized' });
-    }
+    if (bearerToken && tok === bearerToken) return;
+    // Read-only cookie is accepted ONLY for cookie-allowed routes (never control routes).
+    if (COOKIE_ALLOWED.has(path) && validDashboardCookie(req)) return;
+    return reply.status(401).send({ error: 'unauthorized' });
   });
 
   app.get('/api/health', async (_req, reply) => {
-    return reply.send({ pid: process.pid, port: opts.port, startedAt: new Date().toISOString(), ready });
+    const loops = opts.getLoopHealth?.() ?? [];
+    return reply.send({ pid: process.pid, port: opts.port, startedAt: new Date().toISOString(), ready, loops });
+  });
+
+  // D1: unauthenticated read-only dashboard shell (the token is pasted in-page, never in the URL).
+  app.get('/dashboard', async (_req, reply) => {
+    return reply.type('text/html; charset=utf-8').send(renderDashboardPage());
+  });
+
+  // D1: exchange the bearer token (in the BODY, not a URL) for a short-lived HttpOnly read-only cookie.
+  app.post('/api/dashboard/session', async (req, reply) => {
+    const provided = ((req.body ?? {}) as { token?: string }).token ?? '';
+    if (!bearerToken || provided !== bearerToken) return reply.status(401).send({ error: 'unauthorized' });
+    const value = mintDashboardCookie();
+    reply.header('set-cookie', `${COOKIE_NAME}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${DASHBOARD_TTL_MS / 1000}`);
+    return reply.send({ ok: true });
   });
 
   app.get('/api/status', async (_req, reply) => {
@@ -158,6 +217,57 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     return reply.send({ session, recovery_guidance });
   });
 
+  // Unified one-shot snapshot (C1): session + per-account headroom + worker queue + cost-today +
+  // recent events, in ONE response. Composes the SAME readers as /api/status, /api/accounts,
+  // /api/cost, /api/workers, /api/events (no new aggregation). Backs `aisup health`/`watch`, Slack
+  // `!health`, and the dashboard.
+  app.get('/api/overview', async (_req, reply) => {
+    let session: SessionInfo | Partial<SessionState> | null = sessionState;
+    const id = sessionState?.aisup_session_id;
+    if (id && typeof opts.sessionManager?.readState === 'function') {
+      const fresh = opts.sessionManager.readState(id);
+      if (fresh) session = fresh;
+    }
+
+    let accounts: ReturnType<typeof buildAccountsView> = [];
+    if (opts.accountRegistry) {
+      await opts.refreshAccounts?.();
+      accounts = buildAccountsView({
+        accountRegistry: opts.accountRegistry,
+        usageLedger: opts.usageLedger,
+        statuslineDir: opts.statuslineDir,
+        freshnessWindowS: opts.statuslineFreshnessWindowS,
+        nowMs: Date.now(),
+      });
+    }
+
+    const workerList = opts.listWorkers?.() ?? null;
+    const workers = workerList
+      ? {
+          total: workerList.length,
+          queued: workerList.filter((w) => w.status === 'QUEUED').length,
+          running: workerList.filter((w) => w.status === 'RUNNING').length,
+          awaiting_approval: workerList.filter((w) => w.status === 'AWAITING_APPROVAL').length,
+        }
+      : null;
+
+    const cost = opts.journalPath
+      ? (await aggregateCosts({ journalPath: opts.journalPath })).today
+      : { total_cost_usd: 0, by_account: {}, by_session: {} };
+
+    const recent_events = opts.journalPath ? await readEvents(opts.journalPath, { limit: 10 }) : [];
+
+    return reply.send({
+      session,
+      recovery_guidance: session?.status ? recoveryGuidance(session.status) : null,
+      accounts,
+      workers,
+      cost_today: cost,
+      recent_events,
+      daemon: { ok: true, loops: opts.getLoopHealth?.() ?? [] },
+    });
+  });
+
   app.post('/api/sessions', async (req, reply) => {
     const blockingSession = opts.sessionManager?.getBlockingSession?.() ?? (sessionState as SessionInfo | null);
     const check = canStartNewSession(blockingSession);
@@ -166,7 +276,7 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
       return reply.status(409).send({ error: check.reason, exhausted: isExhausted });
     }
 
-    const body = req.body as { cwd?: string; plan?: string } | undefined;
+    const body = req.body as { cwd?: string; plan?: string; name?: string } | undefined;
     const cwd = resolve(body?.cwd ?? process.cwd());
 
     if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
@@ -210,6 +320,7 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
         env: launchCommand.env,
         cwd,
         planPath,
+        name: body?.name,
       });
       sessionState = state;
       await opts.journal?.append({
@@ -223,6 +334,36 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     } catch (err) {
       return reply.status(500).send({ error: `session creation failed: ${String(err)}` });
     }
+  });
+
+  // C9: pause/resume the active session (SIGSTOP/SIGCONT its runner). PAUSED suspends monitoring.
+  const sessionSignalRoute = (verb: 'pause' | 'resume') => async (_req: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
+    if (!opts.sessionManager) return reply.code(503).send({ error: 'no session manager' });
+    const id = sessionState?.aisup_session_id;
+    if (!id) return reply.status(409).send({ error: 'no active session' });
+    const res = verb === 'pause'
+      ? await opts.sessionManager.pauseSession(id)
+      : await opts.sessionManager.resumeSession(id);
+    if (!res.ok) return reply.status(409).send({ ok: false, error: res.reason });
+    const fresh = opts.sessionManager.readState(id);
+    if (fresh) sessionState = fresh;
+    return reply.send({ ok: true, status: fresh?.status });
+  };
+  app.post('/api/sessions/pause', sessionSignalRoute('pause'));
+  app.post('/api/sessions/resume', sessionSignalRoute('resume'));
+
+  // C11: label a session for readability.
+  app.post('/api/sessions/rename', async (req, reply) => {
+    if (!opts.sessionManager) return reply.code(503).send({ error: 'no session manager' });
+    const { id, name } = (req.body ?? {}) as { id?: string; name?: string };
+    if (!id || !name) return reply.status(400).send({ error: 'id and name required' });
+    const res = opts.sessionManager.renameSession(id, name);
+    if (!res.ok) return reply.status(404).send({ ok: false, error: res.reason });
+    if (sessionState?.aisup_session_id === id) {
+      const fresh = opts.sessionManager.readState(id);
+      if (fresh) sessionState = fresh;
+    }
+    return reply.send({ ok: true });
   });
 
   app.delete('/api/sessions', async (req, reply) => {
@@ -250,17 +391,25 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
   });
 
   app.get('/api/events', async (req, reply) => {
-    const query = req.query as { limit?: string; type?: string; since?: string };
+    const query = req.query as { limit?: string; type?: string; since?: string; account?: string; session?: string };
     const limit = parseInt(query.limit ?? '20', 10);
     if (!opts.journalPath) return reply.send({ events: [], limit });
-    const events = await readEvents(opts.journalPath, { limit, type: query.type, since: query.since });
+    const events = await readEvents(opts.journalPath, {
+      limit, type: query.type, since: query.since, account: query.account, session: query.session,
+    });
     return reply.send({ events, limit });
   });
 
-  app.get('/api/cost', async (_req, reply) => {
+  app.get('/api/cost', async (req, reply) => {
+    const by = (req.query as { by?: string }).by;
     if (!opts.journalPath) {
+      if (by) return reply.send({ by, breakdown: {} });
       const empty = { total_cost_usd: 0, by_account: {}, by_session: {} };
       return reply.send({ today: empty, last_7d: empty, last_30d: empty });
+    }
+    if (by === 'account' || by === 'skill' || by === 'provider' || by === 'task') {
+      const events = await readEvents(opts.journalPath, {});
+      return reply.send({ by, breakdown: breakdownCosts(events, by) });
     }
     const windows = await aggregateCosts({ journalPath: opts.journalPath });
     return reply.send(windows);
@@ -329,6 +478,38 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     });
   });
 
+  // PostToolUse → the live activity feed. Fire-and-forget: validate shape/size, hand to the daemon,
+  // and return immediately (a slow Slack post must never stall the session).
+  app.post('/api/hooks/activity', async (req, reply) => {
+    const body = (req.body ?? {}) as { tool_name?: string; tool_input?: unknown; tool_response?: unknown; session_id?: string };
+    if (body.tool_name !== undefined && typeof body.tool_name !== 'string') {
+      return reply.status(400).send({ error: 'tool_name must be a string' });
+    }
+    if (body.session_id !== undefined && typeof body.session_id !== 'string') {
+      return reply.status(400).send({ error: 'session_id must be a string' });
+    }
+    if (body.tool_input !== undefined && body.tool_input !== null) {
+      let inputSize: number;
+      try {
+        inputSize = JSON.stringify(body.tool_input).length;
+      } catch {
+        return reply.status(400).send({ error: 'tool_input is not serializable' });
+      }
+      if (inputSize > 100_000) {
+        return reply.status(413).send({ error: 'tool_input exceeds 100000 bytes' });
+      }
+    }
+    if (body.tool_name) {
+      opts.onActivityHook?.({
+        toolName: body.tool_name,
+        toolInput: body.tool_input ?? null,
+        toolResponse: body.tool_response ?? null,
+        claudeSessionId: body.session_id ?? null,
+      });
+    }
+    return reply.send({ ok: true });
+  });
+
   // ---- Multi-LLM workers (Phase 3) -----------------------------------------
   // POST returns immediately with 202/QUEUED — the pipeline runs in the background (MD-002).
   app.post('/api/workers', async (req, reply) => {
@@ -390,32 +571,64 @@ export async function createDaemonServer(opts: DaemonServerOptions): Promise<Fas
     workerAction(opts.cancelWorker ? (id) => opts.cancelWorker!(id) : undefined, req, reply)
   );
 
+  app.post('/api/workers/:id/retry', async (req, reply) => {
+    if (!opts.retryWorker) return reply.code(503).send({ error: 'workers not enabled' });
+    const { id } = req.params as { id: string };
+    const result = await opts.retryWorker(id);
+    if (result.ok) return reply.send({ ok: true, id: result.id });
+    const code = result.reason === 'not_found' ? 404 : 409;
+    return reply.status(code).send({ ok: false, error: result.reason ?? 'failed' });
+  });
+
+  app.post('/api/workers/:id/undo', async (req, reply) => {
+    if (!opts.undoWorker) return reply.code(503).send({ error: 'workers not enabled' });
+    const { id } = req.params as { id: string };
+    const result = await opts.undoWorker(id);
+    if (result.ok) return reply.send({ ok: true });
+    const code = result.reason === 'not_found' ? 404 : 409;
+    return reply.status(code).send({ ok: false, error: result.reason ?? 'failed' });
+  });
+
+  app.post('/api/workers/cleanup', async (req, reply) => {
+    if (!opts.cleanupWorktrees) return reply.code(503).send({ error: 'workers not enabled' });
+    const force = ((req.body ?? {}) as { force?: boolean }).force === true;
+    return reply.send(await opts.cleanupWorktrees(force));
+  });
+
   app.get('/api/accounts', async (_req, reply) => {
     if (!opts.accountRegistry) {
       return reply.send({ accounts: [] });
     }
     // Refresh first so scores/state + the ledger reflect the latest live telemetry and decay.
     await opts.refreshAccounts?.();
-    const slDir = opts.statuslineDir;
-    const freshness = opts.statuslineFreshnessWindowS ?? 300;
-    const nowMs = Date.now();
-    const accounts = opts.accountRegistry.getAll().map((a) => {
-      // model still comes from telemetry; usage comes from the ledger's decayed estimate.
-      const telemetry = slDir ? readTelemetryForAccount(a.configDir, slDir, freshness) : null;
-      const est = opts.usageLedger?.estimate(a.name, nowMs);
-      const five = est ? est.five_hour.used_pct : (telemetry?.rate_limits?.five_hour?.used_percentage ?? null);
-      const seven = est ? est.seven_day.used_pct : (telemetry?.rate_limits?.seven_day?.used_percentage ?? null);
-      return {
-        name: a.name, state: a.state, priority: a.priority, enabled: a.enabled, score: a.score,
-        cooldown_until: a.cooldownUntil ? a.cooldownUntil.toISOString() : null,
-        five_hour_pct: typeof five === 'number' ? five : null,
-        seven_day_pct: typeof seven === 'number' ? seven : null,
-        five_hour_basis: est?.five_hour.basis ?? null,
-        seven_day_basis: est?.seven_day.basis ?? null,
-        model: telemetry?.model?.id ?? null,
-      };
+    const accounts = buildAccountsView({
+      accountRegistry: opts.accountRegistry,
+      usageLedger: opts.usageLedger,
+      statuslineDir: opts.statuslineDir,
+      freshnessWindowS: opts.statuslineFreshnessWindowS,
+      nowMs: Date.now(),
     });
     return reply.send({ accounts });
+  });
+
+  // C7: runtime account overrides — pin/exclude/enable/disable/clear without a config edit + restart.
+  app.post('/api/accounts/:name/override', async (req, reply) => {
+    if (!opts.accountRegistry) return reply.code(503).send({ error: 'no account registry' });
+    const { name } = req.params as { name: string };
+    const body = (req.body ?? {}) as { pin?: boolean; exclude?: boolean; enable?: boolean; disable?: boolean; clear?: boolean };
+    if (body.clear) {
+      opts.accountRegistry.clearOverrides();
+      await opts.refreshAccounts?.();
+      return reply.send({ ok: true, cleared: true });
+    }
+    if (!opts.accountRegistry.get(name)) return reply.status(404).send({ error: `unknown account "${name}"` });
+    if (body.pin) opts.accountRegistry.setOverride(name, { pinned: true });
+    else if (body.exclude) opts.accountRegistry.setOverride(name, { excluded: true });
+    else if (body.enable) opts.accountRegistry.setOverride(name, { enabled: true });
+    else if (body.disable) opts.accountRegistry.setOverride(name, { enabled: false });
+    else return reply.status(400).send({ error: 'one of pin|exclude|enable|disable|clear required' });
+    await opts.refreshAccounts?.();
+    return reply.send({ ok: true, account: name });
   });
 
   app.post('/api/failover', async (req, reply) => {

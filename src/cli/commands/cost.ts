@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../../config/loader.js';
 import { readEvents } from '../../journal/reader.js';
-import { aggregateCosts, reduceCostSnapshots, type CostWindows, type CostBreakdown } from '../../cost/aggregator.js';
+import { aggregateCosts, reduceCostSnapshots, breakdownCosts, type CostWindows, type CostBreakdown, type CostDimension } from '../../cost/aggregator.js';
 
 const TOKEN_PATH = join(aisupHome(), 'api-token');
 
@@ -67,7 +67,47 @@ async function fetchOnline(): Promise<CostWindows | null> {
   }
 }
 
-export async function sessionCost(opts: { json?: boolean; since?: string; account?: string }): Promise<void> {
+const DIMENSIONS = ['account', 'skill', 'provider', 'task'] as const;
+
+/** C8: fetch a cost breakdown from the daemon, or null when offline. */
+async function fetchBreakdownOnline(by: CostDimension): Promise<Record<string, number> | null> {
+  const pidPath = join(aisupHome(), 'daemon.pid');
+  if (!existsSync(pidPath)) return null;
+  try {
+    const { port } = JSON.parse(await readFile(pidPath, 'utf8')) as { port: number };
+    const token = (await readFile(TOKEN_PATH, 'utf8')).trim();
+    const res = await fetch(`http://127.0.0.1:${port}/api/cost?by=${by}`, { headers: { authorization: `Bearer ${token}` } });
+    if (!res.ok) return null;
+    return (await res.json() as { breakdown: Record<string, number> }).breakdown;
+  } catch {
+    return null;
+  }
+}
+
+async function costBreakdown(by: CostDimension, json: boolean): Promise<void> {
+  const online = await fetchBreakdownOnline(by);
+  let breakdown = online;
+  if (!breakdown) {
+    const config = await loadConfig();
+    breakdown = existsSync(config.journal.path)
+      ? breakdownCosts(await readEvents(config.journal.path, {}), by)
+      : {};
+  }
+  if (json) return void console.log(JSON.stringify({ by, breakdown }, null, 2));
+  console.log(`Cost by ${by}:`);
+  const entries = Object.entries(breakdown).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) console.log('  (no cost recorded)');
+  for (const [k, v] of entries) console.log(`  ${k}: $${v.toFixed(2)}`);
+}
+
+export async function sessionCost(opts: { json?: boolean; since?: string; account?: string; by?: string }): Promise<void> {
+  if (opts.by) {
+    if (!(DIMENSIONS as readonly string[]).includes(opts.by)) {
+      console.log(`Unknown --by dimension "${opts.by}". Use: ${DIMENSIONS.join(' | ')}`);
+      return;
+    }
+    return costBreakdown(opts.by as CostDimension, opts.json ?? false);
+  }
   // Online windows view (parity with the daemon) only when no client-side filter is requested;
   // --since/--account are applied offline against the same configured journal file.
   if (!opts.since && !opts.account) {

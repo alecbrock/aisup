@@ -42,6 +42,9 @@ slack:
   allowed_user_ids: []
   relay_output_enabled: false
   cmd_require_confirmation: true
+  interactivity_enabled: true
+notifications:
+  verbosity: normal
 daemon:
   port: 7394
   log_max_size_mb: 10
@@ -93,4 +96,18 @@ export async function runInit(opts: { dryRun?: boolean; force?: boolean }): Prom
 
   console.log(`Config written to ${configPath}`);
   console.log(`API token written to ${tokenPath}`);
+  printPostInitChecklist(aisupDir, configPath);
+}
+
+/** C5: a next-steps checklist so a fresh install does not silently mis-configure. */
+function printPostInitChecklist(aisupDir: string, configPath: string): void {
+  const daemonLog = join(aisupDir, 'daemon.log');
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  1. Edit ${configPath} — set at least 2 accounts (config_dir per account) for failover.`);
+  console.log('  2. Point each account\'s settings.json statusLine.command at statusline.directory so telemetry flows.');
+  console.log('  3. (Optional) Enable Slack: set the bot/app token env vars and turn ON the Slack app\'s Interactivity toggle.');
+  console.log('  4. Run `aisup doctor` to validate prerequisites.');
+  console.log('  5. Run `aisup daemon start`, then `aisup health` to confirm it is up.');
+  console.log(`Daemon logs: ${daemonLog}`);
 }

@@ -6,4 +6,8 @@ export interface PermissionRequest {
   detail: string;
   /** The matched prompt line, ANSI-stripped and length-bounded, for observability. */
   raw: string;
+  /** Opaque id (uuid) the interactive Slack card and queue entry are keyed by. Set at hook time so
+   *  out-of-order button taps resolve the correct request (`resolveById`). Absent on the legacy
+   *  detector/scrape path, which resolves FIFO by session. */
+  request_id?: string;
 }

@@ -35,6 +35,16 @@ export async function readEvents(
     filtered = filtered.filter((e) => e.event_type === type);
   }
 
+  if (opts.account) {
+    const account = opts.account;
+    filtered = filtered.filter((e) => e.account === account);
+  }
+
+  if (opts.session) {
+    const session = opts.session;
+    filtered = filtered.filter((e) => e.aisup_session_id === session);
+  }
+
   if (opts.limit !== undefined && opts.limit > 0) {
     filtered = filtered.slice(-opts.limit);
   }

@@ -20,10 +20,19 @@ const defaultGateRunner: GateRunner = (command, args, opts) =>
         const e = err as (Error & { code?: number | string; killed?: boolean }) | null;
         const timedOut = e?.killed === true;
         let code: number | null;
+        let stderrText = String(stderr ?? '');
         if (!e) code = 0;
         else if (typeof e.code === 'number') code = e.code;
-        else code = null; // ENOENT, signal-kill, etc.
-        resolve({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), timedOut });
+        else {
+          code = null; // ENOENT, signal-kill, etc.
+          // F-6: a spawn failure (e.g. a non-existent gate binary → ENOENT) yields no exit code and
+          // empty stderr — surface the error so gate.failed records WHY, not a silent exit_code:null.
+          if (!timedOut && e.message) {
+            const detail = `gate spawn error: ${e.message}`;
+            stderrText = stderrText ? `${stderrText}\n${detail}` : detail;
+          }
+        }
+        resolve({ code, stdout: String(stdout ?? ''), stderr: stderrText, timedOut });
       }
     );
   });

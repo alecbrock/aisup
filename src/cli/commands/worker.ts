@@ -1,9 +1,14 @@
 import { join } from 'node:path';
 import { aisupHome } from '../../config/paths.js';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { WorkerStore } from '../../workers/store.js';
+import { redactTails } from '../../workers/redact.js';
 import type { WorkerState } from '../../workers/types.js';
 import type { ProviderUsageReport } from '../../providers/report.js';
+
+const WORKER_TERMINAL = new Set(['MERGED', 'FAILED', 'REJECTED', 'CANCELLED']);
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 const TOKEN_PATH = join(aisupHome(), 'api-token');
 const PID_PATH = join(aisupHome(), 'daemon.pid');
@@ -70,7 +75,7 @@ async function daemonRequest(path: string, method: 'GET' | 'POST', body?: unknow
 export function formatWorkerStatus(w: WorkerState): string {
   const lines = [
     `Worker ${w.task.id}`,
-    `  status:      ${w.status}`,
+    `  status:      ${w.status}${w.progress ? ` — ${w.progress}` : ''}`,
     `  type:        ${w.task.task_type}`,
     `  implementer: ${w.task.implementer}   reviewer: ${w.task.reviewer ?? '-'}`,
   ];
@@ -81,6 +86,14 @@ export function formatWorkerStatus(w: WorkerState): string {
   if (w.review) lines.push(`  review:      ${w.review.verdict}${w.review.degraded ? ' (degraded)' : ''}`);
   const a = w.approval;
   lines.push(`  approval:    ${a.granted ? `granted by ${a.by}` : a.decided ? 'denied' : 'pending'}`);
+  if (w.tried_candidates && w.tried_candidates.length > 0) {
+    lines.push('  tried:');
+    for (const c of w.tried_candidates) {
+      const label = c.provider === 'claude' ? `claude:${c.account ?? '?'}` : c.provider;
+      const role = c.role ? ` [${c.role}]` : '';
+      lines.push(`    - ${label}${role}: ${c.reason}`);
+    }
+  }
   return lines.join('\n');
 }
 
@@ -131,6 +144,17 @@ export function formatProviderUsage(report: ProviderUsageReport): string {
 
 const DAEMON_REQUIRED = 'Daemon not running — worker commands require the daemon. Start it with `aisup daemon start`.';
 
+/**
+ * Report a failed worker request distinguishing an UNREACHABLE daemon (`res === null`) from a
+ * reachable daemon that refused the endpoint (F-1): a 503 means workers are disabled, so surface the
+ * server's own reason ("workers not enabled") instead of the misleading "Daemon not running".
+ */
+async function reportWorkerRequestFailure(res: Response | null): Promise<void> {
+  if (!res) { console.log(DAEMON_REQUIRED); return; }
+  const json = (await res.json().catch(() => ({}))) as { error?: string };
+  console.log(json.error ?? `Request failed (${res.status}).`);
+}
+
 export async function workerDispatch(opts: WorkerDispatchOpts): Promise<void> {
   const body = await buildDispatchBody(opts);
   const res = await daemonRequest('/api/workers', 'POST', body);
@@ -152,7 +176,7 @@ async function fetchWorker(id: string): Promise<WorkerState | null> {
 
 export async function workerList(opts: { json?: boolean } = {}): Promise<void> {
   const res = await daemonRequest('/api/workers', 'GET');
-  if (!res || !res.ok) return void console.log(DAEMON_REQUIRED);
+  if (!res || !res.ok) return void (await reportWorkerRequestFailure(res));
   const body = (await res.json()) as { workers: WorkerState[] };
   if (opts.json) return void console.log(JSON.stringify(body, null, 2));
   console.log(formatWorkerList(body.workers));
@@ -160,7 +184,7 @@ export async function workerList(opts: { json?: boolean } = {}): Promise<void> {
 
 export async function workerProviders(opts: { json?: boolean } = {}): Promise<void> {
   const res = await daemonRequest('/api/workers/providers', 'GET');
-  if (!res || !res.ok) return void console.log(DAEMON_REQUIRED);
+  if (!res || !res.ok) return void (await reportWorkerRequestFailure(res));
   const report = (await res.json()) as ProviderUsageReport;
   if (opts.json) return void console.log(JSON.stringify(report, null, 2));
   console.log(formatProviderUsage(report));
@@ -179,10 +203,44 @@ export async function workerReview(id: string): Promise<void> {
   console.log(formatWorkerReview(worker));
 }
 
-export async function workerLogs(id: string): Promise<void> {
+export async function workerLogs(id: string, opts: { follow?: boolean; pollMs?: number } = {}): Promise<void> {
+  if (opts.follow) return workerLogsFollow(id, opts.pollMs ?? 400);
   const worker = await fetchWorker(id);
   if (!worker) return void console.log(DAEMON_REQUIRED);
   console.log(formatWorkerLogs(worker));
+}
+
+/**
+ * C12: tail the worker's live stdout (`<store>/<id>/live.log`) as it runs, redacting each read,
+ * and exit cleanly when the worker reaches a terminal state. Condition-based polling, no fixed sleep
+ * beyond the poll interval; reads the local store directly (no daemon round-trip per tick).
+ */
+export async function workerLogsFollow(id: string, pollMs = 400): Promise<void> {
+  const store = new WorkerStore();
+  let logPath: string;
+  try {
+    logPath = join(store.dir(id), 'live.log');
+  } catch {
+    console.log(`Invalid worker id "${id}".`);
+    return;
+  }
+  let offset = 0;
+  for (;;) {
+    if (existsSync(logPath)) {
+      const buf = readFileSync(logPath);
+      if (buf.length > offset) {
+        process.stdout.write(redactTails(buf.subarray(offset).toString('utf8')));
+        offset = buf.length;
+      }
+    }
+    const state = store.read(id);
+    if (!state) { console.log(`Worker ${id} not found.`); return; }
+    if (WORKER_TERMINAL.has(state.status)) {
+      process.stdout.write(`\n[worker ${state.status}]\n`);
+      return;
+    }
+    await sleep(pollMs);
+  }
 }
 
 async function workerAction(id: string, action: 'approve' | 'deny' | 'cancel'): Promise<void> {
@@ -199,3 +257,34 @@ async function workerAction(id: string, action: 'approve' | 'deny' | 'cancel'): 
 export const workerApprove = (id: string): Promise<void> => workerAction(id, 'approve');
 export const workerDeny = (id: string): Promise<void> => workerAction(id, 'deny');
 export const workerCancel = (id: string): Promise<void> => workerAction(id, 'cancel');
+
+/** C6: re-dispatch a failed worker; prints the new worker id on success. */
+export async function workerRetry(id: string): Promise<void> {
+  const res = await daemonRequest(`/api/workers/${id}/retry`, 'POST', {});
+  if (!res) return void console.log(DAEMON_REQUIRED);
+  const json = (await res.json().catch(() => ({}))) as { id?: string; error?: string };
+  if (res.ok) console.log(`Worker ${id}: retried → new worker ${json.id}`);
+  else console.log(`Worker ${id}: retry failed (${json.error ?? res.status})`);
+}
+
+/** C10: revert a merged worker's patch from the working tree. */
+export async function workerUndo(id: string): Promise<void> {
+  const res = await daemonRequest(`/api/workers/${id}/undo`, 'POST', {});
+  if (!res) return void console.log(DAEMON_REQUIRED);
+  const json = (await res.json().catch(() => ({}))) as { error?: string };
+  if (res.ok) console.log(`Worker ${id}: merge reverted.`);
+  else if (json.error === 'diverged') console.log(`Worker ${id}: cannot undo — the working tree has diverged from the merged patch. Revert your local edits or undo manually.`);
+  else console.log(`Worker ${id}: undo failed (${json.error ?? res.status})`);
+}
+
+/** C10: list orphaned aisup worktrees, and with --force remove them. */
+export async function workerCleanup(opts: { force?: boolean }): Promise<void> {
+  const res = await daemonRequest('/api/workers/cleanup', 'POST', { force: opts.force ?? false });
+  if (!res) return void console.log(DAEMON_REQUIRED);
+  const json = (await res.json().catch(() => ({}))) as { orphans?: string[]; removed?: string[]; error?: string };
+  if (!res.ok) return void console.log(`Cleanup failed (${json.error ?? res.status})`);
+  const orphans = json.orphans ?? [];
+  if (orphans.length === 0) return void console.log('No orphaned worktrees.');
+  if (opts.force) console.log(`Removed ${json.removed?.length ?? 0} orphaned worktree(s):\n${(json.removed ?? []).map((p) => `  ${p}`).join('\n')}`);
+  else console.log(`Orphaned worktrees (run with --force to remove):\n${orphans.map((p) => `  ${p}`).join('\n')}`);
+}

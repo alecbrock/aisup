@@ -3,23 +3,26 @@ import { writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildWorkerCommand, composeEnvAllowlist, resolveRouting } from './adapter.js';
 import type { WorkerLaunchPlan } from './adapter.js';
-import { buildClaudeWorkerCommand } from './claude-adapter.js';
+import { buildClaudeWorkerCommand, parseClaudeResult } from './claude-adapter.js';
 import { parseCodexJsonStream, chargeableTokens } from './codex-json.js';
 import { buildReviewPrompt } from './review.js';
 import type { ReviewerPlanOverride } from './review.js';
 import { runCandidateLoop } from './failover.js';
-import type { CandidateLoopHooks } from './failover.js';
+import type { CandidateLoopHooks, CandidateFailureKind } from './failover.js';
 import { runWorker, tailOutput } from './runner.js';
+import { redactTails } from './redact.js';
 import type { WorkerExec, WorkerExecResult } from './runner.js';
 import type { validateWorkerOutput } from './validation.js';
 import type { reviewWorkerOutput } from './review.js';
 import type { mergeWorkerOutput } from './merge.js';
 import type { MainTreeSnapshot } from './worktree.js';
+import { listWorktrees, orphanWorktrees } from './worktree.js';
+import { undoWorkerMerge } from './merge.js';
 import { WorkerStore } from './store.js';
 import type { WorkersConfig, WorkerAdapterConfig } from '../config/schema.js';
 import type { JournalWriter } from '../journal/types.js';
 import type { ConcreteCandidate } from '../providers/types.js';
-import type { WorkerOutput, WorkerState, WorkerTask, ReviewVerdict } from './types.js';
+import type { WorkerOutput, WorkerState, WorkerTask, ReviewVerdict, TriedCandidate } from './types.js';
 
 export type WorkerRole = 'implementer' | 'reviewer';
 
@@ -31,15 +34,6 @@ function candidateLabel(c: ConcreteCandidate): string {
   return c.provider === 'claude' ? `claude:${c.account ?? '?'}` : c.provider;
 }
 
-const SECRET_LINE =
-  /(token|secret|api[_-]?key|password|authorization|bot_token|app_token|signing_secret)\s*[:=]/i;
-
-function redactTails(text: string): string {
-  return text
-    .split('\n')
-    .map((l) => (SECRET_LINE.test(l) ? '[redacted]' : l))
-    .join('\n');
-}
 
 /** The worktree module surface the orchestrator depends on (injectable for unit tests). */
 export interface WorktreeOps {
@@ -83,6 +77,8 @@ export interface OrchestratorDeps {
   resolvePinnedClaude?: (nowMs: number) => ConcreteCandidate | null;
   /** Notify on a CROSS-provider failover (claude↔codex) only — account↔account within Claude is routine. */
   notifyCrossProviderFailover?: (taskId: string, from: string, to: string) => void;
+  /** Notify when a worker reaches AWAITING_APPROVAL so the Slack layer can post an interactive card (A7). */
+  notifyAwaitingApproval?: (id: string) => void;
 }
 
 export interface DispatchInput {
@@ -93,9 +89,13 @@ export interface DispatchInput {
   reviewer?: string;
   base_ref?: string;
   workspace?: string;
+  /** Set by retry(): links the new worker back to the one it re-dispatches (C6). */
+  retry_of?: string;
 }
 
 const TERMINAL: ReadonlySet<string> = new Set(['MERGED', 'FAILED', 'REJECTED', 'CANCELLED']);
+/** C6: only a dead-end worker can be retried (a merged one succeeded; the rest are still in-flight). */
+const RETRYABLE: ReadonlySet<string> = new Set(['FAILED', 'REJECTED', 'CANCELLED']);
 
 export class WorkerOrchestrator {
   private readonly d: OrchestratorDeps;
@@ -176,6 +176,8 @@ export class WorkerOrchestrator {
       updated_at: now,
     };
     this.d.store.create(task);
+    // Set retry_of synchronously before any await/pump so it is persisted race-free from creation.
+    if (input.retry_of) this.d.store.patch(id, { retry_of: input.retry_of });
     await this.emit('worker.queued', id, { task_type: task.task_type, implementer, reviewer, base_ref: baseRef, base_sha: baseSha });
 
     this.pump();
@@ -216,7 +218,7 @@ export class WorkerOrchestrator {
     const forbidden = this.config.security.forbidden_path_globs;
 
     try {
-      this.d.store.patch(id, { status: 'RUNNING' });
+      this.d.store.patch(id, { status: 'RUNNING', progress: 'running implementer' });
       await this.emit('worker.dispatched', id, { task_type: task.task_type, implementer: task.implementer, reviewer: task.reviewer, base_ref: task.base_ref, base_sha: task.base_sha });
 
       // Baseline the main tree ONCE before the first candidate; the loop audits every candidate
@@ -258,6 +260,8 @@ export class WorkerOrchestrator {
           output: this.redactedOutput(run, changedFiles, boundaryOk),
           error_summary: 'security_denied',
         });
+        // F-4 (opt-in): also redact the task prompt/title so a secret-bearing prompt isn't retained.
+        if (this.config.security.redact_denied_prompts) this.d.store.redactDeniedTask(id);
         await this.emit('worker.security_denied', id, { violations: sanitized.violations });
         await this.cleanup(id, this.config.retention.keep_rejected);
         return;
@@ -281,12 +285,18 @@ export class WorkerOrchestrator {
       };
       writeFileSync(join(workerStateDir, 'output.json'), JSON.stringify(output, null, 2), { mode: 0o600 });
       this.d.store.patch(id, { status: 'IMPLEMENTED', output });
-      await this.emit('worker.completed', id, { worktree_path: worktree, changed_files: changedFiles, exit_code: run.code, timed_out: run.timedOut });
+      // C8: attribute this worker's cost to its provider + task type. Claude parses a USD cost;
+      // codex is token-metered (no USD), so cost_usd is null there — the split still shows provider/task.
+      const workerCost = winner.provider === 'claude' ? parseClaudeResult(run.stdout).total_cost_usd : null;
+      await this.emit('worker.completed', id, {
+        worktree_path: worktree, changed_files: changedFiles, exit_code: run.code, timed_out: run.timedOut,
+        provider: winner.provider, task_type: task.task_type, cost_usd: workerCost,
+      });
 
       if (this.isCancelled(id)) return void (await this.finishCancelled(id));
 
       // VALIDATING (H₂).
-      this.d.store.patch(id, { status: 'VALIDATING' });
+      this.d.store.patch(id, { status: 'VALIDATING', progress: 'running validation gates' });
       const validation = await this.d.validateOutput({
         gates: this.config.validation_gates,
         worktree,
@@ -306,7 +316,7 @@ export class WorkerOrchestrator {
       }
 
       // REVIEWING — resolve the reviewer candidate (failover: codex unavailable → a Claude account).
-      this.d.store.patch(id, { status: 'REVIEWING' });
+      this.d.store.patch(id, { status: 'REVIEWING', progress: 'reviewing patch' });
       const reviewDir = join(workerStateDir, 'review');
       const verdict = await this.runReview(id, task, output, worktree, reviewDir, winner);
       // Discard a cancellation that raced the review — never write the verdict or REJECTED.
@@ -321,6 +331,7 @@ export class WorkerOrchestrator {
       // AWAITING_APPROVAL — slot freed by the pump's finally.
       this.d.store.patch(id, { status: 'AWAITING_APPROVAL' });
       await this.emit('worker.awaiting_approval', id, { changed_files: changedFiles });
+      this.d.notifyAwaitingApproval?.(id);
     } catch (err) {
       if (this.isCancelled(id)) return void (await this.finishCancelled(id));
       await this.fail(id, 'worker.failed', { reason: 'pipeline_error' }, String(err));
@@ -382,6 +393,15 @@ export class WorkerOrchestrator {
   }
 
   /** Hooks the candidate loop calls for the implementer: fresh worktree per candidate, run, audit, cleanup, emit. */
+  /** C3: persist a failed candidate onto the worker's tried_candidates list (best-effort, never throws the loop). */
+  private recordTried(id: string, candidate: ConcreteCandidate, kind: CandidateFailureKind, role: 'implementer' | 'reviewer'): void {
+    const entry: TriedCandidate = { provider: candidate.provider, reason: kind, role };
+    if (candidate.account) entry.account = candidate.account;
+    try {
+      this.d.store.appendTriedCandidate(id, entry);
+    } catch { /* recording is diagnostic; never abort the failover loop on a store hiccup */ }
+  }
+
   private implementerHooks(id: string, task: WorkerTask, before: MainTreeSnapshot, workerStateDir: string): CandidateLoopHooks {
     const forbidden = this.config.security.forbidden_path_globs;
     return {
@@ -392,7 +412,7 @@ export class WorkerOrchestrator {
       },
       runCandidate: async (candidate, worktree) => {
         const plan = this.buildCandidatePlan(candidate, task, worktree, workerStateDir);
-        const run = await runWorker(plan, { cwd: worktree, timeoutSeconds: this.candidateTimeout(candidate), exec: this.d.runImplementer });
+        const run = await runWorker(plan, { cwd: worktree, timeoutSeconds: this.candidateTimeout(candidate), exec: this.d.runImplementer, liveTailPath: join(workerStateDir, 'live.log') });
         this.recordCodexIfApplicable(candidate, run);
         return run;
       },
@@ -403,7 +423,10 @@ export class WorkerOrchestrator {
       },
       markUnavailable: (candidate) => this.d.markCandidateUnavailable?.(candidate, Date.now()),
       isCancelled: () => this.isCancelled(id),
-      onCandidateFailed: (candidate, kind) => this.emit('worker.candidate_failed', id, { candidate: candidateLabel(candidate), reason: kind }),
+      onCandidateFailed: (candidate, kind) => {
+        this.recordTried(id, candidate, kind, 'implementer');
+        return this.emit('worker.candidate_failed', id, { candidate: candidateLabel(candidate), reason: kind });
+      },
       onFailover: (from, to) => {
         const crossProvider = from.provider !== to.provider;
         if (crossProvider) this.d.notifyCrossProviderFailover?.(id, candidateLabel(from), candidateLabel(to));
@@ -458,6 +481,7 @@ export class WorkerOrchestrator {
       last = verdict;
       if (verdict.run_failure && verdict.run_failure !== 'task_failed') {
         this.d.markCandidateUnavailable?.(cand, Date.now());
+        this.recordTried(id, cand, verdict.run_failure, 'reviewer');
         await this.emit('worker.candidate_failed', id, { candidate: candidateLabel(cand), reason: verdict.run_failure, role: 'reviewer' });
         const next = candidates[i + 1];
         if (next) {
@@ -564,6 +588,61 @@ export class WorkerOrchestrator {
     await this.emit('worker.denied', id, { by });
     await this.cleanup(id, this.config.retention.keep_rejected);
     return { ok: true };
+  }
+
+  /**
+   * C6: re-dispatch a NEW worker from a terminal-failed worker's original task, linked via retry_of.
+   * Rejects an in-flight worker (nothing to retry yet) and an unknown id.
+   */
+  async retry(id: string): Promise<{ ok: boolean; reason?: string; id?: string }> {
+    const w = this.d.store.read(id);
+    if (!w) return { ok: false, reason: 'not_found' };
+    if (!RETRYABLE.has(w.status)) return { ok: false, reason: `not_retryable: worker is ${w.status}` };
+    const newId = await this.dispatch({
+      task_type: w.task.task_type,
+      prompt: w.task.prompt,
+      title: w.task.title,
+      implementer: w.task.pinned_implementer ?? undefined,
+      reviewer: w.task.pinned_reviewer ?? undefined,
+      base_ref: w.task.base_ref,
+      workspace: w.task.workspace_root,
+      retry_of: id,
+    });
+    return { ok: true, id: newId };
+  }
+
+  /** C10: revert a merged worker's patch from the working tree (git-safe; refuses on divergence). */
+  async undoMerge(id: string): Promise<{ ok: boolean; reason?: string }> {
+    const state = this.d.store.read(id);
+    if (!state) return { ok: false, reason: 'not_found' };
+    const res = await undoWorkerMerge({ workspaceRoot: state.task.workspace_root, state, journal: this.d.journal });
+    return res.reverted ? { ok: true } : { ok: false, reason: res.reason ?? 'failed' };
+  }
+
+  /** C10: list (and with force, remove) orphaned aisup worktrees under worktree_dir. */
+  async cleanupWorktrees(force: boolean): Promise<{ orphans: string[]; removed: string[] }> {
+    const workspaceRoot = this.config.workspace_root ?? this.d.resolveActiveSessionCwd() ?? undefined;
+    if (!workspaceRoot) return { orphans: [], removed: [] };
+    const all = await listWorktrees(workspaceRoot);
+    const referenced = new Set(
+      this.d.store.list()
+        .filter((w) => !TERMINAL.has(w.status))
+        .map((w) => w.worktree_path)
+        .filter((p): p is string => !!p),
+    );
+    const orphans = orphanWorktrees(all, referenced, this.config.worktree_dir);
+    if (!force) return { orphans, removed: [] };
+    const removed: string[] = [];
+    for (const path of orphans) {
+      try {
+        await this.d.worktreeOps.removeWorktree({ workspaceRoot, worktreeDir: this.config.worktree_dir, path });
+        removed.push(path);
+      } catch { /* best effort — a locked/busy worktree is left for the next sweep */ }
+    }
+    if (removed.length) {
+      await this.d.journal.append({ ts: new Date().toISOString(), event_type: 'worker.worktree_orphans_cleaned', details: { removed } });
+    }
+    return { orphans, removed };
   }
 
   async cancel(id: string): Promise<{ ok: boolean; reason?: string }> {

@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { GATE_OUTPUT_TAIL_LIMIT, MAX_BUFFER } from '../gates/engine.js';
 import type { WorkerLaunchPlan } from './adapter.js';
@@ -15,13 +16,15 @@ export interface WorkerExecResult {
 export type WorkerExec = (
   command: string,
   args: string[],
-  opts: { cwd: string; timeoutMs: number; env: Record<string, string>; stdin: string | null }
+  opts: { cwd: string; timeoutMs: number; env: Record<string, string>; stdin: string | null; onStdout?: (chunk: string) => void }
 ) => Promise<WorkerExecResult>;
 
 export interface RunWorkerOpts {
   cwd: string;
   timeoutSeconds: number;
   exec?: WorkerExec;
+  /** C12: append incremental stdout here as it arrives so `worker logs --follow` can tail it live. */
+  liveTailPath?: string;
 }
 
 function tail(text: string, limit: number): string {
@@ -56,6 +59,7 @@ const defaultWorkerExec: WorkerExec = (command, args, opts) =>
         resolve({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), timedOut });
       }
     );
+    if (opts.onStdout && child.stdout) child.stdout.on('data', (d) => opts.onStdout!(String(d)));
     if (child.stdin) {
       child.stdin.on('error', () => {}); // swallow EPIPE if the child closes stdin early
       if (opts.stdin !== null) child.stdin.write(opts.stdin);
@@ -78,12 +82,20 @@ export async function runWorker(plan: WorkerLaunchPlan, opts: RunWorkerOpts): Pr
     await writeFile(plan.promptFile.path, plan.promptFile.contents, { mode: 0o600 });
   }
 
+  let onStdout: ((chunk: string) => void) | undefined;
+  if (opts.liveTailPath) {
+    const tailPath = opts.liveTailPath;
+    mkdirSync(dirname(tailPath), { recursive: true, mode: 0o700 });
+    onStdout = (chunk: string): void => { try { appendFileSync(tailPath, chunk, { mode: 0o600 }); } catch { /* best effort */ } };
+  }
+
   try {
     const res = await exec(plan.command, plan.args, {
       cwd: opts.cwd,
       timeoutMs: opts.timeoutSeconds * 1000,
       env: plan.env,
       stdin: plan.stdin,
+      onStdout,
     });
     return {
       code: res.code,

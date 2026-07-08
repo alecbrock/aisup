@@ -1,6 +1,7 @@
 export type SessionStatus =
   | 'CREATING'
   | 'ACTIVE'
+  | 'PAUSED'
   | 'SWITCH_PENDING_AT_IDLE'
   | 'SWITCHING'
   | 'STOPPING'
@@ -41,6 +42,8 @@ export interface SwitchAttempt {
 export interface SessionState {
   aisup_session_id: string;
   status: SessionStatus;
+  /** Optional operator-facing label (C11) set at `start --name` or `session rename`. */
+  name?: string;
   account: string;
   tmux_name: string;
   tmux_session_id: string | null;

@@ -134,6 +134,28 @@ describe('rehydrateSessions', () => {
     );
   });
 
+  // A3: restart reconciliation of persisted permission cards — invoked once with a liveness
+  // predicate (state on disk + tmux still live ⇒ live), so live cards re-bind and dead ones annotate.
+  it('invokes reconcilePermissionCards with a working liveness predicate', async () => {
+    const live = makeSessionState({ aisup_session_id: 'live-1', tmux_name: 'aisup-live' });
+    const stateDir = setupStateDir(tmpDir, [live]);
+    let predicate: ((id: string) => boolean) | null = null;
+    const reconcile = vi.fn().mockImplementation(async (isLive: (id: string) => boolean) => { predicate = isLive; });
+
+    await rehydrateSessions({
+      stateDir,
+      tmuxSocket: 'aisup-test',
+      liveSessions: new Set(['aisup-live']),
+      setSessionState: vi.fn(),
+      journal: { append: vi.fn().mockResolvedValue(undefined) },
+      reconcilePermissionCards: reconcile,
+    });
+
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(predicate!('live-1')).toBe(true);  // persisted state + live tmux pane
+    expect(predicate!('ghost')).toBe(false);  // no persisted state ⇒ dead
+  });
+
   // AF-312: a corrupt/wrong-shape state.json must emit session.state_corrupt, not silently drop the
   // session from supervision — and must not crash rehydration.
   it('emits session.state_corrupt for an unparseable state.json (AF-312)', async () => {

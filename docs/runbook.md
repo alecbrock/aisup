@@ -64,10 +64,13 @@ Notes:
 3. Create an App-Level Token with scope `connections:write` — copy as `AISUP_SLACK_APP_TOKEN`.
 4. Under **OAuth & Permissions → Bot Token Scopes**, add:
    - `chat:write`, `groups:write`, `groups:history`, `users:read`
+   - `files:write` — required for large-diff/command file uploads (`aisup doctor` flags if missing).
 5. Under **Event Subscriptions**, enable and subscribe to **`message.groups`**.
    - **This is mandatory.** Without it the bot connects but never receives messages in private channels.
-6. Install the app to your workspace. Copy the Bot Token (`xoxb-...`) as `AISUP_SLACK_BOT_TOKEN`.
-7. Set env vars and enable Slack in config:
+6. Under **Interactivity & Shortcuts**, turn **Interactivity ON**.
+   - **Required for the Approve/Deny permission cards, worker approve/deny buttons, and the activity-feed Expand modals.** In Socket Mode no Request URL is needed — just flip the toggle on. Without it, buttons render but taps are never delivered. `aisup doctor` reports the config-side `slack.interactivity_enabled` flag; the app-side toggle must be set here.
+7. Install the app to your workspace. Copy the Bot Token (`xoxb-...`) as `AISUP_SLACK_BOT_TOKEN`.
+8. Set env vars and enable Slack in config:
 
 ```bash
 export AISUP_SLACK_BOT_TOKEN=xoxb-...
@@ -81,7 +84,10 @@ slack:
   bot_token_env: AISUP_SLACK_BOT_TOKEN
   app_token_env: AISUP_SLACK_APP_TOKEN
   allowed_user_ids: [U1234567890]   # your Slack user ID
+  interactivity_enabled: true       # must match the app-side Interactivity toggle (step 6)
 ```
+
+**Read-only dashboard (observe):** once the daemon is running, open `http://127.0.0.1:<daemon.port>/dashboard`, paste the daemon token (`~/.aisup/api-token`) once — it is exchanged in-page for a short-lived read-only cookie and **never placed in a URL**. The dashboard is observe-only and cannot reach control routes; all control stays in Slack.
 
 ---
 
@@ -101,6 +107,39 @@ When Claude/Pilot runs with `bypassPermissions: true`, `!cmd <text>` relayed fro
 - `~/.aisup/api-token` created with mode `0600`
 - Session state files created with mode `0600`
 - Journal created with mode `0600`
+
+---
+
+## Permission Resolution (never times out)
+
+aisup resolves Claude permission prompts by **keystroke to the persistent terminal dialog**, not by blocking an HTTP hook on a human. The `PermissionRequest` hook is a non-blocking *detector*: it posts the structured request to Slack and returns `null`, so Claude's terminal dialog appears and waits. A Slack decision (`!permit`/`!deny`, or the Block Kit buttons added in Phase A) drives `resolveHookPermissionViaKeystroke` (`src/permissions/hook-resolver.ts`) → real tmux `send-keys`. **This hook path has no timer** — a request stays resolvable for as long as the dialog is open (minutes or hours later).
+
+### A0 measured behavior (host-gated)
+
+`tests/permissions/long-permission.hostgated.test.ts` (gated by `AISUP_TEST_LONG_PERMISSION=1`) drives the **real** resolver against a real tmux pane whose prompt blocks indefinitely on `read`, then sends the resolving keystroke after a parameterized wait:
+
+```bash
+AISUP_TEST_LONG_PERMISSION=1 npx vitest run tests/permissions/long-permission.hostgated.test.ts          # smoke (8s wait)
+AISUP_TEST_LONG_PERMISSION_WAIT_MS=360000 AISUP_TEST_LONG_PERMISSION=1 npx vitest run \                   # canonical ≥5 min
+  tests/permissions/long-permission.hostgated.test.ts
+```
+
+- **Result:** the dialog is still detectable (`PermissionDetector.scan`) at the wait boundary and is resolved by the keystroke through the real hook path — the resolution **mechanism never times out**, confirming the assumption all of Phase A rests on. The wait is parameterized so the operator can measure the real persistence window with the canonical ≥5-minute run.
+- **Pivot (if a real Claude dialog is ever observed self-closing):** A2/A3 fall back to re-issuing the permission decision on button tap (the hook is re-invoked) rather than relying on a persistent dialog. Record the observed self-close window here if that ever happens.
+
+### Per-option keystroke mapping (feeds A2's button mapping — do not guess)
+
+| Dialog option | Keystroke | Source |
+|---------------|-----------|--------|
+| Approve | `permissions.approval_key` (default `y`) | configured; sent on `!permit` / `Approve` |
+| Deny | `permissions.denial_key` (default `n`) | configured; sent on `!deny` / `Deny` |
+| Approve for session ("don't ask again") | **UNCONFIRMED** | must be observed against the running Claude before wiring |
+
+The "approve for session" keystroke is **not yet confirmed** against a live Claude permission dialog. Until it is observed and recorded here (set `permissions.approval_session_key`), Phase A ships **Approve / Deny only** — A2's third button is conditional on this value being known. Never guess the keystroke.
+
+### TTL is opt-in (never expire by default)
+
+The hook path never expires. The legacy fallback `PermissionBroker` honors `permissions.grant_ttl_seconds` only when set to a finite `N > 0`; `null`/absent means never expire (A3 reworks the sentinel so `0` can no longer fire an immediate timeout).
 
 ---
 

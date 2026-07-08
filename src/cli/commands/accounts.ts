@@ -52,6 +52,41 @@ export async function showAccounts(): Promise<void> {
   }
 }
 
+/** C7: apply a runtime account override (pin/exclude/enable/disable/clear) via the daemon. */
+export async function accountOverride(opts: {
+  pin?: string; exclude?: string; enable?: string; disable?: string; clear?: boolean;
+}): Promise<void> {
+  const pidPath = join(aisupHome(), 'daemon.pid');
+  const tokenPath = join(aisupHome(), 'api-token');
+  if (!existsSync(pidPath) || !existsSync(tokenPath)) {
+    console.log('Daemon not running — runtime account overrides require the daemon.');
+    return;
+  }
+  const name = opts.pin ?? opts.exclude ?? opts.enable ?? opts.disable;
+  const body: Record<string, unknown> = opts.clear
+    ? { clear: true }
+    : opts.pin ? { pin: true } : opts.exclude ? { exclude: true } : opts.enable ? { enable: true } : opts.disable ? { disable: true } : {};
+  if (!opts.clear && !name) {
+    console.log('Usage: aisup accounts --pin|--exclude|--enable|--disable <name> | --clear');
+    return;
+  }
+  try {
+    const { port } = JSON.parse(await readFile(pidPath, 'utf8')) as { port: number };
+    const token = (await readFile(tokenPath, 'utf8')).trim();
+    const target = opts.clear ? '_all' : name!;
+    const res = await fetch(`http://127.0.0.1:${port}/api/accounts/${encodeURIComponent(target)}/override`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json().catch(() => ({}))) as { error?: string };
+    if (res.ok) console.log(opts.clear ? 'Account overrides cleared.' : `Account ${name}: override applied.`);
+    else console.log(`Override failed: ${json.error ?? res.status}`);
+  } catch (err) {
+    console.log(`Override failed: ${String(err)}`);
+  }
+}
+
 async function showAccountsOffline(): Promise<void> {
   console.log('aisup daemon not running — reading config directly');
   try {

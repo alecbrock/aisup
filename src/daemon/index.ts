@@ -1,14 +1,20 @@
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { aisupHome } from '../config/paths.js';
 import { mkdir, readFile } from 'node:fs/promises';
 import { RotatingLog } from '../util/rotating-log.js';
-import { loadConfig } from '../config/loader.js';
+import { loadConfig, resetConfigCache } from '../config/loader.js';
+import { planReload } from './reload.js';
 import { createJournalWriter } from '../journal/writer.js';
 import { createDaemonServer } from './server.js';
 import { writePidFile, removePidFile } from '../cli/pid.js';
 import { LoopManager } from './loop-manager.js';
 import { SessionManager } from '../session/manager.js';
 import { AccountRegistry } from '../accounts/registry.js';
+import { buildAccountsView } from '../accounts/view.js';
+import { aggregateCosts } from '../cost/aggregator.js';
+import { ThresholdAlerter } from './threshold-alert.js';
+import { createNtfyEmitter } from '../notifications/ntfy.js';
 import { CircuitBreaker } from '../accounts/circuit-breaker.js';
 import { refreshAccountScores } from '../accounts/refresh.js';
 import { UsageLedger } from '../accounts/usage-ledger.js';
@@ -22,6 +28,7 @@ import { PermissionDetector } from '../permissions/detector.js';
 import { PermissionBroker } from '../permissions/broker.js';
 import { evaluatePermission } from '../permissions/policy.js';
 import { PendingPermissionQueue } from '../permissions/pending-queue.js';
+import { resolveHookPermissionViaKeystroke, type HookResolverDeps } from '../permissions/hook-resolver.js';
 import type { PermissionRequest } from '../permissions/types.js';
 import type { PermissionHookRequest } from './server.js';
 import { writeHookSettings } from '../hooks/claude-hooks.js';
@@ -91,10 +98,8 @@ function summarizeToolInput(toolInput: unknown): string {
 async function main(): Promise<void> {
   await mkdir(AISUP_DIR, { recursive: true, mode: 0o700 });
 
-  const rotatingLog = new RotatingLog({ path: LOG_PATH, maxSizeMb: 10, maxFiles: 3 });
-  process.stdout.write = (data: string | Uint8Array) => rotatingLog.write(data);
-  process.stderr.write = (data: string | Uint8Array) => rotatingLog.write(data);
-
+  // Load config BEFORE wiring the rotating log so daemon.log honors the configured size (D3) — not
+  // the old hard-coded 10MB. Config errors here are already caught foreground in daemonStart.
   const loadedConfig = await loadConfig();
   const config = {
     ...loadedConfig,
@@ -103,7 +108,14 @@ async function main(): Promise<void> {
       command: validateRunner(loadedConfig.runner),
     },
   };
-  const journal = createJournalWriter(config.journal.path);
+
+  const rotatingLog = new RotatingLog({ path: LOG_PATH, maxSizeMb: config.daemon.log_max_size_mb, maxFiles: 3 });
+  process.stdout.write = (data: string | Uint8Array) => rotatingLog.write(data);
+  process.stderr.write = (data: string | Uint8Array) => rotatingLog.write(data);
+
+  const journal = createJournalWriter(config.journal.path, config.journal.max_size_mb);
+  // D2: best-effort ntfy push mirror (notification-only; Slack stays the control plane).
+  const emitNtfy = createNtfyEmitter({ config: config.notifications.ntfy, journal });
   const accountRegistry = new AccountRegistry(config);
   const circuitBreaker = new CircuitBreaker({
     maxFailures: config.failover.circuit_breaker_max_failures,
@@ -144,6 +156,8 @@ async function main(): Promise<void> {
         token: apiToken,
         includeSkill: true,
         includePermission: config.permissions.enabled,
+        // Live activity feed posts to Slack — only install the PostToolUse hook when Slack is on.
+        includeActivity: config.slack.enabled,
         // Permissions never auto-deny — the hook waits for a human decision (24h ceiling).
         permissionTimeoutS: PERMISSION_HOOK_TIMEOUT_S,
       });
@@ -244,6 +258,12 @@ async function main(): Promise<void> {
         const active = sessionManager.getActiveSession();
         void slackService?.notifyWorkerFailover({ sessionId: active?.aisup_session_id ?? null, taskId, from, to });
       },
+      // A worker reaching awaiting_approval → post an interactive worker card to Slack (A7).
+      notifyAwaitingApproval: (id) => {
+        const active = sessionManager.getActiveSession();
+        void slackService?.notifyWorkerAwaitingApproval(active?.aisup_session_id ?? null, id);
+        void emitNtfy({ title: 'Worker awaiting approval', message: `Worker ${id} is ready for review.`, tags: ['eyes'] });
+      },
     });
 
     // Per-provider usage readout for `aisup worker providers` / GET /api/workers/providers.
@@ -283,25 +303,31 @@ async function main(): Promise<void> {
   // aisup session id (the dialog persists; the keystroke confirms whichever option the config names).
   // Per-session FIFO queue of pending hook permissions (AF-302): two concurrent permission.ask for
   // one session are both tracked and resolved independently (earliest-first), not overwritten.
-  const hookPermissions = new PendingPermissionQueue();
-  const sendPermissionKey = (aisupSessionId: string, approve: boolean): boolean => {
+  // Persisted (A3) so a pending permission survives a daemon restart and its original card re-binds.
+  const hookPermissions = new PendingPermissionQueue(join(AISUP_DIR, 'pending-permissions.json'));
+  // Shared freshness re-scan: is a permission prompt still showing in the session's pane? Used as the
+  // A2 guard on BOTH the hook keystroke path and the legacy broker fallback so a button tap never
+  // injects a keystroke into a closed/different prompt. When detection is disabled there is nothing
+  // to re-scan, so resolution proceeds (preserves the pre-A2 hook behavior).
+  const promptStillActive = (aisupSessionId: string): boolean => {
+    if (!config.permissions.enabled) return true;
     const s = sessionManager.readState(aisupSessionId);
-    if (!s || (s.status !== 'ACTIVE' && s.status !== 'SWITCH_PENDING_AT_IDLE')) return false;
-    sendText(tmuxSocket, s.tmux_name, approve ? config.permissions.approval_key : config.permissions.denial_key);
-    sendEnter(tmuxSocket, s.tmux_name);
-    return true;
+    if (!s) return false;
+    const recent = captureOutput(tmuxSocket, s.tmux_name, 40);
+    return new PermissionDetector(config.permissions.detection_patterns).scan(recent).length > 0;
   };
-  const resolveHookPermissionViaKeystroke = (aisupSessionId: string, approve: boolean): boolean => {
-    const pending = hookPermissions.dequeue(aisupSessionId); // earliest-pending (FIFO)
-    if (!pending) return false;
-    const sent = sendPermissionKey(aisupSessionId, approve);
-    void journal.append({
-      ts: new Date().toISOString(),
-      event_type: sent ? (approve ? 'permission.granted' : 'permission.denied') : 'permission.keystroke_unconfirmed',
-      aisup_session_id: aisupSessionId,
-      details: { tool: pending.tool, detail: pending.detail, source: 'hook' },
-    });
-    return sent;
+  // The hook keystroke resolver (extracted to src/permissions/hook-resolver.ts so the host-gated
+  // never-timeout test and the unit suite drive the exact production path A2/A3 build on).
+  const hookResolverDeps: HookResolverDeps = {
+    queue: hookPermissions,
+    readState: (id) => sessionManager.readState(id),
+    sendKeystroke: (tmuxName, key) => {
+      sendText(tmuxSocket, tmuxName, key);
+      sendEnter(tmuxSocket, tmuxName);
+    },
+    promptStillActive,
+    permissions: config.permissions,
+    journal,
   };
 
   let slackService: SlackService | null = null;
@@ -312,19 +338,83 @@ async function main(): Promise<void> {
       sessionManager,
       tmuxSocket,
       journal,
+      journalPath: config.journal.path,
       channelMapPath,
+      cardStorePath: join(AISUP_DIR, 'slack-cards.json'),
       permissionsConfig: config.permissions,
+      notificationsConfig: config.notifications,
       // Resolve a hook-routed permission via a keystroke to the persistent dialog; fall back to the
       // legacy scrape broker if this session has no hook-pending permission.
-      onPermissionGrant: (sessionId) =>
-        resolveHookPermissionViaKeystroke(sessionId, true) ? Promise.resolve(true) : (permissionBrokerRef?.resolveFromSlack(sessionId, 'grant') ?? Promise.resolve(false)),
-      onPermissionDeny: (sessionId) =>
-        resolveHookPermissionViaKeystroke(sessionId, false) ? Promise.resolve(true) : (permissionBrokerRef?.resolveFromSlack(sessionId, 'deny') ?? Promise.resolve(false)),
+      onPermissionGrant: (sessionId, requestId) =>
+        resolveHookPermissionViaKeystroke(hookResolverDeps, sessionId, true, requestId) ? Promise.resolve(true) : (permissionBrokerRef?.resolveFromSlack(sessionId, 'grant') ?? Promise.resolve(false)),
+      onPermissionDeny: (sessionId, requestId) =>
+        resolveHookPermissionViaKeystroke(hookResolverDeps, sessionId, false, requestId) ? Promise.resolve(true) : (permissionBrokerRef?.resolveFromSlack(sessionId, 'deny') ?? Promise.resolve(false)),
       onGateRun: runConfiguredGates,
       getLatestGateRun: () => latestGateRun,
       onWorkerApprove: workerOrchestrator ? (id) => workerOrchestrator!.approve(id, 'slack') : undefined,
       onWorkerDeny: workerOrchestrator ? (id) => workerOrchestrator!.deny(id, 'slack') : undefined,
+      onWorkerRetry: workerOrchestrator ? (id) => workerOrchestrator!.retry(id) : undefined,
       getWorkerStatus: workerOrchestrator ? () => workerOrchestrator!.list() : undefined,
+      getWorkerDiff: workerOrchestrator
+        ? (id) => {
+            const w = workerOrchestrator!.get(id);
+            return w?.output ? { title: w.task.title, patch: w.output.patch } : null;
+          }
+        : undefined,
+      // A6 observability readers — reuse the same aggregations the HTTP API / CLI use (numbers match).
+      getAccountsView: () => {
+        refreshAccounts();
+        return buildAccountsView({
+          accountRegistry,
+          usageLedger,
+          statuslineDir: config.statusline.directory,
+          freshnessWindowS: config.statusline.freshness_window_s,
+          nowMs: Date.now(),
+        });
+      },
+      getCostView: () => aggregateCosts({ journalPath: config.journal.path }),
+      onAccountOverride: async (action, name) => {
+        if (action === 'clear') { accountRegistry.clearOverrides(); refreshAccounts(); return { ok: true }; }
+        if (!name || !accountRegistry.get(name)) return { ok: false, error: `unknown account "${name ?? ''}"` };
+        const map = { pin: { pinned: true }, exclude: { excluded: true }, enable: { enabled: true }, disable: { enabled: false } } as const;
+        accountRegistry.setOverride(name, map[action]);
+        refreshAccounts();
+        return { ok: true };
+      },
+      onSessionPause: async () => {
+        const active = sessionManager.getActiveSession();
+        if (!active) return { ok: false, reason: 'no active session' };
+        const res = await sessionManager.pauseSession(active.aisup_session_id);
+        if (res.ok) { const s = sessionManager.readState(active.aisup_session_id); if (s) server.setSessionState(s); }
+        return res;
+      },
+      onSessionResume: async () => {
+        const paused = sessionManager.getPausedSession();
+        if (!paused) return { ok: false, reason: 'no paused session' };
+        const res = await sessionManager.resumeSession(paused.aisup_session_id);
+        if (res.ok) { const s = sessionManager.readState(paused.aisup_session_id); if (s) server.setSessionState(s); }
+        return res;
+      },
+      getWorkerProvidersView: getWorkerProviders ? () => getWorkerProviders!() : undefined,
+      getHealthView: () => {
+        const active = sessionManager.getActiveSession();
+        const accts = accountRegistry.getAll();
+        const workers = workerOrchestrator?.list() ?? null;
+        return {
+          session: active
+            ? { id: active.aisup_session_id, status: active.status, account: active.account }
+            : { id: null, status: null, account: null },
+          daemonOk: true,
+          workers: workers
+            ? {
+                queued: workers.filter((w) => w.status === 'QUEUED').length,
+                running: workers.filter((w) => w.status === 'RUNNING').length,
+                awaiting_approval: workers.filter((w) => w.status === 'AWAITING_APPROVAL').length,
+              }
+            : null,
+          accounts: { total: accts.length, healthy: accts.filter((a) => a.state === 'HEALTHY').length },
+        };
+      },
     });
   }
 
@@ -338,7 +428,14 @@ async function main(): Promise<void> {
     const active = sessionManager.getActiveSession();
     if (!active) return 'deny'; // no session to attribute → safe default (hook-deny works)
     const detail = summarizeToolInput(req.toolInput);
-    const request: PermissionRequest = { tool: req.toolName, detail, raw: `${req.toolName}: ${detail}`.slice(0, 200) };
+    // Opaque id every card/queue entry is keyed by — generated at hook time so out-of-order button
+    // taps resolve the correct request (id-routing, A2), threaded through the queue and the card value.
+    const request: PermissionRequest = {
+      tool: req.toolName,
+      detail,
+      raw: `${req.toolName}: ${detail}`.slice(0, 200),
+      request_id: randomUUID(),
+    };
 
     const decision = evaluatePermission(request, config.permissions.policy);
     if (decision === 'grant' || decision === 'deny') {
@@ -401,6 +498,17 @@ async function main(): Promise<void> {
       });
     },
     onPermissionHook,
+    onActivityHook: (req) => {
+      if (!slackService) return;
+      const active = sessionManager.getActiveSession();
+      if (!active) return;
+      if (req.claudeSessionId && active.claude_session_id && active.claude_session_id !== req.claudeSessionId) return;
+      void slackService.postActivity(active.aisup_session_id, {
+        toolName: req.toolName,
+        toolInput: req.toolInput,
+        toolResponse: req.toolResponse,
+      });
+    },
     runGates: runConfiguredGates,
     getLatestGateRun: () => latestGateRun,
     dispatchWorker: workerOrchestrator ? (input) => workerOrchestrator!.dispatch(input) : undefined,
@@ -409,8 +517,15 @@ async function main(): Promise<void> {
     approveWorker: workerOrchestrator ? (id, by) => workerOrchestrator!.approve(id, by) : undefined,
     denyWorker: workerOrchestrator ? (id, by) => workerOrchestrator!.deny(id, by) : undefined,
     cancelWorker: workerOrchestrator ? (id) => workerOrchestrator!.cancel(id) : undefined,
+    retryWorker: workerOrchestrator ? (id) => workerOrchestrator!.retry(id) : undefined,
+    undoWorker: workerOrchestrator ? (id) => workerOrchestrator!.undoMerge(id) : undefined,
+    cleanupWorktrees: workerOrchestrator ? (force) => workerOrchestrator!.cleanupWorktrees(force) : undefined,
     getWorkerProviders,
-    onSessionStart: (session) => slackService?.onSessionStart(session),
+    getLoopHealth: () => loopManagerRef?.getLoopHealth() ?? [],
+    onSessionStart: (session) => {
+      void emitNtfy({ title: 'Session started', message: `aisup session ${session.name ?? session.aisup_session_id} on ${session.account}.`, tags: ['rocket'] });
+      return slackService?.onSessionStart(session);
+    },
     onSessionStop: (session) => {
       // R13: a stopped session ends the recovery cycle — clear its restart + network windows.
       loopManagerRef?.clearRecoveryCounters(session.aisup_session_id);
@@ -525,11 +640,13 @@ async function main(): Promise<void> {
     loopManagerRef?.captureFinalCostSnapshot(sessionId, 'pre_switch');
     refreshAccounts();
     const accounts = accountRegistry.getAll();
-    const { performSwitch, selectSwitchTarget, handleNoTarget } = await import('../failover/switcher.js');
+    const { performSwitch, explainSelection, handleNoTarget } = await import('../failover/switcher.js');
     // Pass reason + the source's refreshed score so the actual switch honours the same
     // soft-threshold "strictly better target" rule the loop-manager precheck applied.
     const currentScore = accountRegistry.get(state.account)?.score ?? null;
-    const target = selectSwitchTarget(accounts, state.account, [], { reason, currentScore });
+    // explainSelection returns the same winner as selectSwitchTarget plus the per-candidate
+    // rationale (C2), so both the exhausted notification and the account.switch event can say WHY.
+    const { chosen: target, rationale } = explainSelection(accounts, state.account, [], { reason, currentScore });
     if (!target) {
       // Soft-threshold no-better-target is nonterminal; every other reason persists EXHAUSTED.
       const { terminal } = await handleNoTarget(
@@ -538,7 +655,10 @@ async function main(): Promise<void> {
           sessionManager,
           journal,
           setSessionVisible: (s) => server.setSessionState(s),
-          notifyExhausted: (id) => slackService?.onSessionExhausted(id, String(reason)),
+          notifyExhausted: (id) => {
+            void emitNtfy({ title: 'Session EXHAUSTED', message: `Session ${id} has no eligible failover account (reason: ${reason}).`, priority: 'high', tags: ['warning'] });
+            return slackService?.onSessionExhausted(id, String(reason), rationale);
+          },
         }
       );
       if (terminal) exhaustedRecoveryRef?.start(sessionId);
@@ -555,6 +675,7 @@ async function main(): Promise<void> {
         targetAccount: target.name,
         reason,
         selectionMode: reason === SwitchReason.Manual ? 'manual' : 'automatic',
+        rationale,
       },
       accounts,
       { sessionManager, journal, createSessionForTarget }
@@ -647,6 +768,9 @@ async function main(): Promise<void> {
     statuslineDir: config.statusline.directory,
     statuslineFreshnessWindowS: config.statusline.freshness_window_s,
     accountConfigDir: (account) => accountRegistry.get(account)?.configDir,
+    reconcilePermissionCards: slackService
+      ? (isSessionLive) => slackService!.reconcilePendingPermissions(isSessionLive)
+      : undefined,
   });
 
   // R8/Task 7 handoff: re-arm the exhausted poller for sessions rehydrated as EXHAUSTED.
@@ -684,18 +808,27 @@ async function main(): Promise<void> {
           sendEnter(tmuxSocket, s.tmux_name);
           return true;
         },
-        promptStillActive: (sessionId) => {
-          const s = sessionManager.readState(sessionId);
-          if (!s) return false;
-          const recent = captureOutput(tmuxSocket, s.tmux_name, 40);
-          return new PermissionDetector(config.permissions.detection_patterns).scan(recent).length > 0;
-        },
+        promptStillActive,
         routeToSlack: config.slack.enabled
-          ? (sessionId, request) => { void slackService?.notifyPermissionRequest(sessionId, request); }
+          ? (sessionId, request) => {
+              void slackService?.notifyPermissionRequest(sessionId, request);
+              void emitNtfy({ title: 'Permission requested', message: 'Claude is asking for tool permission — approve in Slack.', priority: 'high', tags: ['lock'] });
+            }
           : undefined,
       })
     : undefined;
   permissionBrokerRef = permissionBroker;
+
+  // A8: collapse the per-tick threshold stream into one Slack alert per upward band crossing, with an
+  // optional early `warning` band. Emission of `rate_limit.threshold_crossed` is unchanged below.
+  const thresholdAlerter = new ThresholdAlerter({
+    warningPct: config.thresholds.warning_pct,
+    notify: (alert) => {
+      const active = sessionManager.getActiveSession();
+      void slackService?.notifyThreshold(active?.aisup_session_id ?? null, alert);
+      void emitNtfy({ title: 'Usage threshold crossed', message: `${alert.account}: ${alert.band} threshold crossed.`, tags: ['chart_with_upwards_trend'] });
+    },
+  });
 
   const loopManager = new LoopManager({
     rateLimitIntervalMs: config.monitoring.rate_limit_interval_s * 1000,
@@ -716,6 +849,17 @@ async function main(): Promise<void> {
             hard_pct: config.thresholds.hard_pct,
             reset_eta: result.resetsAt?.toISOString() ?? null,
           },
+        });
+      }
+      // A8: de-duped Slack delivery (incl. the optional warning band). Emission above is unchanged.
+      const account = sessionManager.getActiveSession()?.account;
+      if (account) {
+        thresholdAlerter.onResult({
+          account,
+          level: result.level,
+          fiveHourPct: result.fiveHourPct ?? null,
+          sevenDayPct: result.sevenDayPct ?? null,
+          resetEta: result.resetsAt?.toISOString() ?? null,
         });
       }
     },
@@ -829,6 +973,31 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // C13: SIGHUP hot-reloads config — re-read the file and apply the safe (non-structural) subset
+  // to the live loops/registry/Slack WITHOUT dropping the supervised session.
+  let reloadBaseline = config;
+  process.on('SIGHUP', () => void (async () => {
+    try {
+      resetConfigCache();
+      const next = await loadConfig();
+      const plan = planReload(reloadBaseline, next);
+      // Apply the hot subset.
+      loopManager.updateThresholds(next.thresholds.soft_pct, next.thresholds.hard_pct);
+      slackService?.setDefaultVerbosity(next.notifications.verbosity);
+      slackService?.setAllowedUsers(next.slack.allowed_user_ids);
+      accountRegistry.syncConfigEnabled(next.accounts.map((a) => ({ name: a.name, enabled: a.enabled })));
+      reloadBaseline = next;
+      await journal.append({
+        ts: new Date().toISOString(),
+        event_type: 'daemon.reloaded',
+        details: { applied: plan.applied, restart_required: plan.restart_required },
+      });
+      process.stdout.write(`[aisup daemon] reloaded — applied: [${plan.applied.join(', ')}] restart-required: [${plan.restart_required.join(', ')}]\n`);
+    } catch (err) {
+      process.stderr.write(`[aisup daemon] reload failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  })());
 
   // AF-301 backstop: the supervisor daemon's one job is to keep the supervised session alive. A stray
   // rejection or uncaught error (gate/journal/Slack hiccup, etc.) must NOT take it down. Log loudly +

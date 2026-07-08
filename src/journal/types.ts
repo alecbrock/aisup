@@ -72,6 +72,8 @@ export type EventType =
   | 'daemon.started'
   | 'daemon.stopped'
   | 'daemon.rehydrated'
+  | 'daemon.reloaded'
+  | 'daemon.health_check'
   | 'daemon.ready'
   | 'daemon.uncaught_error'
   // Telemetry
@@ -87,8 +89,18 @@ export type EventType =
   | 'slack.rate_limited'
   | 'slack.message_ignored'
   | 'slack.invite_failed'
+  | 'slack.interactivity_unverified'
+  | 'slack.interaction'
+  | 'slack.interaction_unmatched'
+  | 'permission.card_rebound'
+  | 'permission.card_stale'
+  | 'activity.posted'
   // tmux
   | 'tmux.command_timeout'
+  // Notifications
+  | 'notification.ntfy_failed'
+  // Journal maintenance
+  | 'journal.rotated'
   // Output log
   | 'output_log.rotated'
   | 'output_log.cursor_reset'
@@ -109,6 +121,9 @@ export type EventType =
   | 'worker.merge_started'
   | 'worker.merged'
   | 'worker.merge_failed'
+  | 'worker.merge_reverted'
+  | 'worker.merge_revert_failed'
+  | 'worker.worktree_orphans_cleaned'
   | 'worker.boundary_violation'
   | 'worker.security_denied'
   | 'worker.cancelled'
@@ -134,6 +149,10 @@ export interface JournalEvent {
 export interface ReadEventsOptions {
   since?: string;
   type?: EventType | string;
+  /** Keep only events for this account (C4 `aisup log --account`). */
+  account?: string;
+  /** Keep only events for this aisup session id (C4 `aisup log --session`). */
+  session?: string;
   limit?: number;
 }
 

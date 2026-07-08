@@ -1,5 +1,5 @@
 import type { AccountInfo } from '../accounts/types.js';
-import type { ValidationResult, SwitchSnapshot } from './types.js';
+import type { ValidationResult, SwitchSnapshot, SelectionRationale, CandidateRationale } from './types.js';
 import { SwitchReason } from './types.js';
 import type { SessionManager } from '../session/manager.js';
 import type { SessionState, SwitchAttempt, SwitchTx } from '../session/types.js';
@@ -68,25 +68,73 @@ export function validateManualFailoverTarget(
   return { valid: true };
 }
 
-export function selectSwitchTarget(
+type ExcludedReason = CandidateRationale['excluded_reason'];
+
+/** Why a candidate is ineligible on state/identity grounds (before the soft-threshold "better" check). */
+function baseExclusion(a: AccountInfo, current: Set<string>, tried: Set<string>): ExcludedReason {
+  if (tried.has(a.name)) return 'already_tried';
+  if (current.has(a.name)) return 'is_current';
+  if (a.excluded) return 'excluded'; // C7 runtime --exclude override
+  if (!a.enabled) return 'disabled';
+  if (a.state === 'COOLDOWN') return 'cooldown';
+  if (a.state !== 'HEALTHY' && a.state !== 'DEGRADED') return 'unavailable';
+  return null;
+}
+
+/**
+ * Select a failover target AND explain the choice. Returns the same winner
+ * `selectSwitchTarget` would (algorithm unchanged) plus a per-candidate rationale
+ * (score + why-excluded) so surfaces can answer "why this account?".
+ */
+export function explainSelection(
   accounts: AccountInfo[],
   currentAccount: string,
   excludedAccounts: string[],
   opts: { reason?: SwitchReason; currentScore?: number | null } = {}
-): AccountInfo | null {
-  const excluded = new Set([currentAccount, ...excludedAccounts]);
+): { chosen: AccountInfo | null; rationale: SelectionRationale } {
+  const current = new Set([currentAccount]);
+  const tried = new Set(excludedAccounts);
+  const base = new Map<string, ExcludedReason>(accounts.map((a) => [a.name, baseExclusion(a, current, tried)]));
+
   const eligible = accounts
-    .filter((a) => a.enabled && !excluded.has(a.name) && (a.state === 'HEALTHY' || a.state === 'DEGRADED'))
+    .filter((a) => base.get(a.name) === null)
     .sort((a, b) => {
       const aScore = a.score ?? -Infinity;
       const bScore = b.score ?? -Infinity;
       if (aScore !== bScore) return bScore - aScore;
       return a.priority - b.priority;
     });
-  if (opts.reason === SwitchReason.SoftThreshold && typeof opts.currentScore === 'number') {
-    return eligible.find((a) => typeof a.score === 'number' && a.score > opts.currentScore!) ?? null;
-  }
-  return eligible[0] ?? null;
+
+  const softGated = opts.reason === SwitchReason.SoftThreshold && typeof opts.currentScore === 'number';
+  const scoreChosen = softGated
+    ? eligible.find((a) => typeof a.score === 'number' && a.score > opts.currentScore!) ?? null
+    : eligible[0] ?? null;
+  // C7: a runnable pinned account forces the choice, overriding score/soft-threshold ordering.
+  // A pinned-but-unavailable account is not eligible, so safety wins (no forced selection).
+  const chosen = eligible.find((a) => a.pinned) ?? scoreChosen;
+
+  const candidates: CandidateRationale[] = accounts.map((a) => {
+    let reason = base.get(a.name) ?? null;
+    // Soft threshold: an eligible account that does not strictly beat the current score is passed over.
+    if (reason === null && softGated && a.name !== chosen?.name) {
+      reason = 'below_current_score';
+    }
+    return { name: a.name, score: a.score ?? null, excluded_reason: reason };
+  });
+
+  return {
+    chosen,
+    rationale: { reason_code: opts.reason ?? null, candidates, chosen: chosen?.name ?? null },
+  };
+}
+
+export function selectSwitchTarget(
+  accounts: AccountInfo[],
+  currentAccount: string,
+  excludedAccounts: string[],
+  opts: { reason?: SwitchReason; currentScore?: number | null } = {}
+): AccountInfo | null {
+  return explainSelection(accounts, currentAccount, excludedAccounts, opts).chosen;
 }
 
 export interface NoTargetDeps {
@@ -240,6 +288,7 @@ export async function performSwitch(
       from_account: snapshot.sourceAccount,
       to_account: snapshot.targetAccount,
       selection_mode: snapshot.selectionMode,
+      rationale: snapshot.rationale ?? null,
     },
   });
 
@@ -422,6 +471,7 @@ export async function performSwitch(
           to_account: target.name,
           selection_mode: snapshot.selectionMode,
           launch_mode: targetLaunchMode,
+          rationale: snapshot.rationale ?? null,
         },
       });
 

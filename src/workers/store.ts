@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { aisupHome } from '../config/paths.js';
-import type { WorkerState, WorkerTask } from './types.js';
+import type { WorkerState, WorkerTask, TriedCandidate } from './types.js';
 
 /** UUID shape (any version) — worker ids are generated UUIDs; reject anything else to prevent traversal. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -79,6 +79,26 @@ export class WorkerStore {
     };
     this.write(updated);
     return updated;
+  }
+
+  /** C3: append a failed candidate to the worker's durable tried_candidates list (append-only). */
+  appendTriedCandidate(id: string, entry: TriedCandidate): WorkerState {
+    const current = this.read(id);
+    if (!current) throw new Error(`WorkerStore: cannot record tried candidate for unknown worker "${id}"`);
+    return this.patch(id, { tried_candidates: [...(current.tried_candidates ?? []), entry] });
+  }
+
+  /**
+   * F-4 (opt-in): replace a security-denied task's prompt/title with placeholders. The operator's
+   * input may carry secrets and a denied task is never retried (so the prompt isn't needed). Other
+   * task fields are preserved. Callers gate this on `workers.security.redact_denied_prompts`.
+   */
+  redactDeniedTask(id: string): WorkerState {
+    const current = this.read(id);
+    if (!current) throw new Error(`WorkerStore: cannot redact unknown worker "${id}"`);
+    return this.patch(id, {
+      task: { ...current.task, prompt: '[redacted: security-denied]', title: '[redacted]' },
+    });
   }
 
   list(): WorkerState[] {

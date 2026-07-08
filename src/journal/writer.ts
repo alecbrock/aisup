@@ -1,4 +1,5 @@
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, rename, stat } from 'node:fs/promises';
+import { statSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { JournalEvent, JournalWriter, JournalAppendResult } from './types.js';
 
@@ -72,12 +73,36 @@ export async function appendEvent(journalPath: string, event: JournalEvent): Pro
   }
 }
 
-export function createJournalWriter(journalPath: string): JournalWriter {
+/** D3: rotate the journal to `<path>.1` when it exceeds maxBytes, then journal the rotation. Best-effort. */
+async function rotateJournalIfNeeded(journalPath: string, maxBytes: number): Promise<boolean> {
+  try {
+    const size = existsSync(journalPath) ? (await stat(journalPath)).size : 0;
+    if (size <= maxBytes) return false;
+    await rename(journalPath, `${journalPath}.1`);
+    await appendEvent(journalPath, { ts: new Date().toISOString(), event_type: 'journal.rotated', details: { rotated_bytes: size } });
+    return true;
+  } catch {
+    return false; // rotation is best-effort — never break journaling
+  }
+}
+
+export function createJournalWriter(journalPath: string, maxSizeMb?: number): JournalWriter {
+  const maxBytes = maxSizeMb && maxSizeMb > 0 ? maxSizeMb * 1024 * 1024 : Infinity;
+  // Track bytes in-closure (like RotatingLog) so we don't stat() on every append.
+  let bytes = 0;
+  try { bytes = existsSync(journalPath) ? statSync(journalPath).size : 0; } catch { bytes = 0; }
+
   // The wrapper resolves to void and, because appendEvent never throws, NEVER rejects — so every
   // `void journal.append(...)` / `await journal.append(...)` call site is crash-safe (AF-301).
   return {
     append: async (event: JournalEvent): Promise<void> => {
-      await appendEvent(journalPath, event);
+      const res = await appendEvent(journalPath, event);
+      if (res.ok && maxBytes !== Infinity) {
+        bytes += Buffer.byteLength(JSON.stringify(event) + '\n');
+        if (bytes > maxBytes) {
+          if (await rotateJournalIfNeeded(journalPath, maxBytes)) bytes = 0;
+        }
+      }
     },
   };
 }

@@ -34,6 +34,13 @@ export interface RehydrationDeps {
   statuslineDir?: string;
   statuslineFreshnessWindowS?: number;
   accountConfigDir?: (account: string) => string | undefined;
+  /**
+   * A3: reconcile persisted pending-permission cards after a restart. Invoked once at the end of
+   * rehydration with a liveness predicate (aisup_session_id → is the session still live), so the
+   * Slack layer can re-bind live cards (a tap still resolves the original request) and annotate
+   * dead ones. Absent in unit tests / when Slack is disabled.
+   */
+  reconcilePermissionCards?: (isSessionLive: (aisupSessionId: string) => boolean) => Promise<unknown>;
 }
 
 /**
@@ -324,6 +331,15 @@ export async function rehydrateSessions(deps: RehydrationDeps): Promise<{ rehydr
     if (!matchedTmuxNames.has(tmuxName)) {
       orphans.push(tmuxName);
     }
+  }
+
+  // A3: re-bind/annotate persisted permission cards. A session is live when its persisted state
+  // points at a still-running tmux pane.
+  if (deps.reconcilePermissionCards) {
+    await deps.reconcilePermissionCards((aisupSessionId) => {
+      const { state } = readSessionState(deps.stateDir, aisupSessionId);
+      return !!state && liveSessions.has(state.tmux_name);
+    });
   }
 
   await journal.append({

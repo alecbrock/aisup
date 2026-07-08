@@ -88,11 +88,12 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 - Merge gate: user approval required, validation gates on worker output
 - Routing heuristic: task-type → preferred-model mapping (configurable)
 
-**Phase 4:**
-- Mobile status dashboard: HTTP `/dashboard` endpoint, auto-refreshing, token auth for remote access
+**Phase 4:** _(shipped in the 2026-06-30 final-completion plan)_
+- Mobile status dashboard: **Feature L, minimal read-only** — HTTP `/dashboard`, auto-refreshing, token→cookie auth (token never in a URL); observe-only, all control stays in Slack.
 - ntfy as lightweight notification fallback (optional alternative to Slack)
-- Daemon enhancements: log rotation, health self-check
-- Enhanced Slack features: thread summaries, file sharing, rich formatting
+- Daemon enhancements: log rotation (daemon.log + journal, size-configured), health self-check (per-loop liveness on `/api/health`)
+- Enhanced Slack features: session-stop thread summaries, large-diff file upload
+- **Slack remote-control redesign:** per-action permission cards (Approve/Deny buttons, never time out) + live activity feed replace the `!permit`/`!deny` typing model; Slack is the interactive control plane.
 
 ### Explicitly Out of Scope
 
@@ -100,9 +101,10 @@ aisup is a daemon-based supervisor that wraps Pilot Shell (or Claude Code direct
 - OpenTelemetry integration — overkill for single-user system; JSONL event journal suffices
 - Proxy-level model routing (Bifrost pattern) — complementary tool, not a supervisor feature
 - Auto-approval without explicit policy — security risk
-- Multiple simultaneous lead sessions — one lead session at a time; workers are separate
+- Multiple simultaneous lead sessions (R-UX-04) — one lead session at a time is a deliberate Phase-1 boundary (`cli/pid.ts` `getActiveSession()` is singular); workers are separate. Lifting it is a large change with its own PRD.
 - Windows/Linux support — macOS only (matches operator's platform)
-- launchd auto-start — manual daemon start only; user-controlled lifecycle
+- launchd auto-start (R-UX-05) — manual daemon start only; user-controlled lifecycle
+- **Option C — in-aisup orchestration/workflow subsystem** (durable phase graph, read-only workers, coordinator edit-scope enforcement) — deferred to its own future PRD + plan. The 2026-06-30 plan added NO orchestration code; it leaves clean seams (latent `roles.orchestrator`, the activity hook, the worker store) for that future phase.
 
 ## Technical Context
 

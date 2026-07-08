@@ -55,6 +55,9 @@ export async function runGateCommand(opts: { json?: boolean } = {}): Promise<voi
     const journal = createJournalWriter(config.journal.path);
     result = await runGates(config.gates.gates, { journal, defaultCwd: process.cwd() });
   }
-  if (opts.json) { console.log(JSON.stringify(result, null, 2)); return; }
-  console.log(formatGateRun(result));
+  if (opts.json) { console.log(JSON.stringify(result, null, 2)); }
+  else { console.log(formatGateRun(result)); }
+  // F-5: non-zero exit when a gate fails so CI can gate on it; 0 on pass. `exitCode` (not `exit()`)
+  // lets buffered stdout flush and keeps the function unit-testable.
+  process.exitCode = result.passed ? 0 : 1;
 }

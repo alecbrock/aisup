@@ -78,6 +78,57 @@ export function reduceCostSnapshots(events: JournalEvent[], accountFilter?: stri
   return { total_cost_usd: round(total), by_account: roundMap(byAccount), by_session: roundMap(bySession) };
 }
 
+export type CostDimension = 'account' | 'skill' | 'provider' | 'task';
+
+/**
+ * C8: break cost down along one dimension across BOTH cost streams — lead-session `cost.snapshot`
+ * (Claude, per-segment max) and per-worker `worker.completed` (discrete `cost_usd`). The two streams
+ * are distinct and labelled: worker cost carries provider/task_type; lead cost carries account/skill
+ * and buckets under `(lead)` for the task dimension. Worker cost is omitted from account/skill (not
+ * attributable to a lead account/skill).
+ */
+export function breakdownCosts(events: JournalEvent[], dimension: CostDimension): Record<string, number> {
+  const out: Record<string, number> = {};
+  const add = (key: string, amt: number): void => { out[key] = round((out[key] ?? 0) + amt); };
+
+  // Lead-session cost: per-segment max (same segmentation rule as reduceCostSnapshots).
+  const segments = new Map<string, { max: number; account: string; skill: string; provider: string }>();
+  for (const e of events) {
+    if (e.event_type !== 'cost.snapshot') continue;
+    const cost = e.details?.total_cost_usd;
+    if (typeof cost !== 'number') continue;
+    const aisupSessionId = e.aisup_session_id ?? 'unknown';
+    const segmentKey = `${aisupSessionId}::${e.claude_session_id ?? aisupSessionId}`;
+    const prev = segments.get(segmentKey);
+    if (!prev || cost > prev.max) {
+      segments.set(segmentKey, {
+        max: cost,
+        account: e.account ?? 'unknown',
+        skill: (e.details?.active_skill as string | undefined) ?? '(none)',
+        provider: (e.details?.provider as string | undefined) ?? 'claude',
+      });
+    }
+  }
+  for (const seg of segments.values()) {
+    if (dimension === 'account') add(seg.account, seg.max);
+    else if (dimension === 'skill') add(seg.skill, seg.max);
+    else if (dimension === 'provider') add(seg.provider, seg.max);
+    else add('(lead)', seg.max); // task dimension: lead cost has no task type
+  }
+
+  // Worker cost: each completion is a discrete cost, summed (never max).
+  for (const e of events) {
+    if (e.event_type !== 'worker.completed') continue;
+    const cost = e.details?.cost_usd;
+    if (typeof cost !== 'number') continue;
+    if (dimension === 'provider') add((e.details?.provider as string | undefined) ?? 'unknown', cost);
+    else if (dimension === 'task') add((e.details?.task_type as string | undefined) ?? '(untyped)', cost);
+    // account/skill: worker cost is not attributable to a lead account/skill → omitted by design.
+  }
+
+  return out;
+}
+
 /** Aggregate journaled `cost.snapshot` events into rolling today / last_7d / last_30d windows. */
 export async function aggregateCosts(opts: AggregateCostsOptions): Promise<CostWindows> {
   const events = await readEvents(opts.journalPath, { type: 'cost.snapshot' });

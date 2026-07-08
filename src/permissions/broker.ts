@@ -59,8 +59,10 @@ export class PermissionBroker {
     if (!pend) return false;
     this.pending.delete(sessionId);
 
-    const ttlMs = this.deps.permissions.grant_ttl_seconds * 1000;
-    if (this.now() - pend.detectedAt > ttlMs) {
+    // A3 (defense in depth): `null`/absent = never expire; `0` is NOT an immediate-timeout sentinel
+    // (the old `age > 0` check fired instantly when ttl was 0). Only a finite N > 0 can expire.
+    const ttl = this.deps.permissions.grant_ttl_seconds;
+    if (ttl !== null && ttl > 0 && this.now() - pend.detectedAt > ttl * 1000) {
       await this.emit('permission.keystroke_timeout', sessionId, pend.request);
       return false;
     }

@@ -81,3 +81,48 @@ export async function mergeWorkerOutput(opts: {
   await journal.append({ ts: new Date().toISOString(), event_type: 'worker.merged', details: { worker_task_id: taskId } });
   return { merged: true, reason: null, resetApproval: false };
 }
+
+export interface UndoResult {
+  reverted: boolean;
+  reason: 'not_merged' | 'no_patch' | 'patch_hash_mismatch' | 'diverged' | null;
+}
+
+/**
+ * C10: revert a previously-merged worker patch by reverse-applying the SAME approved patch bytes to
+ * the working tree. Best-effort and git-safe: gated on `git apply --reverse --check` so a tree that
+ * has diverged (conflicting local edits, or an already-reverted patch) is refused, never force-reset.
+ * The only git verbs are `apply --reverse --check` and `apply --reverse`.
+ */
+export async function undoWorkerMerge(opts: {
+  workspaceRoot: string;
+  state: WorkerState;
+  journal: JournalWriter;
+}): Promise<UndoResult> {
+  const { workspaceRoot, state, journal } = opts;
+  const taskId = state.task.id;
+  if (state.status !== 'MERGED') return { reverted: false, reason: 'not_merged' };
+  if (!state.output) return { reverted: false, reason: 'no_patch' };
+  const patchPath = state.output.patch_path;
+
+  if (!existsSync(patchPath) || sha256File(patchPath) !== state.output.patch_sha256) {
+    await journal.append({ ts: new Date().toISOString(), event_type: 'worker.merge_revert_failed', details: { worker_task_id: taskId, reason: 'patch_hash_mismatch' } });
+    return { reverted: false, reason: 'patch_hash_mismatch' };
+  }
+
+  try {
+    await execFileAsync('git', ['-C', workspaceRoot, 'apply', '--reverse', '--check', patchPath], { maxBuffer: MAX_BUFFER });
+  } catch {
+    await journal.append({ ts: new Date().toISOString(), event_type: 'worker.merge_revert_failed', details: { worker_task_id: taskId, reason: 'diverged' } });
+    return { reverted: false, reason: 'diverged' };
+  }
+
+  try {
+    await execFileAsync('git', ['-C', workspaceRoot, 'apply', '--reverse', patchPath], { maxBuffer: MAX_BUFFER });
+  } catch {
+    await journal.append({ ts: new Date().toISOString(), event_type: 'worker.merge_revert_failed', details: { worker_task_id: taskId, reason: 'diverged' } });
+    return { reverted: false, reason: 'diverged' };
+  }
+
+  await journal.append({ ts: new Date().toISOString(), event_type: 'worker.merge_reverted', details: { worker_task_id: taskId } });
+  return { reverted: true, reason: null };
+}

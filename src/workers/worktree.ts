@@ -38,6 +38,30 @@ const SECRET_LINE =
 const DIFF_EXCLUDE_DIRS = ['.home/', '.codegraph/', '.serena/'] as const;
 const EXCLUDE_PATHSPECS = DIFF_EXCLUDE_DIRS.map((d) => `:(exclude)${d}`);
 
+/**
+ * C10: from all git worktree paths, return those under `worktreeDir` that no active worker
+ * references — i.e. aisup-created worktrees orphaned by a crash. The main workspace and any
+ * worktree outside `worktreeDir` are never returned, so `--force` can only ever remove aisup's own.
+ */
+export function orphanWorktrees(allWorktreePaths: string[], referenced: Set<string>, worktreeDir: string): string[] {
+  const marker = `${sep}${worktreeDir}${sep}`;
+  return allWorktreePaths.filter((p) => {
+    if (referenced.has(p)) return false;
+    // Under worktreeDir means the path contains "/<worktreeDir>/" — excludes the main workspace root.
+    return p.includes(marker) || p.includes(`/${worktreeDir}/`);
+  });
+}
+
+/** List all registered git worktree paths for the workspace (C10 orphan cleanup). */
+export async function listWorktrees(workspaceRoot: string): Promise<string[]> {
+  try {
+    const out = await git(['worktree', 'list', '--porcelain'], workspaceRoot);
+    return out.split('\n').filter((l) => l.startsWith('worktree ')).map((l) => l.slice('worktree '.length).trim());
+  } catch {
+    return [];
+  }
+}
+
 export interface MainTreeSnapshot {
   status: string; // `git status --porcelain --ignored`, worktreeDir lines removed
   forbidden: Record<string, string>; // matched forbidden path -> "size:mtimeMs:sha256"

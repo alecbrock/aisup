@@ -42,4 +42,25 @@ describe('PendingPermissionQueue (AF-302)', () => {
     const q = new PendingPermissionQueue();
     expect(q.dequeue('nope')).toBeNull();
   });
+
+  it('resolveById removes the matching entry regardless of FIFO order (out-of-order taps)', () => {
+    const q = new PendingPermissionQueue();
+    const s = 'aisup-abc12345';
+    q.enqueue(s, { tool: 'Bash', detail: 'first', raw: 'r', request_id: 'id-1' });
+    q.enqueue(s, { tool: 'Edit', detail: 'second', raw: 'r', request_id: 'id-2' });
+
+    // Resolve the SECOND card first — id-routing, not FIFO.
+    expect(q.resolveById(s, 'id-2')?.detail).toBe('second');
+    expect(q.size(s)).toBe(1);
+    // The first is still pending and resolvable.
+    expect(q.resolveById(s, 'id-1')?.detail).toBe('first');
+    expect(q.size(s)).toBe(0);
+  });
+
+  it('resolveById returns null for an unknown id (no entry removed)', () => {
+    const q = new PendingPermissionQueue();
+    q.enqueue('s', { tool: 'Bash', detail: 'a', raw: 'r', request_id: 'id-1' });
+    expect(q.resolveById('s', 'ghost')).toBeNull();
+    expect(q.size('s')).toBe(1);
+  });
 });

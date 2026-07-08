@@ -11,6 +11,29 @@ export enum SwitchReason {
   NetworkError = 'network_error',
 }
 
+/** Per-candidate line of a failover selection: its score and why it was (not) chosen. */
+export interface CandidateRationale {
+  name: string;
+  score: number | null;
+  /** null when the candidate was eligible; otherwise why it was passed over. */
+  excluded_reason:
+    | 'is_current'
+    | 'already_tried'
+    | 'disabled'
+    | 'excluded'
+    | 'cooldown'
+    | 'unavailable'
+    | 'below_current_score'
+    | null;
+}
+
+/** The "why" behind a failover: the trigger, every candidate's score + disposition, and the winner. */
+export interface SelectionRationale {
+  reason_code: SwitchReason | null;
+  candidates: CandidateRationale[];
+  chosen: string | null;
+}
+
 export interface SwitchSnapshot {
   aisupSessionId: string;
   claudeSessionId: string | null;
@@ -21,6 +44,8 @@ export interface SwitchSnapshot {
   targetAccount: string;
   reason: SwitchReason;
   selectionMode: 'automatic' | 'manual';
+  /** Explainability payload persisted on the account.switch event (C2). Optional for back-compat. */
+  rationale?: SelectionRationale;
 }
 
 export interface ValidationResult {

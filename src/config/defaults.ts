@@ -72,7 +72,9 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
       default_action: 'deny',
     },
     slack_routing: false,
-    grant_ttl_seconds: 300,
+    // A3: never expire by default — a permission prompt may sit for hours awaiting a human. Set a
+    // finite N > 0 only if you want the legacy fallback path to auto-expire Slack-routed requests.
+    grant_ttl_seconds: null,
   },
   gates: {
     enabled: false,
@@ -88,6 +90,11 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
     relay_output_enabled: false,
     cmd_require_confirmation: true,
     redaction_patterns: [],
+    interactivity_enabled: true,
+  },
+  notifications: {
+    verbosity: 'normal',
+    ntfy: { enabled: false, topic: '', server: 'https://ntfy.sh' },
   },
   daemon: {
     port: 7394,
@@ -99,6 +106,7 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
   },
   journal: {
     path: '~/.aisup/journal.jsonl',
+    max_size_mb: 50,
   },
   workers: {
     enabled: false,
@@ -123,6 +131,7 @@ export const CONFIG_DEFAULTS: Omit<AisupConfig, 'accounts' | 'roles'> = {
         '**/.env',
         '**/.env.*',
       ],
+      redact_denied_prompts: false,
     },
     adapters: {
       codex: {

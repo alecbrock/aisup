@@ -17,6 +17,9 @@ export interface ThresholdsConfig {
   soft_pct: number;
   hard_pct: number;
   idle_boundary_seconds: number;
+  /** Optional early-warning band (A8): when usage crosses this % (below soft) a single Slack alert
+   *  is pushed. Absent = no warning band. */
+  warning_pct?: number;
 }
 
 export interface FailoverConfig {
@@ -60,9 +63,16 @@ export interface PermissionsConfig {
   detection_patterns: string[];
   approval_key: string;
   denial_key: string;
+  /** Keystroke for Claude's "don't ask again / approve for this session" dialog option. Absent until
+   *  observed against the running Claude (A0) — when unset the Slack card ships Approve/Deny only and
+   *  the "Approve for session" button is hidden (never guess the keystroke). */
+  approval_session_key?: string;
   policy: PermissionPolicyConfig;
   slack_routing: boolean;
-  grant_ttl_seconds: number;
+  /** Legacy fallback-broker expiry bound. `null`/absent = never expire (the default — a human may
+   *  take hours); a finite `N > 0` expires a Slack-routed request after N seconds. `0` is NOT a
+   *  sentinel and never expires. The hook (Slack-button) path has no timer regardless. */
+  grant_ttl_seconds: number | null;
 }
 
 export interface GateCommandConfig {
@@ -89,6 +99,10 @@ export interface SlackConfig {
   relay_output_enabled: boolean;
   cmd_require_confirmation: boolean;
   redaction_patterns: string[];
+  /** Operator asserts the Slack app's Interactivity toggle is ON (required for Block Kit buttons in
+   * Socket Mode). Default true; the startup probe journals `slack.interactivity_unverified` when this
+   * is false so button routing never fails silently. `doctor` performs the live scope/toggle check. */
+  interactivity_enabled: boolean;
 }
 
 export interface DaemonConfig {
@@ -103,6 +117,8 @@ export interface StatuslineConfig {
 
 export interface JournalConfig {
   path: string;
+  /** Rotate the journal when it exceeds this size in MB (D3). 0/absent = no rotation. */
+  max_size_mb?: number;
 }
 
 export interface WorkerAdapterConfig {
@@ -148,6 +164,10 @@ export interface WorkerSecurityConfig {
   env_allowlist: string[];
   boundary_audit: boolean;
   forbidden_path_globs: string[];
+  /** F-4 opt-in: when true, a `security_denied` task's persisted prompt/title are replaced with
+   *  placeholders (the operator's input may carry secrets and a denied task is never retried).
+   *  Default false — today's behavior (input retained, 0600-isolated) is intentional. */
+  redact_denied_prompts?: boolean;
 }
 
 export interface WorkerMergeConfig {
@@ -204,9 +224,27 @@ export interface AisupConfig {
   permissions: PermissionsConfig;
   gates: GatesConfig;
   slack: SlackConfig;
+  notifications: NotificationsConfig;
   daemon: DaemonConfig;
   statusline: StatuslineConfig;
   journal: JournalConfig;
   workers: WorkersConfig;
   roles: RolesConfig;
+}
+
+export interface NtfyConfig {
+  /** When true, key push-worthy events are mirrored to the ntfy topic (D2). */
+  enabled: boolean;
+  /** ntfy topic name (the path after the server). */
+  topic: string;
+  /** ntfy server base URL, e.g. https://ntfy.sh. */
+  server: string;
+}
+
+export interface NotificationsConfig {
+  /** Default activity-feed verbosity: `silent` (feed off; cards/alerts still post), `normal`
+   *  (meaningful actions), `verbose` (all tool uses). Overridable per channel via `!notify`. */
+  verbosity: 'silent' | 'normal' | 'verbose';
+  /** Optional ntfy push fallback (notification-only; Slack remains the control plane) — D2. */
+  ntfy?: NtfyConfig;
 }

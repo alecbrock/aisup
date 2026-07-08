@@ -77,6 +77,7 @@ async function postWithRetry(url: string, token: string, body: unknown): Promise
 export async function sessionStart(opts: {
   cwd?: string;
   plan?: string;
+  name?: string;
   dryRun?: boolean;
 }): Promise<void> {
   const cwd = opts.cwd ?? process.cwd();
@@ -112,7 +113,7 @@ export async function sessionStart(opts: {
   }
 
   const { url, token } = await getDaemonUrl();
-  const res = await postWithRetry(`${url}/api/sessions`, token, { cwd, plan: opts.plan });
+  const res = await postWithRetry(`${url}/api/sessions`, token, { cwd, plan: opts.plan, name: opts.name });
 
   if (!res.ok) {
     const body = await res.json() as { error?: string };

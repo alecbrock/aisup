@@ -35,6 +35,14 @@ vi.mock('@slack/bolt', () => {
       handlers['message'] ??= [];
       handlers['message'].push(fn);
     }),
+    action: vi.fn().mockImplementation((_matcher: unknown, fn: Function) => {
+      handlers['action'] ??= [];
+      handlers['action'].push(fn);
+    }),
+    view: vi.fn().mockImplementation((_matcher: unknown, fn: Function) => {
+      handlers['view'] ??= [];
+      handlers['view'].push(fn);
+    }),
     start: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
     client: {
@@ -66,6 +74,7 @@ function makeConfig(overrides: Partial<SlackConfig> = {}): SlackConfig {
     relay_output_enabled: false,
     cmd_require_confirmation: false,
     redaction_patterns: [],
+    interactivity_enabled: true,
     ...overrides,
   };
 }

@@ -478,9 +478,10 @@ function validateConfig(raw: Record<string, unknown>): AisupConfig {
     permissions: merged.permissions,
     gates: merged.gates,
     slack: merged.slack,
+    notifications: merged.notifications,
     daemon: merged.daemon,
     statusline: { ...merged.statusline, directory: statuslineDirectory },
-    journal: { path: journalPath },
+    journal: { path: journalPath, max_size_mb: merged.journal.max_size_mb },
     workers,
     roles,
   };

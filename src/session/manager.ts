@@ -14,6 +14,7 @@ import {
   getPaneId,
   respawnPane,
   startOutputLog,
+  panePid,
 } from './tmux.js';
 import type { SessionState } from './types.js';
 import { isValidSessionState } from './validate.js';
@@ -38,6 +39,8 @@ export interface CreateSessionOpts {
   env: Record<string, string>;
   cwd: string;
   planPath?: string | null;
+  /** Optional operator-facing label (C11). */
+  name?: string;
 }
 
 export class SessionManager {
@@ -114,6 +117,7 @@ export class SessionManager {
     const state: SessionState = {
       aisup_session_id: aisupSessionId,
       status: 'CREATING',
+      ...(opts.name ? { name: opts.name } : {}),
       account,
       tmux_name: tmuxName,
       tmux_session_id: null,
@@ -296,6 +300,56 @@ export class SessionManager {
     const existing = this.readState(aisupSessionId);
     if (!existing) return;
     this.writeState({ ...existing, ...patch, updated_at: new Date().toISOString() });
+  }
+
+  /**
+   * C9: SIGSTOP the pane's runner process and mark the session PAUSED. A PAUSED session is not
+   * ACTIVE, so getActiveSession() (and thus the idle/rate-limit monitoring loops) skip it — no
+   * failover/idle/recovery fires while paused. Reversible via resumeSession.
+   */
+  async pauseSession(aisupSessionId: string): Promise<{ ok: boolean; reason?: string }> {
+    const state = this.readState(aisupSessionId);
+    if (!state) return { ok: false, reason: 'not_found' };
+    if (state.status === 'PAUSED') return { ok: false, reason: 'already_paused' };
+    if (state.status !== 'ACTIVE' && state.status !== 'SWITCH_PENDING_AT_IDLE') {
+      return { ok: false, reason: `not_pausable: ${state.status}` };
+    }
+    const pid = panePid(this.socket, state.tmux_name);
+    if (!pid) return { ok: false, reason: 'no_pane_pid' };
+    try { process.kill(pid, 'SIGSTOP'); } catch { return { ok: false, reason: 'signal_failed' }; }
+    this.patchState(aisupSessionId, { status: 'PAUSED' });
+    return { ok: true };
+  }
+
+  /** C9: SIGCONT the paused runner and restore the session to ACTIVE. */
+  async resumeSession(aisupSessionId: string): Promise<{ ok: boolean; reason?: string }> {
+    const state = this.readState(aisupSessionId);
+    if (!state) return { ok: false, reason: 'not_found' };
+    if (state.status !== 'PAUSED') return { ok: false, reason: `not_paused: ${state.status}` };
+    const pid = panePid(this.socket, state.tmux_name);
+    if (!pid) return { ok: false, reason: 'no_pane_pid' };
+    try { process.kill(pid, 'SIGCONT'); } catch { return { ok: false, reason: 'signal_failed' }; }
+    this.patchState(aisupSessionId, { status: 'ACTIVE' });
+    return { ok: true };
+  }
+
+  /** C11: set a session's operator-facing label. */
+  renameSession(aisupSessionId: string, name: string): { ok: boolean; reason?: string } {
+    if (!this.readState(aisupSessionId)) return { ok: false, reason: 'not_found' };
+    this.patchState(aisupSessionId, { name });
+    return { ok: true };
+  }
+
+  /** C9: the first PAUSED session (getActiveSession excludes PAUSED, so resume needs this). */
+  getPausedSession(): import('./types.js').SessionState | null {
+    if (!existsSync(this.stateDir)) return null;
+    try {
+      for (const sessionId of readdirSync(this.stateDir)) {
+        const state = this.readState(sessionId);
+        if (state && state.status === 'PAUSED') return state;
+      }
+    } catch { /* ignore read errors */ }
+    return null;
   }
 
   /** Return the first session in ACTIVE or SWITCH_PENDING_AT_IDLE state, or null. */

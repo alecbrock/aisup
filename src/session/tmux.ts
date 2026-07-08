@@ -123,6 +123,17 @@ export function captureOutput(socket: string, name: string, lines = 100): string
   }
 }
 
+/** The pid of the pane's foreground/root process (the runner), or null when unresolvable (C9). */
+export function panePid(socket: string, name: string): number | null {
+  try {
+    const val = tmuxWithTimeout(socket, ['display-message', '-p', '-t', name, '#{pane_pid}']).trim();
+    const pid = parseInt(val, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
 export function isProcessDead(socket: string, name: string): boolean {
   try {
     const val = tmuxWithTimeout(socket, ['display-message', '-p', '-t', name, '#{pane_dead}']);

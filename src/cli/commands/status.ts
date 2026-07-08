@@ -72,7 +72,8 @@ export async function showStatus(opts: { json?: boolean } = {}): Promise<void> {
       console.log(`aisup daemon: running (PID ${pid}) — no active session`);
     } else {
       console.log(`aisup daemon: running (PID ${pid})`);
-      console.log(`  session: ${session.aisup_session_id ?? 'unknown'} ${session.status ?? 'unknown'} on ${session.account ?? 'unknown'}`);
+      const label = session.name ? `"${session.name}" (${session.aisup_session_id ?? 'unknown'})` : (session.aisup_session_id ?? 'unknown');
+      console.log(`  session: ${label} ${session.status ?? 'unknown'} on ${session.account ?? 'unknown'}`);
       console.log(`  tmux: ${session.tmux_name ?? 'unknown'}  cwd: ${session.cwd ?? 'unknown'}`);
     }
   } catch {
